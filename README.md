@@ -18,6 +18,35 @@
 - **Modo simple y avanzado**: lo básico a la vista; IA, Firefight y lo demás en avanzado.
 - Arranca directo en la Forja: **Mis mapas, Nuevo mapa, Probar**. Nada de campaña ni en línea.
 
+## Cómo se usa (táctil)
+
+Al abrirla, el menú empieza en **FORJA**. Elige el mapa y entras volando como el Monitor.
+
+| Gesto | Qué hace |
+|---|---|
+| Tocar un objeto | Lo eliges: abajo salen **MOVER, GIRAR, COPIAR, AJUSTES, BORRAR** |
+| Arrastrar un objeto | Lo llevas por el suelo bajo el dedo; al levantar el dedo queda ahí |
+| Arrastrar donde no hay nada | Miras alrededor |
+| Con un objeto agarrado, tocar | Lo pones donde tocaste |
+| Con un objeto agarrado, girar dos dedos | Lo giras |
+| Palanca | Volar |
+| **SUBIR / BAJAR** | Altura |
+| **+ OBJETOS** | La paleta: armas, vehículos, escenario, spawns, banderas, teletransportes, enemigos |
+| **DESHACER / REHACER** | Lo último que hiciste |
+| **GUARDAR** | Guarda el mapa (la primera vez le pones nombre) |
+| **EXPORTAR** | Guarda una copia del `.map` donde elijas (Descargas, Drive…) |
+| **MAPA** | Los ajustes del mapa |
+| **PROBAR** | Juegas el mapa como Spartan; vuelves a la Forja con la cruceta **DERECHA** |
+| **?** | La ayuda en pantalla |
+| **START** | El menú de pausa |
+
+En los menús de la Forja (paleta, ajustes) tocas la fila que quieres, arrastras para bajar o subir, y **VOLVER** regresa. El control (por ejemplo el GameSir) sigue funcionando igual.
+
+### Jugar el mapa en Halo C.E
+
+1. En Halo Forge Evolved: **GUARDAR** y luego **EXPORTAR**, y eliges dónde dejar el `.map`.
+2. En Halo C.E (o Halo C.E Evolved): en la lista de mapas, **IMPORTAR**, y eliges ese `.map`.
+
 ## En qué se basa
 
 Este repositorio tiene el código completo de Content Evolved (rama `watanoge`, sin tocar) con los cambios de la Forja encima (rama `main`). Es la Forja (Faber) de [Halo Content Evolved](https://github.com/Watanoge/halo-content-evolved) de Watanoge, que guarda mapas de Custom Edition, hecha sobre [Content Extended Additions](https://github.com/SutlabSol/Content-Extended-Additions) de MotaLev y sobre [OpenCE](https://github.com/OpenCommunityEdition/OpenCE). Ideas tomadas también de la Forge de [Chupathingy](https://github.com/ChupathingyCE/chupathingyce).
