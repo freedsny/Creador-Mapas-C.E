@@ -1525,7 +1525,18 @@ short custom_edition_cache_file_scenario_type(
 		*xbox_map = FALSE;
 	if (is_xbox_flg1_forge_map(path))
 	{
-		return 1;
+		/* (a map Forge saved: a campaign level's stays campaign) */
+		type = _scenario_type_multiplayer;
+		if (custom_edition_file_open(&file, path))
+		{
+			if (cache_file_identify(&file.source, &identity) == _cache_file_status_ok &&
+				identity.scenario_type == _scenario_type_solo)
+			{
+				type = _scenario_type_solo;
+			}
+			custom_edition_file_close(&file);
+		}
+		return type;
 	}
 	if (!custom_edition_file_open(&file, path))
 	{

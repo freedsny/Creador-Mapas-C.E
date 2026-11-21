@@ -5834,7 +5834,7 @@ static int forge_build_xbox_flg1_map(
 
 	if (read_u32(out.data + 0x00u) != CACHE_HEADER_SIGNATURE ||
 		read_s32(out.data + 0x04u) != CACHE_VERSION_XBOX ||
-		read_s16(out.data + 0x60u) != 1)
+		(read_s16(out.data + 0x60u) != 1 && read_s16(out.data + 0x60u) != 0))
 	{
 		buf_free(&out);
 		return FORGE_EXPORT_FAIL;

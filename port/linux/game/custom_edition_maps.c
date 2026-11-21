@@ -293,7 +293,7 @@ static short identity_cached(
 	entry->scenario_type = custom_edition_cache_file_scenario_type(path, &entry->xbox_map);
 	*xbox_map = entry->xbox_map;
 	entry->forge_name[0] = 0;
-	if (entry->scenario_type == _scenario_type_multiplayer)
+	if (entry->scenario_type == _scenario_type_multiplayer || entry->scenario_type == _scenario_type_solo)
 		custom_edition_cache_file_forge_name(path, entry->forge_name, sizeof(entry->forge_name));
 	*forge_name = entry->forge_name;
 
