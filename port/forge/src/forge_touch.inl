@@ -244,17 +244,25 @@ int forge_touch_scene(void)
 	return FORGE_TOUCH_SCENE_FORGE | (g_forge.active_modal != _forge_modal_none ? FORGE_TOUCH_SCENE_MENU : 0);
 }
 
-/* a point of the screen (shares) in the Forge's screen units, as it draws */
+/* a point of the screen (shares) in the Forge's screen units, as it draws.
+The HUD's window is the screen less its margins, the same on each side (on a
+phone about 8% of the screen each way: the HUD's safe area), in units that
+start at the screen's corner: so the whole screen is window_x0 + window_x1
+wide and window_y0 + window_y1 high */
 static void forge_touch_to_window(float x, float y, short *wx, short *wy)
 {
+	float width, height;
+
 	if (!s_touch.window_known)
 	{
 		*wx = (short)(x * 640.0f);
 		*wy = (short)(y * 480.0f);
 		return;
 	}
-	*wx = (short)(s_touch.window_x0 + x * (float)(s_touch.window_x1 - s_touch.window_x0) + 0.5f);
-	*wy = (short)(s_touch.window_y0 + y * (float)(s_touch.window_y1 - s_touch.window_y0) + 0.5f);
+	width = (float)(s_touch.window_x0 + s_touch.window_x1);
+	height = (float)(s_touch.window_y0 + s_touch.window_y1);
+	*wx = (short)(x * width + 0.5f);
+	*wy = (short)(y * height + 0.5f);
 }
 
 /* the button under a point of the screen (shares), as last drawn: its index in

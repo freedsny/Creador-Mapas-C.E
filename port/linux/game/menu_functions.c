@@ -1380,13 +1380,17 @@ static short map_kind_browse(short kind)
 }
 
 /* whether the chooser may show the kind: a singleplayer one only with
-`singleplayer` (hosting, not Firefight) and never in a Forge session (Forge
-edits multiplayer maps),
+`singleplayer` (hosting, not Firefight),
 FORGE MAPS only with `forge_maps`, the daily challenges only with
-game.daily_challenge on */
+game.daily_challenge on. Halo Forge Evolved: a Forge session's level list
+(UN JUGADOR) shows the campaign's levels too, to forge them, which
+Content Evolved left out (its Forge edits multiplayer maps); not the daily
+challenges, which are played, not edited */
 static boolean map_kind_allowed(short kind, boolean singleplayer, boolean forge_maps)
 {
-	if ((!singleplayer || g_forge_session_enabled) && map_kind_singleplayer(kind))
+	if (!singleplayer && map_kind_singleplayer(kind))
+		return FALSE;
+	if (g_forge_session_enabled && kind == MAP_KIND_DAILY)
 		return FALSE;
 	/* (Forge edits MCC MULTIPLAYER's maps too, and saves its own in its
 	[Forge maps] folder: mcc_package.h's MCC_PACKAGE_FORGE. Firefight plays
