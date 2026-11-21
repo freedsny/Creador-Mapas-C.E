@@ -1092,28 +1092,27 @@ static int forge_touch_menu_pointer(int wanted, struct halo_ui_pointer *pointer)
 
 /* ---------- the pick through the finger */
 
-/* where a point of the world is on the screen (shares of the frame last
-drawn's viewport, which is the whole screen in a game alone); FALSE when it
-is behind the camera or off the screen */
-static boolean forge_touch_on_screen(real_point3d const *point, float *x, float *y)
-{
-	struct render_camera const *camera = &render.camera;
-	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
-	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
-	real_point2d screen;
+/* ---------- the Forge's camera, as the screen shows it
 
-	/* (not render.frustum.projection_valid: the frame's projection is still
-	there once it is drawn, when the flag no longer says so; the Forge's own
-	labels project this way too) */
-	if (view_w <= 0.0f || view_h <= 0.0f || render.frustum.projection_matrix[0][0] == 0.0f ||
-		!render_camera_world_to_screen(camera, &render.frustum, point, &screen))
-	{
-		return FALSE;
-	}
-	*x = (screen.x - (float)camera->viewport_bounds.x0) / view_w;
-	*y = (screen.y - (float)camera->viewport_bounds.y0) / view_h;
-	return TRUE;
-}
+The touch works out where things are on the screen, and the line through a
+point of it, from the Forge's own camera (the Monitor's pose, as the observer
+is given it: forge_compute_live_monitor_camera_pose) and the field of view the
+game draws it with (main.c's: the observer's 80 degrees, made vertical, and
+display.fov's, view_fov.c), never from the renderer's globals: when the Forge
+runs, those are the menus' and the HUD's pass, not the world's, and nothing was
+ever found under a finger. The screen's shape is the HUD's (its window and
+margins, forge_touch_draw). */
+
+extern real render_fov_vertical(short local_player_index, real native_vertical_field_of_view);
+static void forge_compute_live_monitor_camera_pose(real_point3d *out_pos, real_vector3d *out_fwd, real_vector3d *out_up);
+
+struct forge_touch_camera
+{
+	real_point3d position;
+	real_vector3d forward, right, up;
+	/* the tangents of half the view, up and across */
+	float tangent_y, tangent_x;
+};
 
 static boolean forge_touch_normalize(real_vector3d *v)
 {
@@ -1127,99 +1126,80 @@ static boolean forge_touch_normalize(real_vector3d *v)
 	return TRUE;
 }
 
-/* how far from (x, y) a line from the camera along direction comes back on the
-screen, in shares of its height (large when it cannot be told) */
-static float forge_touch_ray_error(real_vector3d const *direction, float x, float y)
+/* the screen's width over its height */
+static float forge_touch_aspect(void)
 {
-	struct render_camera const *camera = &render.camera;
-	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
-	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
-	real_point3d point;
-	float sx, sy, dx, dy;
+	if (s_touch.window_known && s_touch.window_y0 + s_touch.window_y1 > 0)
+	{
+		float aspect = (float)(s_touch.window_x0 + s_touch.window_x1) / (float)(s_touch.window_y0 + s_touch.window_y1);
 
-	point.x = camera->position.x + direction->i * 10.0f;
-	point.y = camera->position.y + direction->j * 10.0f;
-	point.z = camera->position.z + direction->k * 10.0f;
-	if (view_h <= 0.0f || !forge_touch_on_screen(&point, &sx, &sy))
-		return 1000.0f;
-	dx = (sx - x) * view_w / view_h;
-	dy = sy - y;
-	return (float)sqrt((double)(dx * dx + dy * dy));
+		if (aspect > 0.5f && aspect < 4.0f)
+			return aspect;
+	}
+	return 16.0f / 9.0f;
 }
 
-/* the line from the camera through a point of the screen (shares), from the
-frame last drawn; FALSE if it cannot be told. Three ways (the projection
-undone, and the camera's axes with its field of view taken as vertical or as
-horizontal), and the one that comes back on the screen nearest the point */
+static boolean forge_touch_camera_get(struct forge_touch_camera *camera)
+{
+	/* (main.c: 2 atan(0.75 tan(fov / 2) 0.85), the observer's fov the Monitor's 80 degrees) */
+	float native = 2.0f * (float)atan(0.75 * 0.85 * tan(1.3962634 * 0.5));
+	float vertical = render_fov_vertical(0, native);
+
+	forge_compute_live_monitor_camera_pose(&camera->position, &camera->forward, &camera->up);
+	if (!forge_touch_normalize(&camera->forward) || !forge_touch_normalize(&camera->up))
+		return FALSE;
+	/* (Halo's world: x ahead, y left, z up; ahead across up is the right) */
+	camera->right.i = camera->forward.j * camera->up.k - camera->forward.k * camera->up.j;
+	camera->right.j = camera->forward.k * camera->up.i - camera->forward.i * camera->up.k;
+	camera->right.k = camera->forward.i * camera->up.j - camera->forward.j * camera->up.i;
+	if (!forge_touch_normalize(&camera->right))
+		return FALSE;
+	if (!(vertical > 0.1f && vertical < 3.0f))
+		vertical = native;
+	camera->tangent_y = (float)tan((double)(vertical * 0.5f));
+	camera->tangent_x = camera->tangent_y * forge_touch_aspect();
+	return camera->tangent_y > 0.0f;
+}
+
+/* where a point of the world is on the screen (shares, 0..1 across and down);
+FALSE when it is behind the camera. depth: how far ahead it is */
+static boolean forge_touch_on_screen(real_point3d const *point, float *x, float *y, float *depth)
+{
+	struct forge_touch_camera camera;
+	float vx, vy, vz, ahead, across, up;
+
+	if (!forge_touch_camera_get(&camera))
+		return FALSE;
+	vx = point->x - camera.position.x;
+	vy = point->y - camera.position.y;
+	vz = point->z - camera.position.z;
+	ahead = vx * camera.forward.i + vy * camera.forward.j + vz * camera.forward.k;
+	if (ahead < 0.1f)
+		return FALSE;
+	across = vx * camera.right.i + vy * camera.right.j + vz * camera.right.k;
+	up = vx * camera.up.i + vy * camera.up.j + vz * camera.up.k;
+	*x = 0.5f + 0.5f * across / (ahead * camera.tangent_x);
+	*y = 0.5f - 0.5f * up / (ahead * camera.tangent_y);
+	if (depth)
+		*depth = ahead;
+	return TRUE;
+}
+
+/* the line from the camera through a point of the screen (shares) */
 static boolean forge_touch_screen_ray(float x, float y, real_vector3d *direction)
 {
-	struct render_camera const *camera = &render.camera;
-	struct render_frustum const *frustum = &render.frustum;
-	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
-	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
-	float ndc_x = 2.0f * x - 1.0f;
-	float ndc_y = 2.0f * y - 1.0f;
-	float best_error = 1000.0f;
-	real_vector3d candidates[3];
-	int valid[3];
-	int i;
+	struct forge_touch_camera camera;
+	float across, up;
 
-	if (view_w <= 0.0f || view_h <= 0.0f)
+	if (!forge_touch_camera_get(&camera))
 		return FALSE;
-	memset(valid, 0, sizeof(valid));
-	/* (render_camera_view_to_screen, the other way: the view's -z is ahead) */
-	if (frustum->projection_matrix[0][0] != 0.0f && frustum->projection_matrix[1][1] != 0.0f)
-	{
-		real_vector3d view;
-
-		view.i = (ndc_x + frustum->projection_matrix[2][0]) / frustum->projection_matrix[0][0];
-		view.j = (frustum->projection_matrix[2][1] - ndc_y) / frustum->projection_matrix[1][1];
-		view.k = -1.0f;
-		matrix4x3_transform_vector(&frustum->view_to_world, &view, &candidates[0]);
-		valid[0] = forge_touch_normalize(&candidates[0]);
-	}
-	/* (the camera's forward, its right, its up) */
-	{
-		real_vector3d forward = camera->forward, up = camera->up, right;
-		float half = camera->vertical_field_of_view * 0.5f;
-		float aspect = view_w / view_h;
-		float t = (float)tan((double)half);
-		int k;
-
-		right.i = forward.j * up.k - forward.k * up.j;
-		right.j = forward.k * up.i - forward.i * up.k;
-		right.k = forward.i * up.j - forward.j * up.i;
-		if (half > 0.01f && half < 1.5f && forge_touch_normalize(&forward) && forge_touch_normalize(&up) &&
-			forge_touch_normalize(&right))
-		{
-			for (k = 0; k < 2; k++)
-			{
-				float sx = k == 0 ? t * aspect : t;
-				float sy = k == 0 ? t : t / aspect;
-
-				candidates[1 + k].i = forward.i + right.i * ndc_x * sx - up.i * ndc_y * sy;
-				candidates[1 + k].j = forward.j + right.j * ndc_x * sx - up.j * ndc_y * sy;
-				candidates[1 + k].k = forward.k + right.k * ndc_x * sx - up.k * ndc_y * sy;
-				valid[1 + k] = forge_touch_normalize(&candidates[1 + k]);
-			}
-		}
-	}
-	for (i = 0; i < 3; i++)
-	{
-		float error;
-
-		if (!valid[i])
-			continue;
-		error = forge_touch_ray_error(&candidates[i], x, y);
-		if (error < best_error)
-		{
-			best_error = error;
-			*direction = candidates[i];
-		}
-	}
-	/* (none comes back near the finger: the frame is not this camera's) */
-	s_touch.last_ray_error = best_error;
-	return best_error < 0.08f;
+	across = (2.0f * x - 1.0f) * camera.tangent_x;
+	up = (1.0f - 2.0f * y) * camera.tangent_y;
+	direction->i = camera.forward.i + camera.right.i * across + camera.up.i * up;
+	direction->j = camera.forward.j + camera.right.j * across + camera.up.j * up;
+	direction->k = camera.forward.k + camera.right.k * across + camera.up.k * up;
+	s_touch.last_ray_error = 0.0f;
+	return forge_touch_normalize(direction);
 }
 
 /* ---------- what is under the finger
@@ -1236,19 +1216,15 @@ finger it shows, a little more for what shows big. */
 
 static float forge_touch_screen_distance(real_point3d const *point, float radius, float x, float y)
 {
-	struct render_camera const *camera = &render.camera;
-	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
-	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
 	float sx, sy, dx, dy, depth, size;
+	struct forge_touch_camera camera;
 
-	if (view_h <= 0.0f || !forge_touch_on_screen(point, &sx, &sy))
+	if (!forge_touch_on_screen(point, &sx, &sy, &depth) || !forge_touch_camera_get(&camera))
 		return 1000.0f;
-	dx = (sx - x) * view_w / view_h;
+	dx = (sx - x) * forge_touch_aspect();
 	dy = sy - y;
-	/* (how big it shows: its radius over its depth, the field of view about 70 degrees) */
-	depth = (point->x - camera->position.x) * camera->forward.i + (point->y - camera->position.y) * camera->forward.j +
-		(point->z - camera->position.z) * camera->forward.k;
-	size = depth > 0.5f ? radius / (depth * 1.4f) : 0.0f;
+	/* (how big it shows: its radius over its depth, in shares of the height) */
+	size = radius / (depth * camera.tangent_y * 2.0f);
 	if (size > 0.2f)
 		size = 0.2f;
 	return (float)sqrt((double)(dx * dx + dy * dy)) - size;
@@ -1799,11 +1775,11 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 			point.x = inst->x;
 			point.y = inst->y;
 			point.z = inst->z + 0.2f;
-			if (g_forge.grabbed_live_index < 0 && render_camera_world_to_screen(&render.camera, &render.frustum, &point, &screen))
+			if (g_forge.grabbed_live_index < 0 && forge_touch_on_screen(&point, &screen.x, &screen.y, NULL))
 			{
-				short sx = (short)(window_x0 + (short)(screen.x + 0.5f));
-				short sy = (short)(window_y0 + (short)(screen.y + 0.5f));
+				short sx, sy;
 
+				forge_touch_to_window(screen.x, screen.y, &sx, &sy);
 				draw_box_border((short)(sx - 18), (short)(sy - 18), (short)(sx + 18), (short)(sy + 18), 2, 0xFFFFC824u);
 			}
 		}
@@ -1842,11 +1818,14 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 				(short)(y0 + line / 2 + (i + 1) * line), 0, lines[i], 0xFFFFFFFFu);
 		}
 		/* (how the touch went: for a screenshot when something fails) */
-		snprintf(buf, sizeof(buf), "Prueba tactil: linea %.3f  dedo en %d/%ld  agarrado %d  pantalla %dx%d",
-			s_touch.last_ray_error, (int)s_touch.last_down_live, s_touch.last_down_object,
-			(int)g_forge.grabbed_live_index,
-			(int)(render.camera.viewport_bounds.x1 - render.camera.viewport_bounds.x0),
-			(int)(render.camera.viewport_bounds.y1 - render.camera.viewport_bounds.y0));
+		{
+			struct forge_touch_camera camera;
+			int known = forge_touch_camera_get(&camera);
+
+			snprintf(buf, sizeof(buf), "Prueba tactil: camara %s  vista %.2f x %.2f  dedo en %d/%ld  agarrado %d",
+				known ? "si" : "no", known ? camera.tangent_x : 0.0f, known ? camera.tangent_y : 0.0f,
+				(int)s_touch.last_down_live, s_touch.last_down_object, (int)g_forge.grabbed_live_index);
+		}
 		draw_ce_menu_str_box(0, font, (short)(x0 + 10), (short)(y0 + line / 2 + i * line), (short)(x1 - 10),
 			(short)(y0 + line / 2 + (i + 1) * line), 0, buf, 0xFF9FD8FFu);
 	}

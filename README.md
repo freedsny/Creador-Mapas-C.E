@@ -24,7 +24,11 @@ Al abrirla, el menú empieza en **FORJA**. Elige el mapa y entras volando como e
 
 | Gesto | Qué hace |
 |---|---|
-| Tocar un objeto | Lo eliges: abajo salen **MOVER, GIRAR, COPIAR, AJUSTES, BORRAR** |
+| **+ OBJETOS** y elegir uno | Queda en tu mano y en la **barra rápida** de abajo (9 casillas, como en Minecraft) |
+| Con algo en la mano, tocar el suelo | Pones uno ahí; toca varias veces para poner varios |
+| Tocar una casilla de la barra | La pones en la mano; tocarla otra vez deja la mano vacía |
+| Mantener el dedo quieto sobre un objeto | Lo borras (una barra roja muestra cuánto falta) |
+| Con la mano vacía, tocar un objeto | Lo eliges: salen **MOVER, GIRAR, COPIAR, AJUSTES, BORRAR** |
 | Arrastrar un objeto | Lo llevas por el suelo bajo el dedo; al levantar el dedo queda ahí |
 | Arrastrar donde no hay nada | Miras alrededor |
 | Con un objeto agarrado, tocar | Lo pones donde tocaste |
@@ -36,6 +40,7 @@ Al abrirla, el menú empieza en **FORJA**. Elige el mapa y entras volando como e
 | **GUARDAR** | Guarda el mapa (la primera vez le pones nombre) |
 | **EXPORTAR** | Guarda una copia del `.map` donde elijas (Descargas, Drive…) |
 | **MAPA** | Los ajustes del mapa |
+| **VACIAR** (dos toques) | Quita todos los objetos del mapa y deja el terreno, para empezar desde cero |
 | **PROBAR** | Juegas el mapa como Spartan; vuelves a la Forja con la cruceta **DERECHA** |
 | **?** | La ayuda en pantalla |
 | **START** | El menú de pausa |
