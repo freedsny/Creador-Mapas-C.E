@@ -656,7 +656,10 @@ void forge_render_end_monitor_visibility(void)
 	}
 }
 
-#define FORGE_IN_MATCH_HUD_SCALE 0.75f
+/* Halo Forge Evolved: the Forge's menus (its palette, an object's settings,
+saving) on a touchscreen are drawn larger, for fingers (forge_touch.inl) */
+static float forge_touch_menu_scale(float scale);
+#define FORGE_IN_MATCH_HUD_SCALE forge_touch_menu_scale(0.75f)
 #define FORGE_COUNTER_HUD_SCALE (FORGE_IN_MATCH_HUD_SCALE * 0.5f)
 
 static float s_hud_ui_scale = 1.0f;

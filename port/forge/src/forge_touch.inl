@@ -77,6 +77,9 @@ Forge acts as a key goes down (one frame), and lets go the next */
 #define FORGE_TOUCH_PULSE_FRAMES 2
 #define FORGE_TOUCH_MAX_FINGERS 5
 #define FORGE_TOUCH_MAX_BUTTONS 24
+/* the Forge's menus on a touchscreen: this many times as large (0.75 becomes
+1.1: the palette then fills most of the screen's height) */
+#define FORGE_TOUCH_MENU_GROWTH 1.47f
 
 enum
 {
@@ -210,6 +213,13 @@ static void forge_touch_ready(void)
 }
 
 /* ---------- small helpers */
+
+/* (FORGE_IN_MATCH_HUD_SCALE) the Forge's menus' scale: larger once a finger
+has been handed over, so that a row is a finger high (a desktop's as it was) */
+static float forge_touch_menu_scale(float scale)
+{
+	return s_touch_ready && s_touch.seen ? scale * FORGE_TOUCH_MENU_GROWTH : scale;
+}
 
 static float forge_touch_abs(float v)
 {
