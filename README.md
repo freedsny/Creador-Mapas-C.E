@@ -1,6 +1,6 @@
-# Creador de Mapas C.E (Halo Forja)
+# Halo Forge Evolved
 
-App para **Android** hecha solo para **crear mapas de Halo CE y exportarlos**: la Forja sacada a una app aparte, más simple y **táctil** (tocar para elegir, arrastrar con el dedo, girar con dos dedos).
+**Map Creation Studio.** App para **Android** hecha solo para **crear mapas de Halo CE y exportarlos**: la Forja sacada a una app aparte, más simple y **táctil** (tocar para elegir, arrastrar con el dedo, girar con dos dedos).
 
 **Creador: freddVelp ([@freedsny](https://github.com/freedsny)).**
 
@@ -20,7 +20,7 @@ App para **Android** hecha solo para **crear mapas de Halo CE y exportarlos**: l
 
 ## En qué se basa
 
-Sobre la Forja (Faber) de [Halo Content Evolved](https://github.com/Watanoge/halo-content-evolved) de Watanoge, que guarda mapas de Custom Edition, hecha sobre [Content Extended Additions](https://github.com/SutlabSol/Content-Extended-Additions) de MotaLev y sobre [OpenCE](https://github.com/OpenCommunityEdition/OpenCE). Ideas tomadas también de la Forge de [Chupathingy](https://github.com/ChupathingyCE/chupathingyce).
+Este repositorio tiene el código completo de Content Evolved (rama `watanoge`, sin tocar) con los cambios de la Forja encima (rama `main`). Es la Forja (Faber) de [Halo Content Evolved](https://github.com/Watanoge/halo-content-evolved) de Watanoge, que guarda mapas de Custom Edition, hecha sobre [Content Extended Additions](https://github.com/SutlabSol/Content-Extended-Additions) de MotaLev y sobre [OpenCE](https://github.com/OpenCommunityEdition/OpenCE). Ideas tomadas también de la Forge de [Chupathingy](https://github.com/ChupathingyCE/chupathingyce).
 
 Los mapas exportados se juegan en cualquier port con mapas de Custom Edition (OpenCE, Content Evolved, Chupathingy) y en Halo PC / Custom Edition.
 
@@ -32,6 +32,12 @@ Los mapas exportados se juegan en cualquier port con mapas de Custom Edition (Op
 4. Exportar y compartir.
 5. Pulir: modo simple y avanzado, todo en español.
 
-## Estado
+## Cómo conseguir el APK
 
-Empezando. Las versiones de prueba se compilan primero en la rama `pruebas`.
+En **Releases** de este repositorio. Se llama **Halo Forge Evolved** y se instala al lado de Halo C.E y de Halo C.E Evolved. La primera vez pide tu imagen de disco de Halo y saca los mapas.
+
+Las versiones de prueba salen de la rama `pruebas` como borrador privado y son otra app, **Forge PRUEBA**.
+
+## Licencia
+
+AGPL-3.0, la de Content Evolved (ver `LICENSE`). El README original de Watanoge está en `README-ContentEvolved.md`.
