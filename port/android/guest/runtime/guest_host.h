@@ -187,6 +187,9 @@ map chosen, or each in a .zip file chosen, into folder (a path: custom_maps;
 HaloActivity.importMaps); returns at once, the copy done on the app's own
 thread */
 void host_android_import_maps(const char *folder);
+/* Halo Forge Evolved: a copy of a map the Forge saved (path, the .map) where
+the player chooses (HaloActivity.exportForgeMap, the system's "save as") */
+void host_android_export_map(const char *path);
 /* the game's files moved to the app's storage ("app") or a folder the player
 picks ("other"): the app asks, then starts the game again to move them
 (HaloActivity.moveGameFiles) */

@@ -76,6 +76,10 @@ public class HaloActivity extends SDLActivity {
     private static final long TEXT_BAR_HIDE_DELAY_MS = 120;
     private static final int EXPORT_LAYOUT = 401, IMPORT_LAYOUT = 402, EXPORT_REPLAYS = 403, IMPORT_REPLAYS = 404,
         IMPORT_MODS = 405, IMPORT_VK_DRIVERS = 406, IMPORT_MAPS = 407;
+    /** Halo Forge Evolved: EXPORTAR's "save as" (exportForgeMap) */
+    private static final int EXPORT_FORGE_MAP = 451;
+    /** the map EXPORTAR copies, while the system's "save as" is up */
+    private String pendingForgeMap;
     private String pendingLayoutExport;
     private static final int PICK_MAPS_FOLDER = 408, MAPS_FOLDER_ACCESS = 409;
     /** the custom maps folder chosen, while its storage access is asked for */
@@ -792,6 +796,51 @@ public class HaloActivity extends SDLActivity {
     }
 
     /**
+     * Halo Forge Evolved: the Forge's EXPORTAR (port/forge/src/forge_touch.inl, through host_android_export_map):
+     * the system's "save as" (the phone's folders, Drive...), then a copy of the map the Forge saved, path, there.
+     * Halo C.E and Halo C.E Evolved take it in with IMPORTAR in their map lists. Called on the game's thread; no
+     * storage permission.
+     */
+    public void exportForgeMap(String path) {
+        runOnUiThread(() -> {
+            File map = path != null ? new File(path) : null;
+            if (map == null || !map.isFile()) {
+                Toast.makeText(this, "Primero guarda el mapa con GUARDAR.", Toast.LENGTH_LONG).show();
+                return;
+            }
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            intent.setType("application/octet-stream");
+            intent.putExtra(Intent.EXTRA_TITLE, map.getName());
+            pendingForgeMap = path;
+            try {
+                startActivityForResult(intent, EXPORT_FORGE_MAP);
+            } catch (android.content.ActivityNotFoundException e) {
+                pendingForgeMap = null;
+                Toast.makeText(this, "Este celular no tiene selector de archivos.", Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+    /** EXPORTAR's copy, away from the UI thread: the map at path into the document chosen */
+    private void copyForgeMap(String path, Uri document) {
+        boolean copied = false;
+        try (InputStream input = new FileInputStream(path);
+             OutputStream output = getContentResolver().openOutputStream(document, "w")) {
+            if (output != null) {
+                copyStream(input, output);
+                copied = true;
+            }
+        } catch (IOException | SecurityException e) {
+            android.util.Log.w("Halo", "exportForgeMap: " + e);
+        }
+        boolean done = copied;
+        runOnUiThread(() -> Toast.makeText(this, done
+            ? "Mapa exportado. Para jugarlo, ábrelo en Halo C.E con IMPORTAR en la lista de mapas."
+            : "No se pudo exportar el mapa.", Toast.LENGTH_LONG).show());
+    }
+
+    /**
      * The map lists' IMPORT (New Game's and the Map screen's: port/linux/game/menu_functions.c, through
      * host_android_import_maps): the system's file picker, several files at once, then each Custom Edition map chosen
      * copied into folder, custom_maps, where the lists find it. A .zip file gives the .map files in it, wherever
@@ -1111,6 +1160,15 @@ public class HaloActivity extends SDLActivity {
             List<Uri> documents = chosenDocuments(data);
             if (!documents.isEmpty())
                 new Thread(() -> copyModsIn(documents, folder), "halo-import-mods").start();
+            return;
+        }
+        if (request == EXPORT_FORGE_MAP) {
+            String path = pendingForgeMap;
+            pendingForgeMap = null;
+            if (result == RESULT_OK && data != null && data.getData() != null && path != null) {
+                Uri document = data.getData();
+                new Thread(() -> copyForgeMap(path, document), "halo-export-forge-map").start();
+            }
             return;
         }
         if (request == EXPORT_REPLAYS) {

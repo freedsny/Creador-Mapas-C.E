@@ -30,5 +30,7 @@ host_android_import_mods
 host_android_import_vk_drivers
 # the map lists' IMPORT (port/android/host/host_main.c; port/linux/game/menu_functions.c)
 host_android_import_maps
+# Halo Forge Evolved: EXPORTAR, a Forge map saved where the player chooses (host_main.c; port/forge/src/forge_touch.inl)
+host_android_export_map
 # Settings > Gameplay > GAME FILES (port/android/host/host_main.c; menu_functions.c)
 host_android_move_game_files

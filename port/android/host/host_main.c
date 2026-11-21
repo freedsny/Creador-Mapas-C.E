@@ -717,6 +717,14 @@ void host_android_import_maps(const char *folder)
 	host_android_folder_call("importMaps", folder);
 }
 
+/* Halo Forge Evolved: asks the activity to save a copy of a map the Forge
+made, path, where the player chooses (HaloActivity.exportForgeMap: the
+system's "save as", then the copy on a thread of its own) */
+void host_android_export_map(const char *path)
+{
+	host_android_folder_call("exportForgeMap", path);
+}
+
 /* asks the activity to move the game's files (maps, custom_maps, mods,
 mcc_maps): where "app" (the app's storage) or "other" (a folder the player
 picks); it asks, and starts the game again to move them before it runs

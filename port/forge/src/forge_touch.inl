@@ -52,6 +52,7 @@ _touch_scene_forge_menu) */
 #if defined(HALO_ANDROID) && !defined(HALO_SWITCH)
 /* port/android/guest/runtime/guest_host.h */
 int host_touch_forge_read(int *events, int maximum);
+void host_android_export_map(const char *path);
 #define FORGE_TOUCH_HOST 1
 #else
 #define FORGE_TOUCH_HOST 0
@@ -59,6 +60,8 @@ int host_touch_forge_read(int *events, int maximum);
 
 /* save the map (forge_runtime_tags.c): the name asked the first time */
 extern void forge_trigger_save_map_action(void);
+/* a d:\ path's file on this machine (the port's file layer) */
+extern void platform_translate_path(const char *xbox_path, char *host_path, unsigned long host_path_size);
 
 /* a finger moves this far (a share of the screen's height) before it is a
 drag, not a tap; a tap is at most this long */
@@ -111,6 +114,7 @@ enum
 	_forge_touch_button_floor,
 	_forge_touch_button_back,
 	_forge_touch_button_snap,
+	_forge_touch_button_export,
 	NUMBER_OF_FORGE_TOUCH_BUTTONS
 };
 
@@ -361,6 +365,50 @@ static void forge_touch_force(int32_t live, long object)
 	s_touch.force_frames = FORGE_TOUCH_PULSE_FRAMES;
 }
 
+/* EXPORTAR: a copy of the map saved (GUARDAR), where the player chooses
+(HaloActivity.exportForgeMap); saved first if it never was */
+static void forge_touch_export(void)
+{
+	static char const *const places[] = {
+		"d:\\Faber_data\\forge_maps\\%s\\%s.map",
+		"d:\\custom_maps\\%s.map",
+		"d:\\OpenCE Forge\\forge_maps\\%s\\%s.map",
+		"d:\\forge_maps\\%s\\%s.map",
+	};
+	char name[128];
+	int i;
+
+	if (!g_forge.has_saved_map_once || !g_forge.save_map_name[0])
+	{
+		forge_set_status("Primero GUARDAR el mapa: luego EXPORTAR");
+		forge_trigger_save_map_action();
+		return;
+	}
+	snprintf(name, sizeof(name), "%s", g_forge.save_map_name);
+	for (i = 0; i < (int)(sizeof(places) / sizeof(places[0])); i++)
+	{
+		char xbox_path[512];
+		char host_path[1024];
+		FILE *file;
+
+		snprintf(xbox_path, sizeof(xbox_path), places[i], name, name);
+		platform_translate_path(xbox_path, host_path, sizeof(host_path));
+		file = (FILE *)forge_host_fopen(host_path, "rb");
+		if (!file)
+			continue;
+		fclose(file);
+		platform_log("Forge: EXPORTAR %s (%s)", xbox_path, host_path);
+#if FORGE_TOUCH_HOST
+		host_android_export_map(host_path);
+		forge_set_status("Elige donde guardar '%s.map'", name);
+#else
+		forge_set_status("El mapa esta en %s", host_path);
+#endif
+		return;
+	}
+	forge_set_status("No se encontro '%s.map': GUARDAR otra vez", name);
+}
+
 static void forge_touch_press(int what)
 {
 	int vk;
@@ -485,6 +533,10 @@ static void forge_touch_press(int what)
 		break;
 	case _forge_touch_button_back:
 		forge_touch_pulse(VK_ESCAPE);
+		break;
+	case _forge_touch_button_export:
+		s_touch.chosen = -1;
+		forge_touch_export();
 		break;
 	}
 }
@@ -1116,20 +1168,21 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 	}
 	/* the top: what is done to the map */
 	{
-		static char const *const texts[] = { "+ OBJETOS", "DESHACER", "REHACER", "GUARDAR" };
+		static char const *const texts[] = { "+ OBJETOS", "DESHACER", "REHACER", "GUARDAR", "EXPORTAR" };
 		static int const whats[] = {
-			_forge_touch_button_palette, _forge_touch_button_undo, _forge_touch_button_redo, _forge_touch_button_save };
+			_forge_touch_button_palette, _forge_touch_button_undo, _forge_touch_button_redo, _forge_touch_button_save,
+			_forge_touch_button_export };
 		short y0 = (short)(window_y0 + h * 0.02f);
 
-		forge_touch_row(font, (short)(window_x0 + w * 0.015f), y0, (short)(y0 + bh), (short)(w * 0.1f), gap, texts, whats, 4);
+		forge_touch_row(font, (short)(window_x0 + w * 0.015f), y0, (short)(y0 + bh), (short)(w * 0.082f), gap, texts, whats, 5);
 	}
 	{
 		static char const *const texts[] = { "MAPA", "PROBAR", "?" };
 		static int const whats[] = { _forge_touch_button_map, _forge_touch_button_test, _forge_touch_button_help };
 		short y0 = (short)(window_y0 + h * 0.02f);
-		short widths = (short)(w * 0.085f);
+		short widths = (short)(w * 0.08f);
 
-		forge_touch_row(font, (short)(window_x0 + w * 0.655f), y0, (short)(y0 + bh), widths, gap, texts, whats, 3);
+		forge_touch_row(font, (short)(window_x0 + w * 0.64f), y0, (short)(y0 + bh), widths, gap, texts, whats, 3);
 	}
 	/* the right: up and down */
 	{
