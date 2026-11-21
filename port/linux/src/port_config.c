@@ -1,0 +1,5176 @@
+/*
+PORT_CONFIG.C
+
+The native ports' settings (port_config.h), parsed with tomlc17
+(port/third_party/tomlc17). Every setting is in the table below with its
+type, default, the HALO_* environment variable that overrides it and the
+comment written into a new file. The file is read once, on the first
+question; unknown keys and values of the wrong type are reported in the log
+and the defaults used instead. A missing setting is added to an existing
+file, and a section that was opened twice is joined into one (a repeated
+key keeps its earlier line). Anything else is left as it is, so the
+player's edits and comments stay.
+*/
+
+#include "platform.h"
+#include "port_config.h"
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+/* (the command line: --config, --server, --probe...) */
+#include "posix.h"
+#include "posix_server.h"
+#endif
+#include "tomlc17.h"
+
+#include <SDL3/SDL.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+#ifdef HALO_SWITCH
+/* the guest's write is not on the card until the host commits it
+(port/switch/host/host_main.c) */
+void host_storage_commit(void);
+#endif
+
+#ifdef HALO_CONFIG_SECTIONS_TEST
+/* platform.h declares this. Repeated so the section check can be compiled
+without that header */
+void platform_log(const char *format, ...);
+/* (for the profile folder the check makes: the port's <sys/stat.h> is MSVC's
+and has no mkdir) */
+int mkdir(const char *path, unsigned int mode);
+#endif
+
+/* ---------- the settings */
+
+enum config_type
+{
+	_config_boolean,
+	_config_integer,
+	_config_real,
+	_config_string,
+};
+
+/* how the setting's environment variable sets it */
+enum config_environment
+{
+	/* the variable's text is the value ("0", "false", "no" and "off" are
+	false for a boolean) */
+	_environment_value,
+	/* the variable being set (not empty, "0", "false", "no" or "off") makes it true */
+	_environment_set_is_true,
+	/* the variable being set (not empty, "0", "false", "no" or "off") makes it false */
+	_environment_set_is_false,
+};
+
+/* the builds a setting means something in, and is written for */
+enum
+{
+	_platform_desktop = 1,
+	_platform_android = 2,
+	_platform_all = _platform_desktop | _platform_android,
+	/* (of the desktop builds, only Windows) */
+	_platform_windows = 4,
+	/* (the web build, which has the desktop's settings, and these) */
+	_platform_web = 8,
+	/* (a dedicated server's, of the Linux and Windows builds: written into
+	config.toml only in server mode) */
+	_platform_server = 16,
+	/* (the Linux builds whose game runs as a guest of the Android port's
+	host, port/linux/host, which have the desktop's settings, and the
+	host's own) */
+	_platform_guest = 32,
+#ifdef HALO_PS5
+	/* (the PS5's, port/ps5: a guest build, with the console's own rows and
+	the Vulkan renderer's debugging rows, which its host reads) */
+	_platform_ps5 = 64,
+#elif defined(HALO_MACOS)
+	/* (the macOS build's, port/macos: a guest build with the Vulkan
+	renderer, whose debugging rows it has) */
+	_platform_macos = 64,
+#endif
+	/* (those hosting from the menus has too, on Android, the Switch and the
+	PS5: port/linux/game/host_dashboard.c) */
+	_platform_host = 128,
+};
+
+/* the Vulkan renderer's debugging rows: Android's, and the PS5's */
+#ifdef HALO_PS5
+#define PLATFORM_VULKAN (_platform_android | _platform_ps5)
+#elif defined(HALO_MACOS)
+#define PLATFORM_VULKAN (_platform_android | _platform_macos)
+#else
+#define PLATFORM_VULKAN _platform_android
+#endif
+
+/* the rows the hosts read: Android's and the Switch's, and the PS5's */
+#ifdef HALO_PS5
+#define PLATFORM_HOST (_platform_android | _platform_ps5)
+#else
+#define PLATFORM_HOST _platform_android
+#endif
+
+/* the gyroscope's rows: every platform's (the phone's on Android, a
+controller's with one everywhere: the Switch's, the DualSense, a DualShock
+4, a Switch Pro Controller on a PC), and the PS5's (the DualSense's) */
+#ifdef HALO_PS5
+#define PLATFORM_GYRO _platform_ps5
+#else
+#define PLATFORM_GYRO _platform_all
+#endif
+
+struct config_setting
+{
+	const char *name;
+	enum config_type type;
+	/* as it is written in the file */
+	const char *default_value;
+	/* NULL: none, for a setting the Android app reads from the file itself */
+	const char *environment;
+	enum config_environment environment_style;
+	unsigned platforms;
+	const char *comment;
+};
+
+/* crouching's keys (in a browser C alone: a page cannot keep Ctrl+W, Ctrl+S or
+Ctrl+D, which moving and crouching would press, from the browser) */
+#ifdef HALO_WEB
+#define CROUCH_KEYS "\"C\""
+#else
+#define CROUCH_KEYS "\"Left Ctrl, C\""
+#endif
+
+/* display.resolution_scaling's default: on Android the Xbox's 480 lines, which
+a phone's GPU draws with time to spare, elsewhere the window's resolution */
+#ifdef HALO_ANDROID
+#define RESOLUTION_SCALING "\"original\""
+#else
+#define RESOLUTION_SCALING "\"native\""
+#endif
+
+static const struct config_setting config_settings[] =
+{
+	{ "display.fullscreen", _config_boolean, "true", "HALO_FULLSCREEN", _environment_value, _platform_desktop,
+		"Where display.mode is empty: start borderless over the whole display;\n"
+		"false starts in a window. F11 switches." },
+	{ "display.mode", _config_string, "\"\"", "HALO_DISPLAY_MODE", _environment_value, _platform_desktop,
+		"\"fullscreen\" takes the display (at display.resolution's mode),\n"
+		"\"borderless\" is a window over the whole desktop, \"windowed\" a window\n"
+		"(display.window_size). Empty: display.fullscreen's (true: borderless).\n"
+		"F11 switches to the window and back." },
+	{ "display.resolution", _config_string, "\"native\"", "HALO_RESOLUTION", _environment_value, _platform_desktop,
+		"What fullscreen and borderless draw at: \"native\", the display's own, or\n"
+		"\"<width>x<height>\" (\"1920x1080\"), 640x480 or more. Fullscreen sets the\n"
+		"display to it; borderless draws it scaled to the display." },
+	{ "display.resolution_scaling", _config_string, RESOLUTION_SCALING, "HALO_RESOLUTION_SCALING", _environment_value,
+		_platform_all,
+		"\"native\" draws at the window's resolution (fullscreen, the display's or\n"
+		"display.resolution; on Android, the display's); \"75%\", \"50%\" or \"25%\"\n"
+		"draw that part of it each way and scale it up; \"original\" draws the\n"
+		"Xbox's 480 lines (640x480; on Android, at the display's shape) and\n"
+		"scales them up, as Android does unless this is set." },
+	{ "display.window_size", _config_string, "\"\"", "HALO_WINDOW_SIZE", _environment_value, _platform_desktop,
+		"The window's size, \"<width>x<height>\" (\"1920x1080\"), 640x480 or more (it\n"
+		"can be resized). Empty: display.window_scale's." },
+	{ "display.window_scale", _config_integer, "2", "HALO_WINDOW_SCALE", _environment_value, _platform_desktop,
+		"Where display.window_size is empty: the window's size as a multiple of\n"
+		"640x480." },
+#ifdef HALO_PS5
+	/* (the Switch's setting, with the PS5's values: port/ps5/host/host_main.c
+	reads it, at the start and when the file changes) */
+	{ "display.resolution_limit", _config_string, "\"2160\"", "HALO_RESOLUTION_LIMIT", _environment_value,
+		_platform_ps5,
+		"The PS5's: the most lines the game draws at, \"2160\" (3840x2160), \"1440\"\n"
+		"(2560x1440) or \"1080\" (1920x1080), no more than the display shows (the\n"
+		"console's video output), which the picture is scaled to. Changes at once." },
+#endif
+	{ "display.screen_width", _config_integer, "0", "HALO_SCREEN_WIDTH", _environment_value, _platform_android,
+		"Columns of the 480-line picture: 0 for the display's shape, 640 for the\n"
+		"Xbox's 4:3." },
+#ifndef HALO_SWITCH
+	/* read by the Android host (port/android/host/host_vk_driver.c) */
+	{ "display.vk_driver", _config_string, "\"\"", "HALO_VK_DRIVER", _environment_value, _platform_android,
+		"The Vulkan driver the Vulkan renderer runs on: empty for the phone's own;\n"
+		"or the name of a driver archive (an adrenotools zip) in freedreno_drivers\n"
+		"in the game's folder, which Video Setup lists: the Turnip build the app\n"
+		"downloads on an Adreno GPU, and any other put or imported there. One that\n"
+		"does not load is logged and the phone's own is used." },
+	/* read by the Android host before the game starts, to choose the game
+	image built with that renderer (port/android/VULKAN.md) */
+	{ "display.renderer", _config_string, "\"vulkan\"", "HALO_RENDERER", _environment_value, _platform_android,
+		"How the game draws: \"vulkan\" (over display.vk_driver; OpenGL ES if Vulkan\n"
+		"cannot start, which sets this to \"gl\") or \"gl\" (OpenGL ES over the\n"
+		"phone's driver). Takes effect the next time the game starts. See the Android\n"
+		"README, \"Graphics: OpenGL ES and Vulkan\"." },
+#endif
+	{ "display.vsync", _config_boolean, "true", "HALO_NO_VSYNC", _environment_set_is_false, _platform_all,
+		"Wait for the display between frames; false draws as fast as possible." },
+	{ "display.max_fps", _config_integer, "0", "HALO_MAX_FPS", _environment_value, _platform_all,
+		"With vsync off, the most frames a second: 0 for twice the display's\n"
+		"refresh rate, -1 for no limit (which can hang some Intel graphics)." },
+	{ "display.frames_in_flight", _config_integer, "3", "HALO_FRAMES_IN_FLIGHT", _environment_value,
+		_platform_desktop,
+		"The most frames the GPU has queued (1 to 8): a frame waits for the GPU\n"
+		"to finish the one this many before it, so that frames come evenly when\n"
+		"the GPU is the slower; 0 leaves it to the driver." },
+	/* port: the frame counter the game draws at the bottom right of a game
+	(main.c's main_framerate_render, display_framerate) for a setting, so the
+	settings screens show it (tools/port_settings.py) and it is kept in
+	config.toml: true to draw it, green from 30 frames a second, red below */
+	{ "display.show_fps", _config_boolean, "false", "HALO_SHOW_FPS", _environment_set_is_true, _platform_all,
+		"Draw the frame rate at the bottom right of a game, counted over half a\n"
+		"second: green from 30 frames a second, red below." },
+	{ "display.anti_aliasing", _config_string, "\"off\"", "HALO_ANTI_ALIASING", _environment_value, _platform_all,
+		"Smoothing of jagged edges, which the Xbox did not have: \"off\"; \"fxaa\"\n"
+		"or \"smaa\" smooth the 3D view once it is drawn (the HUD and menus stay\n"
+		"sharp); \"ssaa2x\" draws at twice the resolution each way (four times\n"
+		"the work); \"msaa2x\", \"msaa4x\" or \"msaa8x\" draw with that many samples\n"
+		"a pixel. Android has \"fxaa\" for \"smaa\", and no \"ssaa2x\"." },
+	{ "display.interpolation", _config_boolean, "true", "HALO_INTERPOLATION", _environment_value, _platform_all,
+		"Draw a frame for every display refresh, blending between the game's 30\n"
+		"ticks a second; false keeps the original 30 frames a second." },
+	{ "display.menu_cursor", _config_string, "\"large\"", "HALO_MENU_CURSOR", _environment_value, _platform_desktop,
+		"The menus' pointer for the mouse: the game's blue arrow, \"small\",\n"
+		"\"medium\", \"large\" or \"extra_large\" (18, 24, 32 or 40 of the menus'\n"
+		"480 lines tall, at any resolution), or \"off\" for the system's pointer." },
+	{ "display.direct_camera", _config_boolean, "true", "HALO_DIRECT_CAMERA", _environment_value, _platform_desktop | _platform_android,
+		"In first person, point the view where the player aims now instead of\n"
+		"where the last tick left it: the view turns the frame the mouse moves,\n"
+		"not up to two ticks (66 ms) later." },
+	{ "display.fov", _config_real, "0.0", "HALO_FOV", _environment_value, _platform_all,
+		"The first-person view's field of view on foot, in degrees across at\n"
+		"16:9 (20 to 150); 0 keeps the stock view. Vehicles, cinematics and\n"
+		"scripted cameras keep their own." },
+	{ "display.viewmodel_fov", _config_real, "0.0", "HALO_VIEWMODEL_FOV", _environment_value, _platform_all,
+		"The first-person weapon's and hands' field of view, in degrees across\n"
+		"at 16:9 (20 to 150); 0 keeps the weapon's stock view, also when\n"
+		"display.fov widens the world." },
+	{ "display.viewmodel_visible", _config_boolean, "true", "HALO_VIEWMODEL_VISIBLE", _environment_value, _platform_all,
+		"Draw the first-person weapon, hands and what is attached to them.\n"
+		"Off, they are not drawn; firing, animation, sound and lights go on." },
+	{ "display.passenger_third_person", _config_boolean, "false", "HALO_PASSENGER_THIRD_PERSON", _environment_value, _platform_all,
+		"Third-person Warthog and Scorpion passengers. Weapon zoom is disabled." },
+	{ "display.high_res_hud", _config_boolean, "true", "HALO_HIGH_RES_HUD", _environment_value, _platform_all,
+		"Draw the HUD (meters, counters, panels, motion sensor, reticles,\n"
+		"waypoints, scopes) from the high-res assets (8x the maps' bitmaps);\n"
+		"false draws the maps' own bitmaps." },
+	{ "display.hud_button_style", _config_string, "\"classic\"", "HALO_HUD_BUTTON_STYLE", _environment_value, _platform_all,
+		"Manual high-res gameplay button style, preserved while automatic detection\n"
+		"is on. Xbox: classic, gems, menu_gems (dark gems), xbox_modern.\n"
+		"PlayStation: ps_classic, ps_gems, ps_dark_gems, ps_modern.\n"
+		"Switch: switch_classic, switch_gems, switch_modern. Controllers require high_res_hud.\n"
+		"keyboard selects binding-aware gameplay keycaps independently of high_res_hud." },
+	{ "display.menu_button_glyphs", _config_boolean, "false", "HALO_MENU_BUTTON_GLYPHS", _environment_value, _platform_all,
+		"Use the selected keyboard/controller style in PC-menu face-button legends." },
+	{ "display.keyboard_glyphs", _config_boolean, "false", "HALO_KEYBOARD_GLYPHS", _environment_value, _platform_all,
+		"With auto button detection on, show binding-aware gameplay keycaps after\n"
+		"keyboard/mouse activity. Off preserves existing prompts. Manual keyboard\n"
+		"style works with detection off. Menu legends require menu_button_glyphs." },
+	{ "display.hud_bumper_style", _config_string, "\"original\"", "HALO_HUD_BUMPER_STYLE", _environment_value, _platform_all,
+		"Xbox Classic, Gems and Dark Gems bumpers: original (black/white) or modern\n"
+		"(LB/RB). Shared by local players, including automatic button detection.\n"
+		"Requires high_res_hud; other button styles keep their own artwork." },
+	{ "input.auto_button_detection", _config_boolean, "true", "HALO_AUTO_BUTTON_DETECTION", _environment_value, _platform_all,
+		"Limit Button Style to the assigned controller's family. Unknown devices\n"
+		"keep the manual choice. Device detection itself is always available." },
+	{ "input.controller_p1", _config_string, "\"\"", "HALO_CONTROLLER_P1", _environment_value, _platform_all,
+		"P1 custom controller layout; empty uses the profile. Edit in Gamepads >\n"
+		"Button Remapping. v3: stores 26 physical-button names, including unbound.\n"
+		"Gameplay and debug camera have separate bindings. Old ten-action and v2 layouts\n"
+		"are accepted. See docs/reading/controller_remapping.md for the full order." },
+	{ "input.controller_p2", _config_string, "\"\"", "HALO_CONTROLLER_P2", _environment_value, _platform_all,
+		"P2 custom controller buttons, same format as controller_p1. Empty uses the profile." },
+	{ "input.controller_p3", _config_string, "\"\"", "HALO_CONTROLLER_P3", _environment_value, _platform_all,
+		"P3 custom controller buttons, same format as controller_p1. Empty uses the profile." },
+	{ "input.controller_p4", _config_string, "\"\"", "HALO_CONTROLLER_P4", _environment_value, _platform_all,
+		"P4 custom controller buttons, same format as controller_p1. Empty uses the profile." },
+	{ "display.hud_button_style_xbox", _config_string, "\"classic\"", "HALO_HUD_BUTTON_STYLE_XBOX", _environment_value, _platform_all,
+		"Remembered automatic Xbox style: classic, gems, menu_gems, xbox_modern." },
+	{ "display.hud_button_style_ps", _config_string, "\"ps_classic\"", "HALO_HUD_BUTTON_STYLE_PS", _environment_value, _platform_all,
+		"Remembered automatic PlayStation style: ps_classic, ps_gems, ps_dark_gems, ps_modern." },
+	{ "display.hud_button_style_switch", _config_string, "\"switch_classic\"", "HALO_HUD_BUTTON_STYLE_SWITCH", _environment_value, _platform_all,
+		"Remembered automatic Switch style: switch_classic, switch_gems, switch_modern." },
+	{ "display.high_res_text", _config_boolean, "true", "HALO_HIGH_RES_TEXT", _environment_value, _platform_all,
+		"Draw the menus' and HUD's text with the fonts in port/assets/fonts\n"
+		"(Overpass) at the resolution the game draws at, and the menus' titles\n"
+		"from port/assets/titles; false draws the maps' bitmap fonts and titles." },
+	{ "display.widescreen_loading", _config_boolean, "true", "HALO_WIDESCREEN_LOADING", _environment_value, _platform_all,
+		"Widen the stock loading screen, keeping its original picture, sweep\n"
+		"and glow trails. False keeps the central 4:3 framing." },
+	{ "display.shadow_resolution", _config_integer, "128", "HALO_SHADOW_RESOLUTION", _environment_value,
+		_platform_all,
+		"The size the objects' shadows are drawn at, in pixels each way: 128 as\n"
+		"on the Xbox, or 256, 512 or 1024 for smoother edges, as soft." },
+#ifdef HALO_SWITCH
+	{ "display.big_sprite_limit", _config_integer, "8", "HALO_BIG_SPRITE_LIMIT", _environment_value, _platform_all,
+#else
+	{ "display.big_sprite_limit", _config_integer, "11", "HALO_BIG_SPRITE_LIMIT", _environment_value, _platform_all,
+#endif
+		"The most sprites (particles, mist, smoke) drawn in a frame that each\n"
+		"cover more than half the view; the others are left out. 11 as on the\n"
+		"Xbox; fewer for less overdraw where effects pile up close (the Switch's\n"
+		"8: the falls of the Halo level). Changes at once." },
+	{ "debug.show_resolution", _config_boolean, "false", "HALO_SHOW_RESOLUTION", _environment_value, _platform_all,
+		"Show the frames a second and the resolution the game draws at, in the\n"
+		"bottom right corner (\"(dynamic)\" while display.dynamic_resolution has\n"
+		"dropped a step). Changes at once." },
+	{ "display.shadow_limit", _config_integer, "16", "HALO_SHADOW_LIMIT", _environment_value, _platform_all,
+		"The most objects' shadows drawn at once: the biggest on the screen keep\n"
+		"theirs, and the rest fade out as the crowd moves. 0 for no limit, as on\n"
+		"the Xbox (each shadow redraws the level under it: a crowd of them is\n"
+		"the most of a busy frame). Changes at once." },
+	{ "display.dynamic_light_limit", _config_integer, "8", "HALO_DYNAMIC_LIGHT_LIMIT", _environment_value, _platform_all,
+		"The most dynamic lights (muzzle flashes, plasma, explosions) that light\n"
+		"the level at once: the biggest on the screen keep their light on the\n"
+		"walls and floor, the rest light only the objects near them. 0 for no\n"
+		"limit, as on the Xbox (each redraws the level it reaches twice: a\n"
+		"firefight of many is the most of a busy frame's GPU time). Changes at\n"
+		"once." },
+	{ "display.specular_light_limit", _config_integer, "2", "HALO_SPECULAR_LIGHT_LIMIT", _environment_value, _platform_all,
+		"Of those, the most that add their specular highlights (the shine on\n"
+		"metal and wet floors): the biggest on the screen, the first-person\n"
+		"weapon's first. The others still light the level, without the shine.\n"
+		"0 for no limit, as on the Xbox (a near light's highlights cover most\n"
+		"of the screen: the costliest pass of a firefight). Changes at once." },
+	{ "display.menus", _config_string, "\"pc\"", "HALO_MENUS", _environment_value, _platform_all,
+		"The menus: \"pc\" for the PC version's main menu (port/assets/menus,\n"
+		"and a menus folder here for your own), \"xbox\" for the Xbox's." },
+	{ "display.menu_language", _config_string, "\"maps\"", "HALO_MENU_LANGUAGE", _environment_value, _platform_all,
+		"The PC menus' language: \"maps\" for the language of the Custom Edition\n"
+		"whose loc.map is in custom_maps (as that edition shows them; English\n"
+		"without one), \"english\" for English. The port's own lines are English." },
+	{ "display.player_names", _config_string, "\"all\"", "HALO_PLAYER_NAMES", _environment_value, _platform_all,
+		"In multiplayer, whose names are drawn above their heads: \"all\",\n"
+		"\"allies\", \"enemies\" or \"none\". An enemy's shows only within the\n"
+		"motion sensor's reach, in sight and not camouflaged; none show if the\n"
+		"gametype's motion tracker shows no players, only allies' if it shows\n"
+		"only friends." },
+	{ "display.player_name_scale", _config_real, "1.0", "HALO_PLAYER_NAME_SCALE", _environment_value, _platform_all,
+		"How large the players' names are drawn: 1.0 three quarters of the size of\n"
+		"the HUD's text, 0.25 to 4." },
+	{ "display.match_timer", _config_boolean, "false", "HALO_MATCH_TIMER", _environment_value, _platform_all,
+		"Draw the match clock at the bottom right in multiplayer. It counts up\n"
+		"from the game's first tick, which the items' respawn periods count from\n"
+		"too: a weapon is back on the map at every multiple of its period on the\n"
+		"clock." },
+	{ "display.scoreboard_team_layout", _config_string, "\"teams\"", "HALO_SCOREBOARD_TEAM_LAYOUT", _environment_value,
+		_platform_all,
+		"How the scoreboard lists a team game's players: \"teams\" in a column for\n"
+		"each team (red on the left, blue on the right), \"score\" all in order of\n"
+		"score." },
+	{ "display.scoreboard_background", _config_boolean, "true", "HALO_SCOREBOARD_BACKGROUND", _environment_value,
+		_platform_all,
+		"Draw a panel behind the multiplayer scoreboard, for clearer text." },
+	{ "display.scoreboard_background_color", _config_string, "\"16, 16, 16, 150\"", "HALO_SCOREBOARD_BACKGROUND_COLOR",
+		_environment_value, _platform_all,
+		"The scoreboard panel's colour: \"red, green, blue, alpha\", each 0 to 255\n"
+		"(alpha 0 is see-through, 255 solid)." },
+	{ "display.anisotropic_filtering", _config_integer, "0", "HALO_ANISOTROPIC_FILTERING", _environment_value,
+		_platform_all,
+		"Sharpen textures seen at a grazing angle (floors, walls, terrain), which\n"
+		"the Xbox did not: 2, 4, 8 or 16 times; 0 filters as the Xbox did. 4 keeps\n"
+		"most of 16's sharpness at less cost on slower GPUs." },
+	{ "display.dxt1_astc", _config_boolean, "true", "HALO_DXT1_ASTC", _environment_value, _platform_android,
+		"On a GPU without DXT textures (Mali), give it the DXT1 textures as ASTC,\n"
+		"which holds them nearly as they are in a quarter of the memory of the\n"
+		"32-bit texels they are otherwise decoded to; false decodes them." },
+	{ "display.latency_meter", _config_boolean, "false", "HALO_LATENCY_METER", _environment_value, _platform_all,
+		"In a network game, your round trip to the host in milliseconds at the\n"
+		"screen's top right, with bars (the host: its slowest player's), and\n"
+		"\"Connection problem\" when the host has sent nothing for two seconds;\n"
+		"the scoreboard's pings in the same colours, as this machine times them." },
+	{ "display.shader_cache", _config_boolean, "true", "HALO_SHADER_CACHE", _environment_value, _platform_desktop,
+		"Keep the GPU programs the game links under the save root (shader_cache),\n"
+		"and load them from there next time instead of linking them again, which\n"
+		"stalls a frame on some drivers; false links each every run." },
+	{ "display.mcc_texture_prepare_mb", _config_integer, "0", "HALO_MCC_TEXTURE_PREPARE_MB", _environment_value, _platform_desktop,
+		"MCC only: prepare large non-paletted textures during loading, within\n"
+		"this estimated GPU memory budget in MiB (0 disables, maximum 512).\n"
+		"Does not change texture quality or the Xbox/Custom Edition caches." },
+	{ "display.stats_log", _config_boolean, "false", "HALO_STATS_LOG", _environment_value, _platform_all,
+		"A line a second in the log with the frame rate, the mode, the map, the\n"
+		"renderer and the size of the 3D view, so a graphics bug's report or two\n"
+		"builds compared say which of them was running and at what frame rate.\n"
+		"Nothing is sent anywhere; off by default." },
+	{ "display.per_pixel_lighting", _config_boolean, "false", "HALO_PER_PIXEL_LIGHTING", _environment_value,
+		_platform_all,
+		"Light the models (characters, weapons, vehicles, scenery) for each\n"
+		"pixel by the lights the game gives them, without the facets the light\n"
+		"of each vertex shows across curved surfaces; false lights each vertex,\n"
+		"as the Xbox does." },
+	{ "display.structure_culling", _config_integer, "31", "HALO_STRUCTURE_CULLING", _environment_value,
+		_platform_all,
+		"Which tests skip the level's triangles the camera cannot see, as bits\n"
+		"added together: 1 outside the view, 2 groups facing away, 4 triangles\n"
+		"facing away, 8 smaller groups, 16 nearer rooms first; 0 walks them as\n"
+		"the Xbox does. The console's structure_culling changes it until the\n"
+		"game quits." },
+	{ "display.model_detail", _config_string, "\"stock\"", "HALO_MODEL_DETAIL", _environment_value, _platform_all,
+		"Which of their levels of detail models are drawn at: \"stock\" chooses by\n"
+		"their size on the Xbox's 480 lines, at any resolution; \"native\" by their\n"
+		"size on the display's, so that more detail is kept at a distance at high\n"
+		"resolutions; \"highest\" draws the models \"native\" does, each at its most\n"
+		"detailed level." },
+	{ "display.reversed_depth", _config_boolean, "true", "HALO_REVERSED_DEPTH", _environment_value, _platform_desktop,
+		"Keep depth in 32-bit floats, reversed (1 near, 0 far), as precise far\n"
+		"away as near: surfaces a few millimetres apart (the lights on Blood\n"
+		"Gulch's base) stay apart at any distance in place of flickering\n"
+		"through each other. false: 24 bits, as the Xbox's. Taken up when the\n"
+		"game starts." },
+	{ "display.hdr", _config_boolean, "false", "HALO_HDR", _environment_value, _platform_all,
+		"Draw the 3D view into a floating-point back buffer, which keeps what\n"
+		"the game's additive effects (explosions, plasma, lights, the sun's\n"
+		"glare) add past white, and tone map it before the HUD is drawn:\n"
+		"display.hdr_tone_mapping brings it back to the display's range\n"
+		"instead of clipping it. false draws into 8 bits a channel, as the\n"
+		"Xbox does." },
+	{ "display.hdr_exposure", _config_real, "1.0", "HALO_HDR_EXPOSURE", _environment_value, _platform_all,
+		"With display.hdr, the 3D view's brightness in linear light before it\n"
+		"is tone mapped, 0.25 to 4.0." },
+	{ "display.hdr_tone_mapping", _config_string, "\"gt7\"", "HALO_HDR_TONE_MAPPING", _environment_value,
+		_platform_all,
+		"With display.hdr, the curve that fits the brightest light into what the\n"
+		"display shows: \"gt7\" (Gran Turismo 7's: the brightest light turns to\n"
+		"white, as film shows it), \"neutral\" (the picture as drawn, its\n"
+		"brightest parts rolled off at their own colour), \"aces\" (filmic,\n"
+		"more contrast) or \"reinhard\" (softer, and darker throughout)." },
+	{ "display.hdr_output", _config_boolean, "false", "HALO_HDR_OUTPUT", _environment_value, _platform_desktop,
+		"With display.hdr, ask for a floating-point window (scRGB), so that an\n"
+		"HDR display shows what is past white brighter than the desktop's\n"
+		"white rather than tone mapped down to it; the operating system's HDR\n"
+		"must be on. Taken up when the game starts." },
+	{ "display.hdr_paper_white", _config_integer, "0", "HALO_HDR_PAPER_WHITE", _environment_value, _platform_desktop,
+		"With display.hdr_output on an HDR display, how bright white is, in\n"
+		"nits (80 to 1000): the HUD, the menus, and the 3D view's white. 0:\n"
+		"Windows' SDR content brightness." },
+	{ "display.hdr_peak_brightness", _config_integer, "0", "HALO_HDR_PEAK_BRIGHTNESS", _environment_value,
+		_platform_desktop,
+		"With display.hdr_output on an HDR display, the brightest the display\n"
+		"shows, in nits (250 to 10000), which the brightest light is fitted to.\n"
+		"0: what Windows reports (set by its HDR Calibration app)." },
+
+	{ "audio.enabled", _config_boolean, "true", "HALO_NO_AUDIO", _environment_set_is_false, _platform_all,
+		"Play sound." },
+	{ "audio.volume", _config_real, "1.0", "HALO_VOLUME", _environment_value, _platform_all,
+		"The volume of everything, 0.0 to 1.0." },
+	{ "audio.music_volume", _config_real, "1.0", "HALO_MUSIC_VOLUME", _environment_value, _platform_all,
+		"The music's volume, 0.0 to 1.0 (of audio.volume)." },
+	{ "audio.effects_volume", _config_real, "1.0", "HALO_EFFECTS_VOLUME", _environment_value, _platform_all,
+		"The volume of every other sound (effects and speech), 0.0 to 1.0 (of\n"
+		"audio.volume)." },
+	{ "audio.buffer_frames", _config_integer, "512", "HALO_AUDIO_BUFFER_FRAMES", _environment_value,
+		_platform_desktop,
+		"The audio device's buffer, in sample frames at 48 kHz (64 to 8192): larger\n"
+		"rides out stalls that cut the sound out, smaller has less delay (512\n"
+		"is 11 ms, 2048 is 43 ms)." },
+	{ "audio.channels", _config_string, "\"stereo\"", "HALO_AUDIO_CHANNELS", _environment_value, _platform_desktop,
+		"\"stereo\", \"5.1\" (surround, as the Xbox's Dolby Digital), or \"auto\"\n"
+		"for 5.1 when the sound device has six or more channels." },
+	{ "audio.hrtf", _config_boolean, "true", "HALO_HRTF", _environment_value, _platform_all,
+		"Use the measured Xbox spatial filters for 3D sounds on stereo and surround outputs." },
+	{ "audio.reverb", _config_boolean, "true", "HALO_REVERB", _environment_value, _platform_all,
+		"Reverberate the world's sounds as the place the player is in does (the\n"
+		"maps' sound environments, as the Xbox's I3DL2 reverb did); false keeps\n"
+		"them dry." },
+	{ "audio.resampler", _config_string, "\"xbox\"", "HALO_AUDIO_RESAMPLER", _environment_value, _platform_all,
+		"How sounds are converted to the output's rate: \"xbox\" models the Xbox;\n"
+		"\"sinc\" uses a "
+		"band-limited low pass; \"linear\" between neighbouring samples,\n"
+		"brighter for the aliasing it lets through." },
+	{ "audio.realtime", _config_boolean, "true", "HALO_AUDIO_REALTIME", _environment_value, _platform_android,
+		"Play through AAudio's low latency path (on a phone that has it, straight to\n"
+		"the hardware, past the system's mixer); false goes through the mixer,\n"
+		"where screen recorders take the app's sound." },
+	{ "audio.stereo_doppler", _config_boolean, "false", "HALO_STEREO_DOPPLER", _environment_value, _platform_all,
+		"Shift the pitch of a stereo sound placed in the world (an engine, a\n"
+		"rocket's flight) as it comes towards or goes away from the player, as\n"
+		"3D sounds are; false plays them at their own pitch, as the Xbox did." },
+	{ "audio.voice_chat", _config_string, "\"push_to_talk\"", "HALO_VOICE_CHAT", _environment_value, _platform_all,
+		"Talking in network games' voice chat: \"push_to_talk\" (while\n"
+		"controls.push_to_talk is held; the microphone opens the first time),\n"
+		"\"open_mic\" (whenever the microphone hears speech), or \"off\". Others'\n"
+		"voices play whatever this is (audio.voice_volume 0 silences them)." },
+	{ "audio.voice_volume", _config_real, "1.0", "HALO_VOICE_VOLUME", _environment_value, _platform_all,
+		"The volume of the other players' voices (0 to 2)." },
+	{ "audio.output_device", _config_string, "\"default\"", "HALO_AUDIO_OUTPUT_DEVICE", _environment_value,
+		_platform_desktop,
+		"Where the game's sound and the voices play: a device's name as Settings >\n"
+		"Audio lists it, or \"default\" for the system's (also if it is not found)." },
+	{ "audio.input_device", _config_string, "\"default\"", "HALO_AUDIO_INPUT_DEVICE", _environment_value,
+		_platform_desktop,
+		"The microphone voice chat listens to: a device's name as Settings >\n"
+		"Audio lists it, or \"default\" for the system's (also if it is not found)." },
+
+	{ "input.touch_controls", _config_string, "\"auto\"", "HALO_TOUCH_CONTROLS", _environment_value, _platform_android | _platform_web,
+		"The on-screen touch controls in a game: \"auto\" shows them on a\n"
+		"touchscreen while no controller is connected, \"on\" also with a\n"
+		"controller, \"off\" never. A device without a touchscreen never shows\n"
+		"them. The menus take taps in any case. On Android, the carnage\n"
+		"report's CONTINUE and LEAVE buttons follow the same rule (otherwise\n"
+		"it shows its A and B prompt)." },
+	{ "input.touch_aim_assist", _config_boolean, "true", "HALO_TOUCH_AIM_ASSIST", _environment_value, _platform_android | _platform_web,
+		"The touch controls' swipe aiming gets a controller's aim assist: the\n"
+		"aim slows over a target and follows a moving one. false: none, as a\n"
+		"mouse (the bullets' own autoaim stays)." },
+	{ "input.mouse_sensitivity", _config_real, "1.0", "HALO_MOUSE_SENSITIVITY", _environment_value, _platform_desktop,
+		"How far the view turns for the mouse's movement." },
+	{ "input.playstation_kernel_driver", _config_boolean, "false", "HALO_PLAYSTATION_KERNEL_DRIVER",
+		_environment_value, _platform_desktop,
+		"Linux: a PlayStation controller (DualSense, DualShock 4) through the\n"
+		"kernel's driver of it (hid-playstation, hid-sony), which needs no setup;\n"
+		"false: through SDL's own, which needs Steam's udev rules to open it. Read\n"
+		"at start-up." },
+	{ "input.invert_mouse", _config_boolean, "false", "HALO_MOUSE_INVERT", _environment_set_is_true, _platform_desktop,
+		"Moving the mouse forward looks down." },
+	{ "network.block_mouse_aim_assist", _config_boolean, "false", "HALO_NET_BLOCK_MOUSE_AIM_ASSIST", _environment_value,
+		_platform_all, "Host: disable optional mouse magnetism for mouse/keyboard players. Controllers and touch keep their own assist." },
+	{ "network.third_person", _config_boolean, "false", "HALO_NET_THIRD_PERSON", _environment_value, _platform_all,
+		"Host: in a multiplayer game, each player may see over their shoulder on\n"
+		"foot (their own game.third_person); false keeps everyone in first person.\n"
+		"A mode's own camera (Floodfection's CAMERA) decides in its games. Players\n"
+		"of builds without it stay in first person. THIRD PERSON in Server Setup >\n"
+		"Player Options writes its choice here." },
+	{ "network.shield_effects", _config_string, "\"stock\"", "HALO_NET_SHIELD_EFFECTS", _environment_value, _platform_all,
+		"Host: the shield effects every player of a network game sees, whatever\n"
+		"their own: \"stock\", \"glow\", \"light_show\", \"overshield\",\n"
+		"\"glow_overshield\" or \"light_show_overshield\" (display.shield_glow,\n"
+		"its light_show intensity, display.overshield_effect); \"players\": not\n"
+		"synced, each player sees their own settings'. An online co-op game is\n"
+		"always each player's own. SHIELD EFFECTS in Server Setup > Player\n"
+		"Options writes its choice here." },
+	{ "network.fire_origins", _config_boolean, "true", "HALO_NET_FIRE_ORIGINS", _environment_value, _platform_all,
+		"Host: whether a reported hit the shooter's camera had no line of sight\n"
+		"to may still count from where their machine says the shot left, when\n"
+		"that is not the camera (a VR build's hand: past a corner the camera is\n"
+		"behind), no further than a player leaning out and an arm, and in front\n"
+		"of the eye. false: from the camera and vehicles' guns only." },
+	{ "input.mouse_aim_assist", _config_boolean, "false", "HALO_MOUSE_AIM_ASSIST", _environment_value, _platform_desktop,
+		"Magnetism while aiming with the mouse, as with a controller: the view\n"
+		"slowed and dragged along by a target. The last of the mouse and the\n"
+		"right stick to move decides. The bullets' autoaim (bent toward the\n"
+		"target) stays either way." },
+	{ "input.mouse_vertical_sensitivity", _config_real, "0.0", "HALO_MOUSE_VERTICAL_SENSITIVITY", _environment_value,
+		_platform_desktop,
+		"How far the view turns up and down for the mouse's movement; 0 for the\n"
+		"same as input.mouse_sensitivity." },
+	{ "input.stick_vertical_sensitivity", _config_real, "0", "HALO_STICK_VERTICAL_SENSITIVITY", _environment_value,
+		_platform_all,
+		"How fast the controller's right stick turns the view up and down, 1 to\n"
+		"15: 40 degrees a second and about 24.4 more a step (10 is 260, the top of\n"
+		"the Xbox's Look Sensitivity left and right; 15 about 382). 0 for the\n"
+		"game's own, half of Look Sensitivity's turn." },
+	{ "input.left_stick_dead_zone", _config_integer, "-1", "HALO_LEFT_STICK_DEAD_ZONE", _environment_value, _platform_all,
+		"How far the controller's left stick moves before it moves the player,\n"
+		"in percent of its travel (0 to 50): lower for finer control, higher for\n"
+		"a worn stick that drifts; -1 for the game's own (27%). Not the touch\n"
+		"controls' sticks, which have their own." },
+	{ "input.right_stick_dead_zone", _config_integer, "-1", "HALO_RIGHT_STICK_DEAD_ZONE", _environment_value, _platform_all,
+		"How far the controller's right stick moves before it turns the view, in\n"
+		"percent of its travel (0 to 50); -1 for the game's own (27%)." },
+
+	/* the keyboard and mouse's own controls (port/linux/src/xinput_sdl.c) */
+	{ "controls.move_forward", _config_string, "\"W\"", "HALO_KEY_MOVE_FORWARD", _environment_value, _platform_all,
+		"The keyboard and mouse's controls, which Settings > Controls Setup\n"
+		"changes: up to two keys or buttons each, separated by a comma. Keys by\n"
+		"their names on a US keyboard (\"W\", \"Space\", \"Left Ctrl\", \"F1\"): a key\n"
+		"is the one in that place on any keyboard, which the menus show by its\n"
+		"own label. Buttons: \"Mouse Left\", \"Mouse Right\", \"Mouse Middle\",\n"
+		"\"Mouse 4\", \"Mouse 5\", \"Wheel\" (either way), \"Wheel Up\" and \"Wheel\n"
+		"Down\"; empty for none. Moving forward:" },
+	{ "controls.move_backward", _config_string, "\"S\"", "HALO_KEY_MOVE_BACKWARD", _environment_value, _platform_all,
+		"Moving backward." },
+	{ "controls.strafe_left", _config_string, "\"A\"", "HALO_KEY_STRAFE_LEFT", _environment_value, _platform_all,
+		"Moving left." },
+	{ "controls.strafe_right", _config_string, "\"D\"", "HALO_KEY_STRAFE_RIGHT", _environment_value, _platform_all,
+		"Moving right." },
+	{ "controls.jump", _config_string, "\"Space\"", "HALO_KEY_JUMP", _environment_value, _platform_all,
+		"Jumping (and skipping cutscenes)." },
+	{ "controls.crouch", _config_string, CROUCH_KEYS, "HALO_KEY_CROUCH", _environment_value, _platform_all,
+		"Crouching." },
+	{ "controls.fire", _config_string, "\"Mouse Left\"", "HALO_KEY_FIRE", _environment_value, _platform_all,
+		"Firing." },
+	{ "controls.throw_grenade", _config_string, "\"Mouse Right, G\"", "HALO_KEY_THROW_GRENADE", _environment_value,
+		_platform_all,
+		"Throwing a grenade." },
+	{ "controls.melee", _config_string, "\"F, Mouse 4\"", "HALO_KEY_MELEE", _environment_value, _platform_all,
+		"Melee attack." },
+	{ "controls.reload", _config_string, "\"R\"", "HALO_KEY_RELOAD", _environment_value, _platform_all,
+		"Reloading." },
+	{ "controls.zoom", _config_string, "\"Z, Mouse Middle\"", "HALO_KEY_ZOOM", _environment_value, _platform_all,
+		"Zooming the scope." },
+	{ "controls.switch_weapon", _config_string, "\"Wheel, 1\"", "HALO_KEY_SWITCH_WEAPON", _environment_value,
+		_platform_all,
+		"Switching weapons." },
+	{ "controls.switch_grenade", _config_string, "\"X\"", "HALO_KEY_SWITCH_GRENADE", _environment_value, _platform_all,
+		"Switching grenades." },
+	{ "controls.action", _config_string, "\"E\"", "HALO_KEY_ACTION", _environment_value, _platform_all,
+		"The action: picking up (held: swapping weapons), entering and leaving\n"
+		"vehicles, pressing switches; never reloading (the controller's X does\n"
+		"when there is nothing to act on)." },
+	{ "controls.flashlight", _config_string, "\"Q\"", "HALO_KEY_FLASHLIGHT", _environment_value, _platform_all,
+		"The flashlight." },
+	{ "controls.scoreboard", _config_string, "\"Tab\"", "HALO_KEY_SCOREBOARD", _environment_value, _platform_all,
+		"Showing the scores (the controller's Back)." },
+	{ "controls.pause", _config_string, "\"Escape\"", "HALO_KEY_PAUSE", _environment_value, _platform_all,
+		"The pause menu (the controller's Start)." },
+	{ "controls.screenshot", _config_string, "\"F10\"", "HALO_KEY_SCREENSHOT", _environment_value, _platform_all,
+		"Save a PNG screenshot beside maps/ (press once per capture)." },
+	{ "controls.push_to_talk", _config_string, "\"V\"", "HALO_KEY_PUSH_TO_TALK", _environment_value, _platform_all,
+		"Voice chat: talk while it is held (audio.voice_chat \"push_to_talk\"); in a\n"
+		"game a controller's D-pad Down talks too, as its D-pad Up opens the text\n"
+		"chat. A controller's button may be bound too (\"Gamepad DPad Down\", \"Gamepad LB\";\n"
+		"Settings > Controls Setup takes one pressed), which the game then ignores\n"
+		"(not a replay's playback, whose controls take every button)." },
+	{ "controls.chat", _config_string, "\"T\"", "HALO_KEY_CHAT", _environment_value, _platform_all,
+		"Network games' text chat: type a line to everyone (Enter sends it,\n"
+		"Escape lets it go)." },
+	{ "controls.team_chat", _config_string, "\"Y\"", "HALO_KEY_TEAM_CHAT", _environment_value, _platform_all,
+		"Network games' text chat: type a line to your team." },
+	{ "controls.vote_yes", _config_string, "\"F1\"", "HALO_KEY_VOTE_YES", _environment_value, _platform_all,
+		"Network games' votes (to kick a player, to end the game): vote yes in\n"
+		"the vote running, whose box shows at the left." },
+	{ "controls.vote_no", _config_string, "\"F2\"", "HALO_KEY_VOTE_NO", _environment_value, _platform_all,
+		"Network games' votes: vote no in the vote running." },
+
+#if defined(HALO_SWITCH) || defined(HALO_PS5)
+	/* (the link page: port/linux/src/link_page.c) */
+	{ "network.link_page", _config_boolean, "true", "HALO_LINK_PAGE", _environment_value, _platform_all,
+		"While Join Game > Direct Link is open, serve a page on the local network\n"
+		"(its QR code and address are on that page) where a phone or a computer\n"
+		"pastes an invite link for the console to join; nothing is served\n"
+		"otherwise. false: none." },
+#endif
+	{ "game.overlay_menu", _config_boolean, "true", "HALO_OVERLAY_MENU", _environment_value, _platform_all,
+		"Holding L and R and pressing the d-pad's down opens the game's overlay\n"
+		"menu, and closes it, as | does on the keyboard: cheats, the game's\n"
+		"speed, the HUD, the camera and the renderer's switches, in a panel at\n"
+		"the left of the screen (on Android also three or four fingers on the\n"
+		"screen together). While it is open the game gets no input; it is not\n"
+		"paused.\n"
+		"false: neither the buttons nor | open it." },
+#if defined(HALO_SWITCH) || defined(HALO_PS5)
+	{ "display.xbox_buttons", _config_boolean, "false", "HALO_XBOX_BUTTONS", _environment_value, _platform_all,
+		"Draw the controller's buttons as the Xbox's (the green A, the red B...)\n"
+		"in the menus, the game's prompts and the text, instead of this\n"
+		"console's own. Changes at the next map (or the next start)." },
+#endif
+#ifdef HALO_SWITCH
+	{ "controls.nintendo_menu_buttons", _config_boolean, "true", "HALO_NINTENDO_MENU_BUTTONS", _environment_value,
+		_platform_all,
+		"The menus' buttons as the Switch's own menus have them: the button\n"
+		"marked A (on the right) chooses and the one marked B (at the bottom)\n"
+		"goes back. false: as on an Xbox controller, the bottom button chooses\n"
+		"and the right one goes back. A game's controls are the same either\n"
+		"way. The buttons change at once; the menus' button pictures at the\n"
+		"next map (or the next start)." },
+#endif
+	{ "game.console_log", _config_string, "\"none\"", "HALO_CONSOLE_LOG", _environment_value, _platform_all,
+		"What the game's console shows on screen of what it logs: \"important\"\n"
+		"(bans, players dropped for cheating, what refuses a command, and the\n"
+		"asserts that stop the game), \"all\" (every line, the game's own\n"
+		"chatter too), or \"none\" (the asserts that stop the game only). What\n"
+		"a command prints shows whatever this is, and debug.txt has every line." },
+
+	{ "game.language", _config_string, "\"\"", "HALO_LANGUAGE", _environment_value, _platform_all,
+		"The language the game asks the Xbox for: \"ja\", \"de\", \"fr\", \"es\" or \"it\";\n"
+		"empty for English. The game data decides what is translated." },
+	{ "display.text_chat", _config_boolean, "true", "HALO_TEXT_CHAT", _environment_value, _platform_all,
+		"Show the text chat of network games: false hides its lines and keeps\n"
+		"its keys (and a controller's D-pad Up) from opening it, as for purists\n"
+		"and streamers." },
+	{ "display.chat_style", _config_string, "\"colors\"", "HALO_CHAT_STYLE", _environment_value, _platform_all,
+		"The text chat's colours: \"colors\" (names in their team's colour, the\n"
+		"text a pale blue) or \"white\" (all white, as Custom Edition)." },
+	{ "game.enhanced_animations", _config_boolean, "true", "HALO_ENHANCED_ANIMATIONS", _environment_value, _platform_all,
+		"The player bipeds' grenade throws keep their legs moving (crouched,\n"
+		"in the air and in a vehicle's seat too), riders' hands leave the grips\n"
+		"to throw and reload, and a player turns with the aim while throwing\n"
+		"and in the air (so shots after a turn in a jump go to the crosshair);\n"
+		"false: the original animations, which freeze the legs and stand a\n"
+		"rider up (the turning, which moves where shots go, stays on in a\n"
+		"network game for every player)." },
+	{ "game.ragdoll", _config_string, "\"none\"", "HALO_RAGDOLL", _environment_value, _platform_all,
+		"The older ragdoll setting. When game.ragdoll_players or game.ragdoll_ai\n"
+		"is not in this file, that one takes this (\"woody\", \"halo2\" or \"none\").\n"
+		"A new file has \"none\", so both stay off. Once each has its own line,\n"
+		"this is not read." },
+	{ "game.ragdoll_players", _config_string, "\"none\"", "HALO_RAGDOLL_PLAYERS", _environment_value, _platform_all,
+		"How a player's body falls, in a campaign or a multiplayer game:\n"
+		"\"none\" (the original death animations), \"woody\" (a ragdoll of light,\n"
+		"freely swinging limbs) or \"halo2\" (a ragdoll as Halo 2's: a heavy\n"
+		"torso, limbs that keep out of it, joints that drag, thrown further by\n"
+		"blasts). Settings > Gameplay, or here. A cinematic keeps its own. On a\n"
+		"client, and in a game of one machine, the ragdoll moves the body; the\n"
+		"host of a network game leaves its bodies as the stock game moves them\n"
+		"and only draws them as their ragdolls lie. Each machine draws its own." },
+	{ "game.ragdoll_ai", _config_string, "\"none\"", "HALO_RAGDOLL_AI", _environment_value, _platform_all,
+		"How an AI's body falls, the same choices as game.ragdoll_players.\n"
+		"Settings > Gameplay, or here. A cinematic keeps its own." },
+	/* port: the view over the shoulder on foot (port/linux/game/third_person.c) */
+	{ "game.third_person", _config_boolean, "false", "HALO_THIRD_PERSON", _environment_value, _platform_all,
+		"Settings > Gameplay > Third Person. On foot, the view over your shoulder\n"
+		"instead of first person, where the game leaves it to you: the campaign\n"
+		"and co-op; in multiplayer, a game whose host allows it (network.third_person)\n"
+		"or a mode that does (Floodfection's CAMERA set to PLAYERS' CHOICE). A mode\n"
+		"may also force either view. A scope's zoom is first person. Shots still\n"
+		"go from your eye." },
+	{ "game.third_person_shoulder", _config_string, "\"right\"", "HALO_THIRD_PERSON_SHOULDER", _environment_value,
+		_platform_all,
+		"Over which shoulder the third-person view looks: \"right\", \"left\" or\n"
+		"\"center\" (above the head)." },
+	{ "game.third_person_distance", _config_string, "\"normal\"", "HALO_THIRD_PERSON_DISTANCE", _environment_value,
+		_platform_all,
+		"How far back the third-person view is: \"near\", \"normal\" or \"far\"." },
+	{ "game.campaign_score", _config_boolean, "false", "HALO_CAMPAIGN_SCORE", _environment_value, _platform_all,
+		"Settings > Gameplay > Scoring's SCORING. Score the campaign as Halo 3: a\n"
+		"kill is its enemy's points times its style (one shot one kill, headshot,\n"
+		"melee, backsmack), the difficulty and the skulls on; killing allies or\n"
+		"players, dying and reverting take points; the level's points are\n"
+		"multiplied by its time against its par time when it is won. The values\n"
+		"are port/linux/game/campaign_score_values.json's. The score and time are\n"
+		"at the bottom right, the scoreboard (hold BACK, or tab) lists everyone's,\n"
+		"and a summary is shown when a level is won, until A or B is pressed." },
+	{ "game.campaign_medals", _config_boolean, "true", "HALO_CAMPAIGN_MEDALS", _environment_value, _platform_all,
+		"Settings > Gameplay > Scoring's MEDAL POPUPS: show the medals at the\n"
+		"center left as they are won. With SCORING on, the campaign always gives\n"
+		"Halo 3's and Halo: Reach's medals (multi-kills, sprees, headshots,\n"
+		"Wheelman, ...), each worth points\n"
+		"(port/linux/game/campaign_score_values.json), and shows the last few\n"
+		"above the score; this only hides the popups." },
+	{ "game.multiplayer_scoring", _config_boolean, "false", "HALO_MULTIPLAYER_SCORING", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Scoring's MULTIPLAYER: the campaign's medals and a\n"
+		"score panel in multiplayer games, as game.multiplayer_medals and\n"
+		"game.multiplayer_score_hud choose. Only this machine's players' are\n"
+		"shown, and nothing is sent: a client has them whatever the host's." },
+	{ "game.multiplayer_medals", _config_boolean, "true", "HALO_MULTIPLAYER_MEDALS", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Scoring's MEDALS, with MULTIPLAYER on: a kill of\n"
+		"another player wins the campaign's medals (multi-kills, sprees,\n"
+		"headshots, Revenge, ...), shown at the center left as they are won and\n"
+		"the last few at the bottom right." },
+	{ "game.multiplayer_score_hud", _config_boolean, "true", "HALO_MULTIPLAYER_SCORE_HUD", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Scoring's SCORE HUD, with MULTIPLAYER on: a panel\n"
+		"at the bottom right of the player's name and place, kills and deaths,\n"
+		"the game's kind and its score (captures, time on the hill, kills), a\n"
+		"team game's standing (winning, losing, tied) and the game's time." },
+	{ "game.score_hud_color", _config_string, "\"default\"", "HALO_SCORE_HUD_COLOR", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Scoring's HUD COLOR: the score panel's color at\n"
+		"the bottom right (campaign and multiplayer): \"default\" (the Master\n"
+		"Chief Collection's blue), \"spartan\" (your Spartan's: a team game's\n"
+		"team color, a free for all's armor color, the campaign Spartan's own)\n"
+		"or \"custom\" (game.score_hud_custom_color, whatever the Spartan's)." },
+	{ "game.score_hud_custom_color", _config_string, "\"blue\"", "HALO_SCORE_HUD_CUSTOM_COLOR", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Scoring's CUSTOM COLOR, with game.score_hud_color\n"
+		"\"custom\": a multiplayer armor color: white, black, red, blue, gray,\n"
+		"yellow, green, pink, purple, cyan, cobalt, orange, teal, sage, brown,\n"
+		"tan, maroon or salmon (black is drawn grey)." },
+	{ "game.campaign_progression", _config_string, "\"default\"", "HALO_CAMPAIGN_PROGRESSION", _environment_value,
+		_platform_all,
+		"Settings > Gameplay's CAMPAIGN PROGRESSION. \"default\": the campaign's\n"
+		"levels open as they are reached (the first, those played, and the one\n"
+		"after the last finished). \"all_unlocked\": every one of the ten can be\n"
+		"chosen, whatever the profile has finished; what it has finished is\n"
+		"kept, and shown as before." },
+	{ "game.randomizer", _config_boolean, "true", "HALO_RANDOMIZER", _environment_value, _platform_all,
+		"Settings > Gameplay. true: after the difficulty of one of the ten\n"
+		"campaign levels, a screen sets how that level's enemies and weapons\n"
+		"are swapped. The choice is kept for the later levels. A co-op game\n"
+		"that is actually randomized is listed with \"[RNDM MOD]\" before its\n"
+		"level's name, and a player whose build cannot run it is refused.\n"
+		"A slayer game is not randomized." },
+	{ "game.randomizer_enemies", _config_boolean, "true", "HALO_RANDOMIZER_ENEMIES", _environment_value, _platform_all,
+		"The randomizer screen. true: a squad's actors are taken from the\n"
+		"pool, except one with a command list or in a conversation." },
+	{ "game.randomizer_allies", _config_boolean, "false", "HALO_RANDOMIZER_ALLIES", _environment_value, _platform_all,
+		"The randomizer's AI REPLACEMENT page. true: the marines\n"
+		"and crew who fight beside the player are swapped too (one a scene seats\n"
+		"in a vehicle it has no animations for rides as the actor the level gave\n"
+		"it, until it is out and on its feet). false: they stay the actors the\n"
+		"level gave them." },
+	{ "game.randomizer_pickups", _config_boolean, "true", "HALO_RANDOMIZER_PICKUPS", _environment_value, _platform_all,
+		"The randomizer screen. true: a weapon lying in the level is swapped\n"
+		"for another, except one a script names." },
+	{ "game.randomizer_enemy_weapons", _config_boolean, "true", "HALO_RANDOMIZER_ENEMY_WEAPONS", _environment_value, _platform_all,
+		"The randomizer screen. true: the weapon an actor is given is swapped\n"
+		"for another that actor can hold." },
+	{ "game.randomizer_pool", _config_string, "\"any\"", "HALO_RANDOMIZER_POOL", _environment_value, _platform_all,
+		"The randomizer screen. Which actors a squad may become: \"any\",\n"
+		"\"covenant\", \"flood\", \"human\", \"one\" (game.randomizer_type), or\n"
+		"\"tag_injector\": the Tag Injector profile's actor variants alone (with a\n"
+		"profile played: game.randomizer_tag_profile; else \"any\")." },
+	{ "game.randomizer_type", _config_string, "\"grunt\"", "HALO_RANDOMIZER_TYPE", _environment_value, _platform_all,
+		"The randomizer screen, when the pool is \"one\": \"grunt\", \"elite\",\n"
+		"\"jackal\", \"hunter\", \"flood_combat\", \"flood_carrier\", \"marine\",\n"
+		"\"engineer\", \"sentinel\", or \"tag_injector\": the Tag Injector profile's\n"
+		"actor variants of the custom type game.randomizer_custom_type." },
+	{ "game.randomizer_custom_type", _config_string, "\"\"", "HALO_RANDOMIZER_CUSTOM_TYPE", _environment_value,
+		_platform_all,
+		"The randomizer screen, when the one type is \"tag_injector\": the custom\n"
+		"type (a tag's custom_type, else the last part of its path, in the Tag\n"
+		"Injector) whose actor variants the pool is." },
+	{ "game.randomizer_grunt_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_GRUNT_RANK", _environment_value, _platform_all,
+		"The randomizer screen, when the one type is \"grunt\": \"any\", \"minor\",\n"
+		"\"major\" or \"specops\"." },
+	{ "game.randomizer_elite_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_ELITE_RANK", _environment_value, _platform_all,
+		"The randomizer screen, when the one type is \"elite\": \"any\", \"minor\",\n"
+		"\"major\", \"specops\", \"zealot\" (the gold commanders) or \"stealth\"." },
+	{ "game.randomizer_jackal_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_JACKAL_RANK", _environment_value, _platform_all,
+		"The randomizer screen, when the one type is \"jackal\": \"any\", \"minor\" or\n"
+		"\"major\"." },
+	{ "game.randomizer_hunter_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_HUNTER_RANK", _environment_value, _platform_all,
+		"The randomizer screen, when the one type is \"hunter\": \"any\", \"minor\" or\n"
+		"\"major\"." },
+	{ "game.randomizer_flood_combat_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_FLOOD_COMBAT_RANK", _environment_value,
+		_platform_all,
+		"The randomizer screen, when the one type is \"flood_combat\": \"any\",\n"
+		"\"human\" or \"elite\"." },
+	{ "game.randomizer_pickup_pool", _config_string, "\"any\"", "HALO_RANDOMIZER_PICKUP_POOL", _environment_value, _platform_all,
+		"The randomizer screen, with game.randomizer_pickups. Which weapons a\n"
+		"weapon lying in the level may become: \"any\", \"covenant\", \"human\",\n"
+		"\"precision\" (pistol, sniper rifle), \"automatic\" (assault rifle, plasma\n"
+		"rifle, needler), \"power\" (shotgun, sniper rifle, rocket launcher, and\n"
+		"the flamethrower with game.randomizer_crazy_flamethrower) or \"one\"\n"
+		"(game.randomizer_pickup_type). A weapon the level has not got is taken\n"
+		"from another campaign level. \"tag_injector\": the Tag Injector profile's\n"
+		"weapons alone (with a profile played; else \"any\")." },
+	{ "game.randomizer_pickup_type", _config_string, "\"pistol\"", "HALO_RANDOMIZER_PICKUP_TYPE", _environment_value,
+		_platform_all,
+		"The randomizer screen, when the pickup pool is \"one\": \"pistol\",\n"
+		"\"assault_rifle\", \"shotgun\", \"sniper_rifle\", \"rocket_launcher\",\n"
+		"\"flamethrower\" (with game.randomizer_crazy_flamethrower), \"plasma_pistol\",\n"
+		"\"plasma_rifle\", \"needler\", or \"tag_injector\": the Tag Injector\n"
+		"profile's weapons of the custom type game.randomizer_pickup_custom." },
+	{ "game.randomizer_pickup_custom", _config_string, "\"\"", "HALO_RANDOMIZER_PICKUP_CUSTOM", _environment_value,
+		_platform_all,
+		"The randomizer screen, when the pickup type is \"tag_injector\": the\n"
+		"custom type of the Tag Injector profile's weapons a pickup may become." },
+	{ "game.randomizer_weapon_pool", _config_string, "\"any\"", "HALO_RANDOMIZER_WEAPON_POOL", _environment_value, _platform_all,
+		"The randomizer screen, with game.randomizer_enemy_weapons. Which weapons\n"
+		"an actor may be given, among those it has the animations to hold: the\n"
+		"choices of game.randomizer_pickup_pool, \"power\" adding the fuel rod and\n"
+		"the energy sword, or \"one\" (game.randomizer_weapon_type). An actor that\n"
+		"can hold none of them keeps its own." },
+	{ "game.randomizer_weapon_type", _config_string, "\"plasma_rifle\"", "HALO_RANDOMIZER_WEAPON_TYPE", _environment_value,
+		_platform_all,
+		"The randomizer screen, when the enemy weapon pool is \"one\": a choice\n"
+		"of game.randomizer_pickup_type, \"fuel_rod\" or \"energy_sword\"." },
+	{ "game.randomizer_weapon_custom", _config_string, "\"\"", "HALO_RANDOMIZER_WEAPON_CUSTOM", _environment_value,
+		_platform_all,
+		"The randomizer screen, when the enemy weapon type is \"tag_injector\":\n"
+		"the custom type of the Tag Injector profile's weapons an actor may be\n"
+		"given." },
+	{ "game.randomizer_extra_enemies", _config_integer, "1", "HALO_RANDOMIZER_EXTRA_ENEMIES", _environment_value,
+		_platform_all,
+		"The randomizer screen's EXTRA ENEMIES: each squad of the players'\n"
+		"enemies a campaign level places is this many times as large (1, off,\n"
+		"to 32), as co-op's static multiplier (network.coop_enemies_multiplier)\n"
+		"makes them; a co-op game's extra enemies come on top of it. Played\n"
+		"alone or as a co-op host, never in a daily challenge." },
+	{ "game.randomizer_ally_pool", _config_string, "\"as_enemies\"", "HALO_RANDOMIZER_ALLY_POOL", _environment_value,
+		_platform_all,
+		"The randomizer's AI REPLACEMENT page, with game.randomizer_allies.\n"
+		"Which actors the allies may become: \"as_enemies\" (the choices of\n"
+		"game.randomizer_pool and its rows, ENEMIES on or off), or a choice of\n"
+		"game.randomizer_pool (\"one\": game.randomizer_ally_type)." },
+	{ "game.randomizer_ally_type", _config_string, "\"marine\"", "HALO_RANDOMIZER_ALLY_TYPE", _environment_value,
+		_platform_all,
+		"AI REPLACEMENT, when the ally pool is \"one\": a choice of\n"
+		"game.randomizer_type (\"tag_injector\":\n"
+		"game.randomizer_ally_custom_type)." },
+	{ "game.randomizer_ally_custom_type", _config_string, "\"\"", "HALO_RANDOMIZER_ALLY_CUSTOM_TYPE",
+		_environment_value, _platform_all,
+		"AI REPLACEMENT, when the ally type is \"tag_injector\": the custom\n"
+		"type of the Tag Injector profile's actor variants the allies may\n"
+		"become." },
+	{ "game.randomizer_ally_grunt_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_ALLY_GRUNT_RANK",
+		_environment_value, _platform_all,
+		"AI REPLACEMENT, when the ally type is \"grunt\": as\n"
+		"game.randomizer_grunt_rank." },
+	{ "game.randomizer_ally_elite_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_ALLY_ELITE_RANK",
+		_environment_value, _platform_all,
+		"AI REPLACEMENT, when the ally type is \"elite\": as\n"
+		"game.randomizer_elite_rank." },
+	{ "game.randomizer_ally_jackal_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_ALLY_JACKAL_RANK",
+		_environment_value, _platform_all,
+		"AI REPLACEMENT, when the ally type is \"jackal\": as\n"
+		"game.randomizer_jackal_rank." },
+	{ "game.randomizer_ally_hunter_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_ALLY_HUNTER_RANK",
+		_environment_value, _platform_all,
+		"AI REPLACEMENT, when the ally type is \"hunter\": as\n"
+		"game.randomizer_hunter_rank." },
+	{ "game.randomizer_ally_flood_combat_rank", _config_string, "\"any\"", "HALO_RANDOMIZER_ALLY_FLOOD_COMBAT_RANK",
+		_environment_value, _platform_all,
+		"AI REPLACEMENT, when the ally type is \"flood_combat\": as\n"
+		"game.randomizer_flood_combat_rank." },
+	{ "game.randomizer_loadout", _config_string, "\"default\"", "HALO_RANDOMIZER_LOADOUT", _environment_value,
+		_platform_all,
+		"The randomizer's PLAYER LOADOUT page: the weapons a player\n"
+		"starts a campaign level with. \"default\": the level's. \"random\": two at\n"
+		"random for each player, from the pickups' pool with\n"
+		"game.randomizer_pickups, else the campaign's hand weapons and the Tag\n"
+		"Injector profile's. \"set\": game.randomizer_loadout_primary and\n"
+		"_secondary. Played alone or as a co-op host (who gives only weapons the\n"
+		"level has), never in a daily challenge." },
+	{ "game.randomizer_loadout_primary", _config_string, "\"assault_rifle\"", "HALO_RANDOMIZER_LOADOUT_PRIMARY",
+		_environment_value, _platform_all,
+		"PLAYER LOADOUT's PRIMARY, with game.randomizer_loadout \"set\":\n"
+		"a choice of game.randomizer_pickup_type, or a Tag Injector profile's\n"
+		"weapon as the screen writes it." },
+	{ "game.randomizer_loadout_secondary", _config_string, "\"pistol\"", "HALO_RANDOMIZER_LOADOUT_SECONDARY",
+		_environment_value, _platform_all,
+		"The PLAYER LOADOUT screen's SECONDARY: as\n"
+		"game.randomizer_loadout_primary, or \"none\"." },
+	{ "game.randomizer_crazy", _config_boolean, "false", "HALO_RANDOMIZER_CRAZY", _environment_value, _platform_all,
+		"Settings > Gameplay > Randomizer's Go Crazy. true: the parts of it on\n"
+		"(game.randomizer_crazy_weapons, _enemies, _flamethrower), and as many\n"
+		"of the infection forms swapped as game.randomizer_crazy_pods says.\n"
+		"Things might not go as smooth. false: none of them, and one infection\n"
+		"form in three swapped (the rest are not placed)." },
+	{ "game.randomizer_crazy_weapons", _config_boolean, "true", "HALO_RANDOMIZER_CRAZY_WEAPONS", _environment_value,
+		_platform_all,
+		"Go Crazy's, with game.randomizer_crazy. true: any NPC can hold any\n"
+		"weapon, but might not know how to use it (one with no animations for it\n"
+		"holds it as a near weapon: a marine's plasma pistol as its pistol, an\n"
+		"elite's shotgun as its plasma rifle). false: an actor keeps its own\n"
+		"weapon instead." },
+	{ "game.randomizer_crazy_enemies", _config_boolean, "true", "HALO_RANDOMIZER_CRAZY_ENEMIES", _environment_value,
+		_platform_all,
+		"Go Crazy's, with game.randomizer_crazy. true: the unused NPCs\n"
+		"(engineers, sentinels) join the enemy pools." },
+	{ "game.randomizer_crazy_flamethrower", _config_boolean, "true", "HALO_RANDOMIZER_CRAZY_FLAMETHROWER",
+		_environment_value, _platform_all,
+		"Go Crazy's, with game.randomizer_crazy. true: the multiplayer-only\n"
+		"flamethrower can be the one weapon type of a pool, and joins the weapon\n"
+		"pools of more than one weapon. false: neither (a type of the\n"
+		"flamethrower is taken as the default: pistol, plasma rifle)." },
+	{ "game.randomizer_crazy_pods", _config_integer, "30", "HALO_RANDOMIZER_CRAZY_PODS", _environment_value,
+		_platform_all,
+		"Go Crazy's, with game.randomizer_crazy. How many of a squad's\n"
+		"infection forms the enemy pool swaps for other actors, a percentage\n"
+		"(10 to 100, in tens): the squad's first, then evenly; the rest are not\n"
+		"placed. Without Go Crazy, one in three." },
+	{ "game.randomizer_tag_profile", _config_string, "\"\"", "HALO_RANDOMIZER_TAG_PROFILE", _environment_value,
+		_platform_all,
+		"The Tag Injector's profile the randomizer plays: its folder's name, or\n"
+		"\"\" for none. Chosen on the screen before the randomizer's, with\n"
+		"game.tag_injection on and a profile. A level played alone (not a network game, nor a challenge)\n"
+		"is given its tags on, which join the pools their settings name, and the\n"
+		"TAG INJECTOR pools and types." },
+	{ "game.randomizer_profile_1", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_1", _environment_value, _platform_all,
+		"The randomizer screen's saved setups (Save, then Load), one a setting:\n"
+		"a name, then the screen's settings, separated by semicolons. Written by\n"
+		"the screen." },
+	{ "game.randomizer_profile_2", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_2", _environment_value, _platform_all,
+		"A saved setup of the randomizer screen (game.randomizer_profile_1)." },
+	{ "game.randomizer_profile_3", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_3", _environment_value, _platform_all,
+		"A saved setup of the randomizer screen (game.randomizer_profile_1)." },
+	{ "game.randomizer_profile_4", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_4", _environment_value, _platform_all,
+		"A saved setup of the randomizer screen (game.randomizer_profile_1)." },
+	{ "game.randomizer_profile_5", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_5", _environment_value, _platform_all,
+		"A saved setup of the randomizer screen (game.randomizer_profile_1)." },
+	{ "game.randomizer_profile_6", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_6", _environment_value, _platform_all,
+		"A saved setup of the randomizer screen (game.randomizer_profile_1)." },
+	{ "game.randomizer_profile_7", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_7", _environment_value, _platform_all,
+		"A saved setup of the randomizer screen (game.randomizer_profile_1)." },
+	{ "game.randomizer_profile_8", _config_string, "\"\"", "HALO_RANDOMIZER_PROFILE_8", _environment_value, _platform_all,
+		"A saved setup of the randomizer screen (game.randomizer_profile_1)." },
+	{ "game.skulls", _config_boolean, "true", "HALO_SKULLS", _environment_value, _platform_all,
+		"Settings > Gameplay. true: after a campaign level's difficulty (and\n"
+		"after the randomizer's screen, when that is on), a screen turns the\n"
+		"skulls on and off (game.skulls_active), as the Master Chief\n"
+		"Collection's. They then apply to every campaign game, Continue and Load\n"
+		"Game too. A co-op client plays with the host's." },
+	{ "game.skulls_active", _config_string, "\"\"", "HALO_SKULLS_ACTIVE", _environment_value, _platform_all,
+		"The skulls turned on, with game.skulls, separated by commas: anger,\n"
+		"assassins, bandanna, black_eye, blind, boom, catch, confetti_party,\n"
+		"envy, eye_patch,\n"
+		"famine, fog, foreign, ghost, grunt_birthday_party, grunt_funeral, iron,\n"
+		"malfunction, mythic, pinata, protected, recession, sputnik, streaking,\n"
+		"swarm, thats_just_wrong, thunderstorm, tough_luck, vampirism. Written by\n"
+		"the skulls screen." },
+	{ "game.skulls_unlock_mode", _config_string, "\"\"", "HALO_SKULLS_UNLOCK_MODE", _environment_value, _platform_all,
+		"Whether the skulls screen's question (how the skulls are had) was\n"
+		"answered, the first time it opened: \"play\" (game.skulls_all_unlocked\n"
+		"says whether every skull is had, or those found: enemies carry the\n"
+		"locked skulls, one picked up is on for that level, and kept once the\n"
+		"level is finished; a death loses it), or \"\" (not asked yet). \"all\",\n"
+		"of an older build, becomes \"play\" with ALL SKULLS on." },
+	{ "game.skulls_unlocked", _config_string, "\"\"", "HALO_SKULLS_UNLOCKED", _environment_value, _platform_all,
+		"With game.skulls_unlock_mode \"play\", the skulls found and kept,\n"
+		"separated by commas (game.skulls_active's names). Grunt Birthday Party\n"
+		"is always had. Written as levels are finished." },
+	{ "game.skulls_all_unlocked", _config_boolean, "false", "HALO_SKULLS_ALL_UNLOCKED", _environment_value, _platform_all,
+		"Settings > Gameplay's ALL SKULLS, once the skulls screen's question\n"
+		"is answered (ALL UNLOCKED turns it on). true: every skull can be turned\n"
+		"on, and none drop. false: those found (game.skulls_unlocked), which this\n"
+		"leaves as they are, and the others dropped by enemies to be found." },
+	{ "game.skulls_instant_unlock", _config_boolean, "false", "HALO_SKULLS_INSTANT_UNLOCK", _environment_value,
+		_platform_all,
+		"Settings > Gameplay's INSTANT UNLOCK, with ALL SKULLS off. true: a\n"
+		"skull picked up is unlocked at once, and not turned on. false: it is on\n"
+		"for the level, and unlocked once the level is finished (without dying,\n"
+		"with game.skulls_lose_on_death)." },
+	{ "game.skulls_lose_on_death", _config_boolean, "true", "HALO_SKULLS_LOSE_ON_DEATH", _environment_value,
+		_platform_all,
+		"Settings > Gameplay's LOSE ON DEATH, with ALL SKULLS and INSTANT UNLOCK\n"
+		"off; the skulls screen's second question asks it after UNLOCK VIA\n"
+		"GAMEPLAY. true: a death, or a return to a checkpoint, loses the skulls\n"
+		"picked up and not yet unlocked (to be found again). false: they stay\n"
+		"on, and are unlocked once the level is finished." },
+	{ "game.skulls_drop_count", _config_integer, "0", "HALO_SKULLS_DROP_COUNT", _environment_value, _platform_all,
+		"Settings > Gameplay's SKULLS PER LEVEL, with ALL SKULLS off: how many\n"
+		"of the locked skulls the enemies of a campaign level drop (1 to 8), or\n"
+		"0 for the difficulty's (one on easy to four on legendary). A co-op\n"
+		"game drops the host's locked skulls by the host's, and every player\n"
+		"who picks one up or sees it picked up gets it." },
+	{ "game.skulls_drop_chance", _config_integer, "100", "HALO_SKULLS_DROP_CHANCE", _environment_value, _platform_all,
+		"Settings > Gameplay's DROP CHANCE, with ALL SKULLS off: a kill's odds\n"
+		"of dropping a skull, a percentage of the usual (one in as many enemies\n"
+		"as are left, more for a headshot, a punch from behind, an instant kill,\n"
+		"a group's or a vehicle's): 25, 50, 100, 200 or 400. The level's first\n"
+		"skull always drops at the first kill. The host's in co-op." },
+	{ "game.skulls_random_min", _config_integer, "1", "HALO_SKULLS_RANDOM_MIN", _environment_value, _platform_all,
+		"The skulls screen's RANDOM: the fewest skulls it turns on (0 to 40)." },
+	{ "game.skulls_random_max", _config_integer, "5", "HALO_SKULLS_RANDOM_MAX", _environment_value, _platform_all,
+		"The skulls screen's RANDOM: the most skulls it turns on (0 to 40). It\n"
+		"turns on a number between the two, at random, of the skulls had, and\n"
+		"the rest off." },
+	{ "game.terminal_output", _config_string, "\"menus\"", "HALO_TERMINAL_OUTPUT", _environment_value, _platform_all,
+		"The game's messages at the bottom left of the screen (\"Shaders\n"
+		"preloaded.\", what the console's commands print): \"none\", \"menus\" (in\n"
+		"the main menu, not in a campaign or multiplayer game) or \"always\".\n"
+		"While the console is open they are shown. Settings > Gameplay, or here." },
+	{ "game.custom_edition", _config_boolean, "true", "HALO_CUSTOM_EDITION", _environment_value, _platform_all,
+		"Load and run Halo Custom Edition maps (not those that need OpenSauce):\n"
+		"put them and Custom Edition's bitmaps.map, sounds.map and loc.map in\n"
+		"the custom_maps folder beside the maps folder; the map lists show them\n"
+		"as CUSTOM SINGLEPLAYER and CUSTOM MULTIPLAYER. Their tags are checked\n"
+		"as the game's own maps' are before they run; false refuses them\n"
+		"(docs/custom_edition_caches.md)." },
+	{ "game.tag_injection", _config_boolean, "false", "HALO_TAG_INJECTION", _environment_value, _platform_all,
+		"Settings > Gameplay > Tag Injector. true: the randomizer can add the\n"
+		"tags of a profile (game.randomizer_tag_profile) to a campaign level\n"
+		"played alone: weapons and actor variants taken out of Custom Edition\n"
+		"maps (docs/tag_injector.md)." },
+	{ "game.tag_injection_profile", _config_string, "\"\"", "HALO_TAG_INJECTION_PROFILE", _environment_value,
+		_platform_all,
+		"The Tag Injector's profile the menu's maps add tags to: its folder's\n"
+		"name in the data root's tag_injector folder. Written by the menu." },
+	{ "game.multiplayer_tag_profile", _config_string, "\"\"", "HALO_MULTIPLAYER_TAG_PROFILE", _environment_value,
+		_platform_all,
+		"The Tag Injector multiplayer profile a multiplayer game hosted here plays\n"
+		"on the game's own multiplayer maps (Server Setup's TAG PROFILE): its\n"
+		"file's name, without .toml, in the data root's tag_injector/multiplayer\n"
+		"folder; \"\" none. Its clients download its weapons from the host\n"
+		"(docs/tag_injector.md, \"In multiplayer\")." },
+	{ "game.campaign_tag_profile", _config_string, "\"\"", "HALO_CAMPAIGN_TAG_PROFILE", _environment_value,
+		_platform_all,
+		"The Tag Injector campaign profile a campaign level played alone plays,\n"
+		"in the randomizer's place (the TAG INJECTOR PROFILE screen before the\n"
+		"level): its file's name, without .toml, in the data root's\n"
+		"tag_injector/campaign folder; \"\" none. With game.tag_injection on\n"
+		"(docs/tag_injector.md, \"Campaign profiles\")." },
+	{ "game.tag_injection_textures", _config_string, "\"auto\"", "HALO_TAG_INJECTION_TEXTURES", _environment_value,
+		_platform_all,
+		"How large the bitmaps of a profile's tags are drawn in a level: \"full\"\n"
+		"as they are, \"small\" from their mipmaps of 256 pixels at most (a\n"
+		"Custom Edition weapon's are often uncompressed 512s, 16 MB of them),\n"
+		"\"auto\" small where the texture cache is as small as the Xbox's (the\n"
+		"web build's), else full. Bitmaps without mipmaps (a HUD's) are drawn\n"
+		"as they are." },
+	{ "bots.enabled", _config_boolean, "true", "HALO_BOTS_ENABLED", _environment_value, _platform_all,
+		"Whether bots join the games hosted here at all: false keeps them out\n"
+		"without bots.count's number being lost (Server Setup > BOTS > BOTS: OFF)." },
+	{ "bots.count", _config_integer, "0", "HALO_BOTS", _environment_value, _platform_all,
+		"Computer players (bots) in a Slayer, Capture the Flag or King of the Hill\n"
+		"game hosted here, local (split screen), system link or internet (public\n"
+		"or private): 0 to 127 (the most players a game holds but the host's)\n"
+		"join its lobby with the players, as far as the game has room. Their\n"
+		"names begin with [BOT]. In a game, the console's add_bot and drop_bot\n"
+		"(add_bot_red, drop_bot_blue...) add or take one. 0: none, as in the\n"
+		"stock game." },
+	{ "bots.firefight_enabled", _config_boolean, "true", NULL, _environment_value, _platform_all,
+		"Firefight's bots.enabled: whether bots join a Firefight game hosted here\n"
+		"as the players' allies (Firefight's BOTS screen), kept apart from a\n"
+		"multiplayer game's." },
+	{ "bots.firefight_count", _config_integer, "0", NULL, _environment_value, _platform_all,
+		"Firefight's bots.count: the bots in a Firefight game hosted here (0 to 16),\n"
+		"kept apart from a multiplayer game's." },
+	{ "bots.firefight_skill", _config_string, "\"distributed\"", NULL, _environment_value, _platform_all,
+		"Firefight's bots.skill (the same words), kept apart from a multiplayer\n"
+		"game's." },
+	{ "bots.keep_min", _config_boolean, "true", "HALO_BOTS_KEEP_MIN", _environment_value, _platform_all,
+		"In a system link or internet game hosted here: a player who joins takes\n"
+		"a bot's place (20 bots, one joins: 19 bots and the player), and a bot\n"
+		"takes theirs again when they leave, in the lobby and in the game. One\n"
+		"player's place is kept free for them to join into. false: the bots stay\n"
+		"as many as bots.count while the game has room." },
+	{ "bots.skill", _config_string, "\"distributed\"", "HALO_BOT_SKILL", _environment_value, _platform_all,
+		"How well the bots play: \"recruit\", \"easy\", \"normal\", \"heroic\",\n"
+		"\"veteran\" or \"legendary\" (how soon they react, how well they aim,\n"
+		"how far they see, and how they fight: blows, grenades, strafes, retreats),\n"
+		"or \"distributed\": each bot its own level, on a curve (most of them normal\n"
+		"and heroic, a few recruit and legendary), the same on both teams." },
+	{ "bots.kind", _config_string, "\"birchwood\"", "HALO_BOT_KIND", _environment_value, _platform_all,
+		"The kind of bot added from now on: \"birchwood\" (the bots as they\n"
+		"were) or \"provinggrounds\" (a second kind, with hidden personalities,\n"
+		"that also plays Oddball and Race). Each bot keeps the kind it joined as,\n"
+		"so one game can hold both; in Oddball and Race every bot plays as\n"
+		"Proving Grounds." },
+	{ "bots.teams", _config_string, "\"even\"", "HALO_BOT_TEAMS", _environment_value, _platform_all,
+		"In team games: \"even\" puts the bots on both teams, evening them with\n"
+		"the players; \"against\" puts them all on the team the players are not on." },
+	{ "bots.vehicles", _config_integer, "1", "HALO_BOT_VEHICLES", _environment_value, _platform_all,
+		"1: the bots drive and ride the map's vehicles (Warthogs, Ghosts and\n"
+		"Scorpions) to goals a long way off, and man its turrets; 0: they stay\n"
+		"on foot." },
+	{ "bots.routes", _config_string, "\"direct\"", "HALO_BOT_ROUTES", _environment_value, _platform_all,
+		"The ways the bots go to their goals (port/linux/game/bots_routes.c):\n"
+		"\"direct\" (everyone the shortest way, down the middle into one fight),\n"
+		"\"lanes\" (the attackers spread over the map's side lanes, flanking) or\n"
+		"\"mixed\" (most direct, a few on the side lanes)." },
+	{ "display.viewmodel_shield", _config_boolean, "false", "HALO_VIEWMODEL_SHIELD", _environment_value, _platform_all,
+		"The energy shield's flare on the first-person arms too, as on the body\n"
+		"(the stock game draws it on the body only)." },
+	{ "display.first_person_legs", _config_boolean, "false", "HALO_FIRST_PERSON_LEGS", _environment_value, _platform_all,
+		"Your own legs in first person, seen looking down: your body as others\n"
+		"see it, drawn from the waist down, moving as it moves." },
+	{ "display.overshield_effect", _config_boolean, "false", "HALO_OVERSHIELD_EFFECT", _environment_value, _platform_all,
+		"The overshield as this machine draws it: its flare rising up the body as\n"
+		"it charges (2 seconds, 3 from a shield that was down) and staying lit,\n"
+		"its energy slower, green above 200% shield and pink through 200%; on the\n"
+		"arms too with viewmodel_shield; a hit on it plays what the projectile\n"
+		"plays on an Elite's shield. Only what is drawn and heard changes.\n"
+		"In a network game, the host's network.shield_effects decides, unless\n"
+		"it is \"players\" (each player's own) or the game is co-op." },
+	{ "display.plasma_occlusion", _config_boolean, "false", "HALO_PLASMA_OCCLUSION", _environment_value, _platform_all,
+		"Light Occlusion: dynamic lights stop at walls and vehicles, from rays\n"
+		"traced on the CPU. Projectile, muzzle, Covenant, vehicle and Shield Glow\n"
+		"lights all follow it; off, no rays are traced. At most eight occluded\n"
+		"lights. Not in Android's OpenGL renderer." },
+#if defined(HALO_ANDROID) && !defined(HALO_SWITCH)
+	/* (the phone's: lighting_config.c's lighting_budget. The Switch traces a
+	fixed count of rays, the PS5 eight lights) */
+	{ "display.occlusion_lights", _config_integer, "6", "HALO_OCCLUSION_LIGHTS", _environment_value, _platform_android,
+		"How many lights Light Occlusion traces rays for in a frame: 8, 6 or 4.\n"
+		"Fewer are faster on a slower phone; a light past them keeps its last\n"
+		"occlusion, or has none, until its turn. Changes at once. Vulkan only." },
+#endif
+	{ "display.plasma_lighting", _config_boolean, "false", "HALO_PLASMA_LIGHTING", _environment_value, _platform_all,
+		"Supported plasma, Covenant and rocket flight lights follow rendered poses\n"
+		"with soft world and model falloff and omni highlights. Off keeps stock\n"
+		"lighting. Not in Android's OpenGL renderer." },
+	{ "display.muzzle_lighting", _config_boolean, "false", "HALO_MUZZLE_LIGHTING", _environment_value, _platform_all,
+		"Soft muzzle illumination with a smooth render-time fade. Stock flash\n"
+		"effects remain intact. Off keeps stock lighting. Not in Android's OpenGL renderer." },
+	{ "display.weapon_glow", _config_boolean, "false", "HALO_WEAPON_GLOW", _environment_value, _platform_all,
+		"Held energy weapons cast soft light. Not in Android's OpenGL renderer." },
+	{ "display.fuel_rod_lighting", _config_boolean, "false", "HALO_FUEL_ROD_LIGHTING", _environment_value, _platform_all,
+		"Soft green illumination from exposed Grunt and Hunter fuel rods. Stock\n"
+		"weapon effects remain intact. Not in Android's OpenGL renderer." },
+	{ "display.ammo_counter_lighting", _config_boolean, "false", "HALO_AMMO_COUNTER_LIGHTING", _environment_value, _platform_all,
+		"Blue spill and screen emission from held Assault Rifle ammo counters.\n"
+		"Not in Android's OpenGL renderer." },
+	{ "display.needler_lighting", _config_boolean, "false", "HALO_NEEDLER_LIGHTING", _environment_value, _platform_all,
+		"Soft pink-purple spill and luminous crystals on held Needlers. Not in\n"
+		"Android's OpenGL renderer." },
+	{ "display.plasma_prong_lighting", _config_boolean, "false", "HALO_PLASMA_PRONG_LIGHTING", _environment_value, _platform_all,
+		"Short, soft forward spill from plasma-weapon prongs, apart from Weapon\n"
+		"Glow. Not in Android's OpenGL renderer." },
+	{ "display.jackal_shield_lighting", _config_boolean, "false", "HALO_JACKAL_SHIELD_LIGHTING", _environment_value, _platform_all,
+		"Soft illumination from visible Jackal shields, following their colour and\n"
+		"pose. Stock shield effects remain intact. Not in Android's OpenGL renderer." },
+	{ "display.covenant_shield_lighting", _config_boolean, "false", "HALO_COVENANT_SHIELD_LIGHTING", _environment_value, _platform_all,
+		"Soft illumination from active stationary Covenant shield emitters. Stock\n"
+		"shield effects remain intact. Not in Android's OpenGL renderer." },
+	{ "display.vehicle_lighting", _config_boolean, "false", "HALO_VEHICLE_LIGHTING", _environment_value, _platform_all,
+		"Vehicle engines and headlights illuminate nearby surfaces. Not in\n"
+		"Android's OpenGL renderer." },
+	{ "display.world_lighting", _config_boolean, "false", "HALO_WORLD_LIGHTING", _environment_value, _platform_all,
+		"Visible powerups and teleporters cast soft light. Not in Android's OpenGL renderer." },
+	{ "display.shield_glow", _config_boolean, "false", "HALO_SHIELD_GLOW", _environment_value, _platform_all,
+		"Energy shields light what is around them as they flare, as plasma\n"
+		"does, in the shield's own color. In a network game, the host's\n"
+		"network.shield_effects decides, unless it is \"players\" (each\n"
+		"player's own) or the game is co-op." },
+	{ "display.shield_glow_intensity", _config_string, "\"stock\"", "HALO_SHIELD_GLOW_INTENSITY", _environment_value, _platform_all,
+		"Dynamic Lighting's LIGHTING: \"stock\" turns every added light off, as\n"
+		"the original Xbox drew the game, whatever their own settings. Else how\n"
+		"far every dynamic light reaches, and how bright it is: \"default\"\n"
+		"(as made), \"1.5x\", \"2x\" or \"light_show\" (three times: as far, and\n"
+		"at full strength from a third of its brightness). In a network game,\n"
+		"the shield glow's is the host's network.shield_effects, unless it is\n"
+		"\"players\" (each player's own) or the game is co-op." },
+	{ "display.shield_color", _config_string, "\"default\"", "HALO_SHIELD_COLOR", _environment_value, _platform_all,
+		"Your energy shield's color, as this machine draws it: \"default\" (the\n"
+		"shield's own) or a multiplayer armor color: white, black, red, blue,\n"
+		"gray, yellow, green, pink, purple, cyan, cobalt, orange, teal, sage,\n"
+		"brown, tan, maroon or salmon." },
+
+	{ "game.unlock_all_levels", _config_boolean, "false", "HALO_UNLOCK_ALL_LEVELS", _environment_value, _platform_all,
+		"true: a profile made from now on starts with every campaign level\n"
+		"finished on every difficulty, so any level can be played. false: a new\n"
+		"profile starts at The Pillar of Autumn and opens each level as the one\n"
+		"before it is finished, as on the Xbox. Profiles already made keep their\n"
+		"progress; the console's profile_reset_campaign starts one over." },
+
+	{ "game.downloaded_maps", _config_string, "\"\"", "HALO_DOWNLOADED_MAPS", _environment_value, _platform_all,
+		"Maps played as downloaded ones, besides those map sharing downloaded:\n"
+		"their names (bloodgulch, hugeass), separated by commas, or \"*\" for\n"
+		"every map. A downloaded map's scripts may not change the player's\n"
+		"settings or other players' games (debug.txt names what they were\n"
+		"refused)." },
+
+	{ "game.maps.path", _config_string, "\"\"", "HALO_MAPS_PATH", _environment_value, _platform_all,
+		"The folder the game's maps are read from; empty for the maps folder in\n"
+		"the data folder. A relative path is under the data folder. Read once,\n"
+		"at the start. The disc's maps are only ever unpacked into the data\n"
+		"folder's maps, so a folder named here must hold them already (on\n"
+		"Android, the launcher's \"Use another folder\" sets this and unpacks\n"
+		"them there)." },
+	{ "game.custom_maps.path", _config_string, "\"\"", "HALO_CUSTOM_MAPS_PATH", _environment_value, _platform_all,
+		"The folder Custom Edition maps are read from (and map sharing's\n"
+		"downloads go to); empty for the custom_maps folder in the data folder.\n"
+		"A relative path is under the data folder. On Android, Settings >\n"
+		"Gameplay > CUSTOM MAPS FOLDER chooses it; a change takes effect at once." },
+	{ "game.mods.path", _config_string, "\"\"", "HALO_MODS_PATH", _environment_value, _platform_all,
+		"The folder the mods are read from (and Android's IMPORT puts them in);\n"
+		"empty for the mods folder in the data folder. A relative path is under\n"
+		"the data folder." },
+	{ "game.mcc.path", _config_string, "\"\"", "HALO_MCC_PATH", _environment_value, _platform_all,
+		"The folder holding mcc_maps (the MCC maps, and Steam's downloads of them);\n"
+		"empty for the data folder. A relative path is under the data folder. Read\n"
+		"once, at the start. mcc_staging stays in the data folder." },
+
+	{ "paths.data", _config_string, "\"\"", "HALO_DATA_ROOT", _environment_value, _platform_desktop,
+		"The folder holding the game data's maps folder; empty looks in the\n"
+		"working directory and its assets folder. Windows paths are easiest in\n"
+		"single quotes: 'C:\\Games\\Halo'." },
+	{ "paths.saves", _config_string, "\"\"", "HALO_SAVE_ROOT", _environment_value, _platform_desktop,
+		"Where saved games and profiles go; empty for the usual place\n"
+		"(~/.local/share/halo-linux, or %APPDATA%\\halo on Windows)." },
+	{ "paths.custom_edition", _config_string, "\"\"", "HALO_CUSTOM_EDITION_ROOT", _environment_value, _platform_desktop,
+		"A Halo Custom Edition install whose maps folder is looked in after the\n"
+		"custom_maps folder for Custom Edition maps and their bitmaps.map,\n"
+		"sounds.map and loc.map (game.custom_edition); empty for none." },
+	{ "paths.logs", _config_string, "\"\"", "HALO_LOG_ROOT", _environment_value, _platform_desktop,
+		"Where debug.txt, bans.txt and cheaters.txt go; empty for the data\n"
+		"folder. Lets the data folder be read-only (a dedicated server's maps\n"
+		"mounted so)." },
+	{ "paths.custom_maps", _config_string, "\"\"", "HALO_CUSTOM_MAPS_ROOT", _environment_value, _platform_desktop,
+		"The custom_maps folder (Custom Edition maps, and their bitmaps.map,\n"
+		"sounds.map and loc.map); empty for the one in the data folder." },
+	{ "paths.steam", _config_string, "\"\"", "HALO_STEAM_ROOT", _environment_value, _platform_desktop,
+		"A Steam folder (or Steam library) to check first for subscribed Halo CE\n"
+		"Workshop items. Empty uses automatic discovery: Windows registry, Linux\n"
+		"Steam/XDG hints, usual folders and their libraries. Windows paths use single\n"
+		"quotes: 'D:\\Steam'." },
+	{ "game.mcc_campaigns", _config_boolean, "true", "HALO_MCC_CAMPAIGNS", _environment_value, _platform_all,
+		"Use explicit MCC campaign manifests for mission discovery, ordering and\n"
+		"progression. Reopen the map list after changing this." },
+	{ "game.mcc_host_conversion", _config_boolean, "true", "HALO_MCC_HOST_CONVERSION", _environment_value, _platform_all,
+		"Convert an MCC map's sounds and textures on the host's threads as it loads,\n"
+		"keeping its converted sounds in the host's memory. false converts them on the\n"
+		"game's own thread, one after another, as before." },
+	{ "game.workshop_maps", _config_boolean, "true", "HALO_WORKSHOP_MAPS", _environment_value, _platform_desktop,
+		"Discover installed Halo CE Steam Workshop maps. Read-only desktop\n"
+		"discovery; manually installed mcc_maps packages always remain available." },
+	{ "game.mcc_collections", _config_boolean, "true", "HALO_MCC_COLLECTIONS", _environment_value, _platform_all,
+		"Group identified MCC packages into the bundled Workshop collections.\n"
+		"Works with imported packages without Steam; reopen the map list after changing." },
+
+	{ "network.address", _config_string, "\"\"", "HALO_NET_ADDRESS", _environment_value, _platform_all,
+		"This machine's IPv4 address for system link, for a machine on several\n"
+		"networks; empty chooses one." },
+	{ "network.broadcast", _config_string, "\"\"", "HALO_NET_BROADCAST", _environment_value, _platform_all,
+		"Comma-separated IPv4 addresses system link sends its announcements to\n"
+		"instead of the local network's broadcast address (for VPNs); empty for\n"
+		"the local network." },
+	{ "network.online", _config_boolean, "true", "HALO_NET_ONLINE", _environment_value, _platform_all,
+		"Internet play: hosting makes an invite link (logged, and put on the\n"
+		"clipboard) that lets whoever has it join over the internet; opening a\n"
+		"link (or copying one before switching to the game) joins. Only people\n"
+		"with the invite can join. Off keeps system link to the local network." },
+	{ "network.join_from_clipboard", _config_boolean, "true", "HALO_NET_JOIN_FROM_CLIPBOARD", _environment_value,
+		_platform_all,
+		"Join the game of an invite link found on the clipboard when the game\n"
+		"comes to the front." },
+	{ "network.tunnel_port", _config_integer, "0", "HALO_NET_TUNNEL_PORT", _environment_value, _platform_all,
+		"The UDP port internet play uses; 0 picks one. A fixed one can be\n"
+		"forwarded on the router, for networks whose NAT stops connections." },
+	{ "network.client_timeout_seconds", _config_integer, "15", "HALO_NET_CLIENT_TIMEOUT_SECONDS", _environment_value,
+		_platform_all,
+		"Seconds a host waits for a machine it hears nothing from before it\n"
+		"drops it (5 to 300; the stock game's 15). Longer keeps players whose\n"
+		"connection stalls (a browser tab in the background) at the cost of\n"
+		"frozen players for longer when one really goes." },
+	{ "network.record_replays", _config_boolean, "false", "HALO_NET_RECORD_REPLAYS", _environment_value,
+		_platform_all,
+		"Each network game is recorded to the data folder's replays/, which\n"
+		"the main menu's Theater plays (port/linux/REPLAY.md): a host's, all of\n"
+		"it (what a client that sees everything is sent); a client's, what its\n"
+		"host sends it (far players less often) and its own input. Read at a\n"
+		"game's start; the overlay's System folder has it too." },
+	{ "network.replay_hints", _config_boolean, "true", "HALO_NET_REPLAY_HINTS", _environment_value,
+		_platform_all,
+		"Watching a replay with a controller: the bars of the buttons and of the\n"
+		"camera's controls over the seek bar. The replay's pause menu turns them\n"
+		"on and off (the north button: Y, the Switch's X, the PS5's triangle)." },
+	{ "network.full_detail_to_clients", _config_boolean, "false", "HALO_NET_FULL_DETAIL_TO_CLIENTS",
+		_environment_value, _platform_all,
+		"Hosting: send every client every player every tick (not those far\n"
+		"from its own, or out of their sight, less often) and every damage\n"
+		"event (not only those near its players), so that a client's replay\n"
+		"holds all of the game. More to send: a client's download grows with\n"
+		"the players. Read each tick." },
+	{ "network.replays_kept", _config_integer, "30", "HALO_NET_REPLAYS_KEPT", _environment_value, _platform_all,
+		"How many replays the replays/ folder keeps: the oldest are deleted as a\n"
+		"recording starts; 0 keeps them all." },
+	{ "network.allow_upnp", _config_boolean, "true", "HALO_NET_ALLOW_UPNP", _environment_value, _platform_all,
+		"Let internet play ask the router (UPnP) to forward its port, for\n"
+		"networks whose NAT stops connections: when a player joins this\n"
+		"machine's game, and when joining a game takes too long. False never\n"
+		"asks." },
+	{ "network.public_lobby", _config_boolean, "true", "HALO_NET_PUBLIC_LOBBY", _environment_value, _platform_all,
+		"The server browser: public games are listed through the signalling\n"
+		"brokers, and Join Game > Server Browser shows them. False lists no\n"
+		"game of this machine's and shows none." },
+	{ "network.host_public", _config_boolean, "true", "HALO_NET_HOST_PUBLIC", _environment_value, _platform_all,
+		"Whether a new game of Create Game > Internet starts as PUBLIC (listed\n"
+		"in everyone's server browser: anyone can see and join it) or, false,\n"
+		"PRIVATE (only players with its invite link can join). Server Setup's\n"
+		"LISTING changes it for each game." },
+	{ "network.voice_lobby", _config_boolean, "true", "HALO_NET_VOICE_LOBBY", _environment_value, _platform_all,
+		"Hosting: voice chat in the lobby, before and after a game, where every\n"
+		"player hears every other." },
+	{ "network.voice_mode", _config_string, "\"team_global_enemy_proximity\"", "HALO_NET_VOICE_MODE",
+		_environment_value, _platform_all,
+		"Hosting: voice chat in a game: \"off\"; \"team_proximity\" (teammates\n"
+		"near); \"team_enemy_proximity\" (anyone near); \"team_global\" (all\n"
+		"teammates); or \"team_global_enemy_proximity\" (all teammates, and\n"
+		"enemies near). A game without teams has only enemies; co-op only\n"
+		"teammates." },
+	{ "network.voice_kbps", _config_integer, "24", "HALO_NET_VOICE_KBPS", _environment_value, _platform_all,
+		"Hosting: the voices' quality, in the lobby and in a game, in kilobits a\n"
+		"second (8 to 64)." },
+	{ "network.voice_proximity", _config_real, "15.0", "HALO_NET_VOICE_PROXIMITY", _environment_value,
+		_platform_all,
+		"Hosting: how near (world units: 1 is about 3 metres) a player must be\n"
+		"to be heard by proximity voice chat (5 to 100)." },
+	{ "network.text_chat", _config_string, "\"on\"", "HALO_NET_TEXT_CHAT", _environment_value, _platform_all,
+		"Hosting: the text chat: \"on\" (links in lines are refused), \"links\"\n"
+		"(links allowed) or \"off\", in either case. Always off in a game a\n"
+		"player hosts that is listed in the server browser (a public internet\n"
+		"game); a dedicated server's follows this setting, listed or not." },
+	{ "network.votekick", _config_boolean, "true", "HALO_NET_VOTEKICK", _environment_value, _platform_all,
+		"Hosting: let the players vote to kick a player (the scoreboard's\n"
+		"right-click, or the console's votekick; F1 or the D-pad's left votes\n"
+		"yes, F2 or its right no). The yes votes needed are\n"
+		"network.votekick_threshold's, counted once per address, and more yes\n"
+		"than no." },
+	{ "network.votekick_threshold", _config_string, "\"dynamic\"", "HALO_NET_VOTEKICK_THRESHOLD", _environment_value,
+		_platform_all,
+		"Hosting: the yes votes a vote (to kick, to end the game) needs, of the\n"
+		"players who may vote: \"dynamic\", scaled with the players (more than\n"
+		"half up to 8, 40% up to 32, 30% beyond); \"static\",\n"
+		"network.votekick_percent of them. At least 2 either way." },
+	{ "network.votekick_percent", _config_integer, "50", "HALO_NET_VOTEKICK_PERCENT", _environment_value,
+		_platform_all,
+		"Hosting: with network.votekick_threshold \"static\", the percentage of\n"
+		"the players who may vote whose yes passes a vote (1 to 100, rounded\n"
+		"up; a kick's never more than those who can vote)." },
+	{ "network.vote_end_game", _config_boolean, "true", "HALO_NET_VOTE_END_GAME", _environment_value, _platform_all,
+		"Hosting: let the players vote to end the game (\"!endgame\" in the chat;\n"
+		"F1 votes yes, F2 no), counted as a vote to kick. The game ends with its\n"
+		"scores, as sv_end_game ends it." },
+	{ "network.votekick_minutes", _config_integer, "5", "HALO_NET_VOTEKICK_MINUTES", _environment_value,
+		_platform_all,
+		"Hosting: the minutes a player must have played on this server to start\n"
+		"a vote to kick (0 to 60); to vote, 2 minutes or this, the less." },
+	{ "network.votekick_ban_minutes", _config_integer, "30", "HALO_NET_VOTEKICK_BAN_MINUTES", _environment_value,
+		_platform_all,
+		"Hosting: the minutes a player kicked by a vote cannot join again (1 to\n"
+		"1440)." },
+	{ "network.map_share", _config_boolean, "true", "HALO_NET_MAP_SHARE", _environment_value, _platform_all,
+		"Hosting: share CE maps and MCC packages automatically. MCC base\n"
+		"resources are never sent; joiners need matching local copies.\n"
+		"For a player without the game's Custom Edition map, send\n"
+		"the map (from custom_maps), and the resource maps it needs that the\n"
+		"player lacks (bitmaps.map, sounds.map, loc.map). The game's other\n"
+		"players help (network.map_seed)." },
+	{ "network.map_share_upload", _config_integer, "1024", "HALO_NET_MAP_SHARE_UPLOAD", _environment_value,
+		_platform_all,
+		"Hosting: the most kilobytes a second the host sends of maps (16 to\n"
+		"256000: 250 MB/s), so that the game's own traffic keeps the rest of the\n"
+		"upload." },
+	{ "network.map_seed", _config_boolean, "true", "HALO_NET_MAP_SEED", _environment_value, _platform_all,
+		"Playing in another's game: help send its map to players who join\n"
+		"without it, as a torrent's peers do (the pieces this machine has, at\n"
+		"most network.map_seed_upload)." },
+	{ "network.map_seed_upload", _config_integer, "256", "HALO_NET_MAP_SEED_UPLOAD", _environment_value,
+		_platform_all,
+		"Playing in another's game: the most kilobytes a second this machine\n"
+		"sends of maps to other players (16 to 256000: 250 MB/s)." },
+	{ "network.map_upload_in_game", _config_integer, "25", "HALO_NET_MAP_UPLOAD_IN_GAME", _environment_value,
+		_platform_all,
+		"While a game is being played on this machine, the part of\n"
+		"network.map_share_upload and network.map_seed_upload that map uploads\n"
+		"take, in percent (10 to 100), so that the game's own traffic comes\n"
+		"first; in the lobby and after a game, the whole of it." },
+	{ "network.map_download", _config_boolean, "true", "HALO_NET_MAP_DOWNLOAD", _environment_value, _platform_all,
+		"Allow map downloads when joining. MCC asks before downloading from\n"
+		"the host; Custom Edition downloads from the game's players.\n"
+		"For a Custom Edition map this machine does not have:\n"
+		"download it (and the resource maps it needs) from the game's players\n"
+		"into custom_maps, if its host shares it (network.map_share); false\n"
+		"leaves the game, saying which map is missing." },
+	{ "network.map_archive", _config_boolean, "true", "HALO_NET_MAP_ARCHIVE", _environment_value, _platform_all,
+		"When joining a game on a Custom Edition map this machine does not\n"
+		"have (network.map_download on): look for the host's version of it in\n"
+		"FractumSeraph's map archive first and download it from there, asking\n"
+		"the host's players only if the archive has not got it\n"
+		"(port/linux/src/map_archive.c). Not in the browser build." },
+	{ "network.coop_public", _config_boolean, "false", "HALO_NET_COOP_PUBLIC", _environment_value, _platform_all,
+		"Whether an online co-op game (Create Game > Internet, a SINGLEPLAYER\n"
+		"map) starts as PUBLIC or, false, PRIVATE: Server Setup's LISTING in\n"
+		"co-op, which writes its choice here." },
+	{ "network.coop_team_wipe", _config_string, "\"auto\"", "HALO_NET_COOP_TEAM_WIPE", _environment_value,
+		_platform_all,
+		"When every co-op player dies: \"auto\" reverts the checkpoint in a\n"
+		"PRIVATE game and only respawns in a PUBLIC game; \"revert\" or\n"
+		"\"respawn\" overrides that choice. A password does not make a PUBLIC\n"
+		"game private. Reverting requires a saved checkpoint with the current\n"
+		"players and machines; otherwise they respawn without a world reset.\n"
+		"TEAM WIPE in Server Setup > Co-op Options writes its choice here." },
+	{ "network.coop_friendly_fire", _config_string, "\"on\"", "HALO_NET_COOP_FRIENDLY_FIRE", _environment_value,
+		_platform_all,
+		"Whether the players of an online co-op game hurt each other: \"off\",\n"
+		"\"on\", \"shields_only\" or \"explosives_only\" (FRIENDLY FIRE in\n"
+		"co-op's Server Setup > Co-op Options writes its choice here). Their AI\n"
+		"allies they hurt as network.coop_ally_friendly_fire says." },
+	{ "network.coop_ally_friendly_fire", _config_boolean, "true", "HALO_NET_COOP_ALLY_FRIENDLY_FIRE",
+		_environment_value, _platform_all,
+		"Whether the players of an online co-op game hurt their AI allies (the\n"
+		"Marines, Captain Keyes, the Sentinels while they are allies), as in the\n"
+		"campaign; false, the players' weapons, grenades and vehicles do them\n"
+		"no harm. ALLY FRIENDLY FIRE in co-op's Server Setup > Co-op Options\n"
+		"writes its choice here." },
+	{ "network.coop_own_friendly_fire", _config_boolean, "true", "HALO_NET_COOP_OWN_FRIENDLY_FIRE",
+		_environment_value, _platform_all,
+		"Whether this machine's players hurt, and are hurt by, the other players\n"
+		"of an online co-op game: two players hurt each other only if both have\n"
+		"it true. FRIENDLY FIRE in that game's pause menu writes its choice\n"
+		"here. A player away from the controls for over 70 seconds is hurt by\n"
+		"every player, whatever either chose." },
+	{ "network.coop_player_collisions", _config_boolean, "true", "HALO_NET_COOP_PLAYER_COLLISIONS", _environment_value,
+		_platform_all,
+		"Whether the players of an online co-op game bump into each other;\n"
+		"false, they walk through each other (the AI's characters they still\n"
+		"bump into). PLAYER COLLISIONS in co-op's Server Setup > Co-op Options\n"
+		"writes its choice here." },
+	{ "network.coop_score_type", _config_string, "\"competitive\"", "HALO_NET_COOP_SCORE_TYPE", _environment_value,
+		_platform_all,
+		"How a co-op game's campaign score (game.campaign_score) is kept, split\n"
+		"screen and online: \"competitive\" (INDIVIDUAL) gives each player a\n"
+		"score of their own, \"cooperative\" (TEAM) adds the players' scores\n"
+		"together. SCORING TYPE in co-op's Server Setup > Co-op Options and\n"
+		"Settings > Gameplay > Scoring's CO-OP SCORING write it; the host's counts." },
+	{ "network.vehicle_riding", _config_boolean, "false", "HALO_NET_VEHICLE_RIDING", _environment_value, _platform_all,
+		"Host: the base setting: players standing on a moving vehicle are\n"
+		"carried by it (co-op's options in Server Setup set it). In\n"
+		"multiplayer each gametype's VEHICLE RIDING rule overrides it (a\n"
+		"gametype without the rule is off), and a dedicated server's co-op\n"
+		"entry may with +riding. A map's own choice still wins. Changes count\n"
+		"from the next map." },
+	{ "network.coop_enemies_mode", _config_string, "\"per_player\"", "HALO_NET_COOP_ENEMIES_MODE", _environment_value,
+		_platform_all,
+		"Online co-op's extra enemies: \"none\", \"per_player\" (each squad of\n"
+		"enemies grows by coop_enemies for each player past the first) or\n"
+		"\"multiplier\" (each is coop_enemies_multiplier times as large, for any\n"
+		"number of players). EXTRA ENEMIES in co-op's Server Setup > Co-op\n"
+		"Options writes its choice here." },
+	{ "network.coop_pickups", _config_string, "\"none\"", "HALO_NET_COOP_PICKUPS", _environment_value, _platform_all,
+		"Extra campaign weapons, grenades, health kits, overshields and camouflage.\n"
+		"Modes: \"none\", \"per_player\" (coop_enemies percent per extra player),\n"
+		"or \"multiplier\" (coop_enemies_multiplier times as many), up to 8 times\n"
+		"the original pickups. Only safe nearby places receive copies." },
+	{ "network.coop_vehicles", _config_string, "\"none\"", "HALO_NET_COOP_VEHICLES", _environment_value, _platform_all,
+		"Extra campaign vehicles: \"none\", \"per_player\" or \"multiplier\".\n"
+		"After a player clears its unloaded starting place by both bounding\n"
+		"radii plus 15 percent, make one more there, up to\n"
+		"floor((players - 1) * coop_enemies * 2 / 300) extras, or floor((coop_enemies_multiplier - 1) * 2 / 3) in static mode.\n"
+		"The host alone creates them, and waits while the starting place is blocked." },
+	{ "network.coop_enemies", _config_integer, "50", "HALO_NET_COOP_ENEMIES", _environment_value, _platform_all,
+		"Online co-op's extra enemies per player, a percentage: for each player\n"
+		"past the first, each squad of enemies a level places gets this much of\n"
+		"itself more (100: as many again; 25 to 200). PER PLAYER in co-op's\n"
+		"Server Setup > Co-op Options writes its choice here." },
+	{ "network.coop_enemies_multiplier", _config_integer, "2", "HALO_NET_COOP_ENEMIES_MULTIPLIER", _environment_value,
+		_platform_all,
+		"Online co-op's shared static multiplier (2 to 32). Pickups are capped\n"
+		"at 8 times their original count; extra vehicle growth uses two thirds\n"
+		"of (multiplier - 1), rounded down. MULTIPLIER in\n"
+		"co-op's Server Setup > Co-op Options writes its choice here." },
+	{ "network.brokers_file", _config_string, "\"brokers.txt\"",
+		"HALO_NET_BROKERS_FILE", _environment_value, _platform_all,
+		"The file of the public MQTT brokers through which the machines of an\n"
+		"invite find each other (its messages are encrypted), beside this file\n"
+		"unless a full path: one host:port on each line, up to 4. Updates\n"
+		"replace brokers.txt: keep a list of your own under another name." },
+	{ "network.public_address", _config_string, "\"\"", "HALO_NET_PUBLIC_ADDRESS", _environment_value,
+		_platform_desktop,
+		"Hosting: the internet address joiners reach this machine at, as\n"
+		"host[:port] (the port: the one forwarded to network.tunnel_port), for a\n"
+		"server behind a NAT with one forwarded port; offered first, its name\n"
+		"looked up again every 5 minutes. Empty: what STUN and UPnP find." },
+	{ "network.listings", _config_string, "\"both\"", "HALO_NET_LISTINGS", _environment_value, _platform_all,
+		"What the server browser lists: \"both\" (dedicated servers from the\n"
+		"master servers first, then the games players host, from the brokers),\n"
+		"\"masters\" (the master servers' alone) or \"brokers\" (the brokers'\n"
+		"alone)." },
+	{ "network.masters_file", _config_string, "\"masters.txt\"", "HALO_NET_MASTERS_FILE", _environment_value,
+		_platform_all,
+		"The file of the master servers the server browser asks for dedicated\n"
+		"servers, beside this file unless a full path: an https:// URL and its\n"
+		"key (ed25519:<hex>) on each line, up to 4. None named (no file, or\n"
+		"comments alone): the official masters, built in." },
+	{ "network.link_share", _config_string, "\"when_needed\"", "HALO_NET_LINK_SHARE", _environment_value,
+		_platform_all,
+		"When the game shows a server the Discord account linked to it\n"
+		"(Settings > Network Setup > Discord Account): \"when_needed\" (a server\n"
+		"that asks, to let you in from a VPN), \"always\" or \"never\"." },
+	{ "network.browser_source", _config_string, "\"all\"", "HALO_NET_BROWSER_SOURCE", _environment_value,
+		_platform_all,
+		"The server browser's games: \"all\" (ALL GAMES: the dedicated\n"
+		"servers and the games players host), \"dedicated\" (the\n"
+		"master servers' dedicated servers) or \"players\" (P2P GAMES: games\n"
+		"players host). Its top-left tab changes it." },
+	{ "network.browser_show_empty", _config_boolean, "true", "HALO_NET_BROWSER_SHOW_EMPTY", _environment_value,
+		_platform_all,
+		"The server browser lists games with no player (its Filters screen)." },
+	{ "network.browser_show_full", _config_boolean, "true", "HALO_NET_BROWSER_SHOW_FULL", _environment_value,
+		_platform_all,
+		"The server browser lists full games (its Filters screen)." },
+	{ "network.browser_maps", _config_string, "\"yes\"", "HALO_NET_BROWSER_MAPS", _environment_value, _platform_all,
+		"The server browser lists games on maps this machine lacks: \"yes\", \"no\",\n"
+		"or \"downloadable\" (those of a Custom Edition map its host shares)." },
+	{ "network.browser_gametype", _config_string, "\"any\"", "HALO_NET_BROWSER_GAMETYPE", _environment_value,
+		_platform_all,
+		"The server browser lists games of one kind only: \"any\", \"ctf\",\n"
+		"\"slayer\", \"oddball\", \"king\" or \"race\" (its Filters screen)." },
+	{ "network.browser_vanilla_maps", _config_boolean, "true", "HALO_NET_BROWSER_VANILLA_MAPS", _environment_value,
+		_platform_all,
+		"The server browser lists games on the game's own maps (its Filters\n"
+		"screen's VANILLA MAPS)." },
+	{ "network.browser_custom_edition_maps", _config_boolean, "true", "HALO_NET_BROWSER_CUSTOM_EDITION_MAPS",
+		_environment_value, _platform_all,
+		"The server browser lists games on Custom Edition maps (its Filters\n"
+		"screen's CUSTOM EDITION MAPS)." },
+	{ "network.browser_mcc_maps", _config_boolean, "true", "HALO_NET_BROWSER_MCC_MAPS", _environment_value,
+		_platform_all,
+		"The server browser lists games on MCC maps (its Filters screen's MCC\n"
+		"MAPS)." },
+	{ "network.browser_mode", _config_string, "\"all\"", "HALO_NET_BROWSER_MODE", _environment_value, _platform_all,
+		"The server browser lists \"all\" games, \"multiplayer\" games or\n"
+		"\"campaign\" co-op games alone (its Filters screen's GAME MODE)." },
+	{ "network.browser_favorites_only", _config_boolean, "false", "HALO_NET_BROWSER_FAVORITES_ONLY",
+		_environment_value, _platform_all,
+		"The server browser lists your favorite servers alone (its Filters\n"
+		"screen's FAVORITES ONLY)." },
+	{ "network.browser_favorites", _config_string, "\"\"", "HALO_NET_BROWSER_FAVORITES", _environment_value,
+		_platform_all,
+		"The server browser's favorite servers, listed first with a star: their\n"
+		"names' letters and digits in lower case, between bars. The browser's\n"
+		"FAVORITE button (a controller's left trigger, F on a keyboard) adds\n"
+		"the chosen one, or takes it out." },
+	{ "network.browser_sort", _config_string, "\"players\"", "HALO_NET_BROWSER_SORT", _environment_value,
+		_platform_all,
+		"The server browser's order: \"players\" (the most players first),\n"
+		"\"servers\" (dedicated servers first, then by players), \"name\", \"map\",\n"
+		"\"type\", \"locked\" (a password's first) or \"ping\" (the lowest first,\n"
+		"those not timed yet last); \"-\" before one reverses it\n"
+		"(\"-players\"). A column title sorts by it, and again the other way." },
+	{ "network.stun_servers", _config_string, "\"stun.l.google.com:19302,stun.cloudflare.com:3478\"",
+		"HALO_NET_STUN", _environment_value, _platform_all,
+		"Public STUN servers that tell this machine its internet address;\n"
+		"comma-separated host:port." },
+	{ "discord.application_id", _config_string, "\"1553978809840050229\"", "HALO_DISCORD_APPLICATION",
+		_environment_value, _platform_desktop,
+		"The Discord application internet play invites go through while the\n"
+		"Discord desktop client runs; empty for none." },
+
+	{ "game.daily_challenge", _config_boolean, "true", "HALO_DAILY_CHALLENGE", _environment_value, _platform_all,
+		"Settings > Gameplay > Community's DAILY CHALLENGE: Campaign's DAILY\n"
+		"CHALLENGE, a level a day with the randomizer and skulls set, the same\n"
+		"for everyone (port/linux/game/community.c). false: no such item." },
+	{ "community.enabled", _config_boolean, "true", "HALO_COMMUNITY", _environment_value, _platform_all,
+		"Settings > Gameplay > Community's ONLINE. true: the daily\n"
+		"challenge and the leaderboards come from the community server\n"
+		"(community.server_mode). false: nothing is sent or asked; the day's\n"
+		"challenge is made on this machine, and the leaderboards are its own." },
+	{ "community.server_mode", _config_string, "\"default\"", "HALO_COMMUNITY_SERVER_MODE", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Community's SERVER: \"default\" (the\n"
+		"OpenCE server, https://oceapi.watanoge.com) or \"custom\"\n"
+		"(community.custom_server)." },
+	{ "community.custom_server", _config_string, "\"\"", "HALO_COMMUNITY_CUSTOM_SERVER", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Community's SERVER ADDRESS, with\n"
+		"community.server_mode \"custom\": another community server's address\n"
+		"(https only), as https://example.com." },
+	{ "community.upload_scores", _config_boolean, "true", "HALO_COMMUNITY_UPLOAD_SCORES", _environment_value,
+		_platform_all,
+		"Settings > Gameplay > Community's SHARE LEVEL SCORES, with\n"
+		"community.enabled: a campaign level won with scoring on, by one player\n"
+		"on this machine, is sent to the online leaderboard with the profile's\n"
+		"name. A daily challenge's run is always sent." },
+	{ "community.key", _config_string, "\"\"", "HALO_COMMUNITY_KEY", _environment_value, _platform_all,
+		"This install's own key on the community server, made the first time it\n"
+		"is asked: it keeps your scores yours. Keep it secret; copy it to move\n"
+		"your scores to another install." },
+	{ "social.enabled", _config_boolean, "true", "HALO_SOCIAL", _environment_value, _platform_all,
+		"With community.enabled: this install's account on the community server\n"
+		"(made the first time, with no sign-up: community.key is its key), the\n"
+		"records of its matches and levels (social.record_matches), and the\n"
+		"fork's chat (social.chat). false: none of them is sent or asked." },
+	{ "social.chat", _config_boolean, "true", "HALO_SOCIAL_CHAT", _environment_value, _platform_all,
+		"The fork's chat box, in the game and the menus: the network games' text\n"
+		"chat in it (its lines marked U), and the fork's own through the\n"
+		"community server (marked F): the match's, the team's, private ones and\n"
+		"global ones. T, Y, D-pad Up in a network game, or L + R + D-pad Up open\n"
+		"it. false: the network games' text chat as it was." },
+	{ "social.global_chat", _config_boolean, "true", "HALO_SOCIAL_GLOBAL_CHAT", _environment_value,
+		_platform_all,
+		"social.chat: the fork's global chat (every player of the fork's online)\n"
+		"is heard; false hears the match's, the team's and private lines alone." },
+	{ "social.global_everywhere", _config_boolean, "true", "HALO_SOCIAL_GLOBAL_EVERYWHERE", _environment_value,
+		_platform_all,
+		"social.global_chat: global lines show with the others, in a match too;\n"
+		"false: only in the box's GLOBAL channel, which shows them alone." },
+	{ "social.record_matches", _config_boolean, "true", "HALO_SOCIAL_RECORD_MATCHES", _environment_value,
+		_platform_all,
+		"social.enabled: each multiplayer match played (kills, deaths, assists,\n"
+		"medals with game.multiplayer_medals, won or lost) and each campaign\n"
+		"level won is added to the account's records." },
+	{ "social.private_chat", _config_boolean, "true", "HALO_SOCIAL_PRIVATE_CHAT", _environment_value,
+		_platform_all,
+		"social.chat: private lines reach you (and the box's PRIVATE channel is\n"
+		"there); false: no one's private line reaches you, nor do you send any." },
+	{ "social.private_anyone", _config_boolean, "true", "HALO_SOCIAL_PRIVATE_ANYONE", _environment_value,
+		_platform_all,
+		"social.private_chat: private lines with anyone; false: only your friends'\n"
+		"reach you, and you write to your friends alone." },
+	{ "social.show_reported", _config_boolean, "false", "HALO_SOCIAL_SHOW_REPORTED", _environment_value,
+		_platform_all,
+		"social.chat: the lines of players many others reported are shown\n"
+		"(marked REPORTED); false hides them. Muted and blocked players' never show." },
+	{ "social.friends", _config_boolean, "true", "HALO_SOCIAL_FRIENDS", _environment_value, _platform_all,
+		"social.enabled: the friend list (main menu's Y: SOCIAL). false: your\n"
+		"friends see you offline and no one can ask to be your friend." },
+	{ "social.friend_requests", _config_boolean, "true", "HALO_SOCIAL_FRIEND_REQUESTS", _environment_value,
+		_platform_all,
+		"social.friends: other players can ask to be your friend (from the chat\n"
+		"or your page); false: only those you give your code to can." },
+	{ "social.show_activity", _config_boolean, "true", "HALO_SOCIAL_SHOW_ACTIVITY", _environment_value,
+		_platform_all,
+		"social.friends: your friends see what you are playing, your latest\n"
+		"matches and levels; false: only that you are online." },
+	{ "social.instant_join", _config_boolean, "true", "HALO_SOCIAL_INSTANT_JOIN", _environment_value,
+		_platform_all,
+		"social.friends: your friends can join the internet game you host from\n"
+		"their friend list (its invite is theirs); false: only by your invite." },
+
+	{ "update.auto", _config_boolean, "true", "HALO_UPDATE_AUTO", _environment_value, _platform_all,
+		"Look for a new version when the game starts, and offer to update to it;\n"
+		"false never looks (the game's \"Do not ask again\" writes false here)." },
+	/* (a dedicated server's: halo --server, port/linux/src/server_mode.c;
+	written into the file only by one) */
+	{ "server.enabled", _config_boolean, "false", "HALO_SERVER", _environment_set_is_true, _platform_server,
+		"Run as a dedicated server (as halo --server does): host games with no\n"
+		"window, sound or player of its own, one after another from\n"
+		"server.rotation (docs/dedicated_server.md)." },
+#if defined(HALO_ANDROID) || defined(HALO_PS5)
+	/* (hosting from the menus: no name until the host gives one, which
+	Server Settings asks for before the first game: menu_functions.c) */
+	{ "server.name", _config_string, "\"\"", "HALO_SERVER_NAME", _environment_value, _platform_server | _platform_host,
+		"The server's name in the lobby and the server browser: 15 characters\n"
+		"of printable ASCII. Empty until it is set: Multiplayer > Host Server >\n"
+		"Server Settings, which hosting asks for first." },
+#else
+	{ "server.name", _config_string, "\"OpenCE Server\"", "HALO_SERVER_NAME", _environment_value, _platform_server | _platform_host,
+		"The game's name in the lobby and the server browser: 15 characters of\n"
+		"printable ASCII." },
+#endif
+	{ "server.max_players", _config_integer, "16", "HALO_SERVER_MAX_PLAYERS", _environment_value, _platform_server | _platform_host,
+		"The most players (2 to 127)." },
+	{ "server.min_players", _config_integer, "1", "HALO_SERVER_MIN_PLAYERS", _environment_value, _platform_server | _platform_host,
+		"Players in the lobby before it counts down to a game (1 to 16)." },
+	{ "server.password", _config_string, "\"\"", "HALO_SERVER_PASSWORD", _environment_value, _platform_server | _platform_host,
+		"The password the server browser asks for (the invite link still joins);\n"
+		"empty for none. Never logged." },
+	{ "server.public", _config_boolean, "true", "HALO_SERVER_PUBLIC", _environment_value, _platform_server | _platform_host,
+		"List the server in everyone's server browser (on the master servers,\n"
+		"with network.online); false: joined by its invite link and on the LAN." },
+	{ "server.listing", _config_string, "\"internet_public\"", "HALO_SERVER_LISTING", _environment_value, _platform_host,
+		"Hosting from the menus (Host Server's Server Settings, LISTING): where the\n"
+		"server is found, as Create Game's INTERNET and LAN choose. \"internet_public\":\n"
+		"in everyone's server browser; \"internet_private\": by its invite link and\n"
+		"on the LAN; \"lan\": on the LAN only. The internet's need network.online.\n"
+		"(A dedicated server goes by server.public and network.online instead.)" },
+	{ "server.rotation", _config_string, "\"bloodgulch:ctf, sidewinder:team_slayer, prisoner:slayer\"",
+		"HALO_SERVER_ROTATION", _environment_value, _platform_server | _platform_host,
+		"The games played one after another: map[:gametype[+rule=value...]],\n"
+		"separated by commas, 64 at most. A map is a multiplayer map's name\n"
+		"(bloodgulch), custom_maps\\<name> or a level's path; a gametype a\n"
+		"built-in's name (slayer, team_slayer, ctf...), an OpenCE gametype's\n"
+		"(swat...), a gametypes/<name>.toml or file=<saved gametype>." },
+	{ "server.rotation_fallback", _config_boolean, "false", "HALO_SERVER_ROTATION_FALLBACK", _environment_value,
+		_platform_server,
+		"With no playable rotation entry, play bloodgulch:slayer rather than\n"
+		"stop (exit code 3)." },
+	{ "server.lobby_seconds", _config_integer, "15", "HALO_SERVER_LOBBY_SECONDS", _environment_value,
+		_platform_server | _platform_host,
+		"Seconds the lobby counts down once min_players are in (0 to 300; 0\n"
+		"starts at once)." },
+	{ "server.postgame_seconds", _config_integer, "12", "HALO_SERVER_POSTGAME_SECONDS", _environment_value,
+		_platform_server | _platform_host,
+		"Seconds the scores show after a game (0 to 300)." },
+	{ "server.empty_seconds", _config_integer, "30", "HALO_SERVER_EMPTY_SECONDS", _environment_value,
+		_platform_server | _platform_host,
+		"Seconds a game nobody is in goes on before it ends (0: never). A game\n"
+		"whose last player leaves ends at once, as the game ends it." },
+	{ "server.idle_minutes", _config_integer, "0", "HALO_SERVER_IDLE_MINUTES", _environment_value, _platform_server | _platform_host,
+		"Minutes a game goes on with no score before it ends (0: never)." },
+	{ "server.team_start", _config_string, "\"one\"", "HALO_SERVER_TEAM_START", _environment_value, _platform_server | _platform_host,
+		"A team game: \"one\" starts with one team's players (the next joiners\n"
+		"balance), \"both\" waits for a player on each team, \"skip\" skips team\n"
+		"games while one player waits." },
+	{ "server.team_switch", _config_boolean, "true", "HALO_SERVER_TEAM_SWITCH", _environment_value,
+		_platform_server | _platform_host,
+		"A player in a team game may say \"!switch\" (or \"!team\") in the chat to\n"
+		"change teams: not in Infection, and with the gametype's auto team\n"
+		"balance only to the smaller team." },
+	{ "server.team_switch_cooldown_seconds", _config_integer, "30", "HALO_SERVER_TEAM_SWITCH_COOLDOWN_SECONDS",
+		_environment_value, _platform_server | _platform_host,
+		"Seconds a player waits after a !switch before another (0 to 3600)." },
+	{ "server.motd", _config_string, "\"\"", "HALO_SERVER_MOTD", _environment_value, _platform_server | _platform_host,
+		"A notice each machine is shown as it joins (127 characters); empty for\n"
+		"none." },
+	{ "server.frame_rate", _config_integer, "60", "HALO_SERVER_FRAME_RATE", _environment_value, _platform_server,
+		"Frames a second (30 to 120); the game's ticks stay 30 a second. A\n"
+		"server with no other machine runs 10." },
+	{ "server.console", _config_boolean, "true", "HALO_SERVER_CONSOLE", _environment_value, _platform_server,
+		"Take commands from the standard input." },
+	{ "server.console_exit_on_eof", _config_boolean, "false", "HALO_SERVER_CONSOLE_EXIT_ON_EOF", _environment_value,
+		_platform_server,
+		"Stop when the standard input ends; false goes on (a panel may close\n"
+		"it)." },
+	{ "server.init_file", _config_string, "\"init.txt\"", "HALO_SERVER_INIT_FILE", _environment_value,
+		_platform_server,
+		"Commands run once at the start, one a line: in the data folder unless a\n"
+		"full path; empty for none." },
+	{ "server.web_port", _config_integer, "8080", "HALO_SERVER_WEB_PORT", _environment_value, _platform_server,
+		"The TCP port of the web page, its API and the remote console (RCON);\n"
+		"0 for none." },
+	{ "server.web_bind", _config_string, "\"127.0.0.1\"", "HALO_SERVER_WEB_BIND", _environment_value,
+		_platform_server,
+		"The address the web port listens on. Any but 127.0.0.1 needs\n"
+		"web_password (behind a reverse proxy with TLS)." },
+	{ "server.web_password", _config_string, "\"\"", "HALO_SERVER_WEB_PASSWORD", _environment_value,
+		_platform_server,
+		"The web page's admin password (8 characters or more). Empty: one is\n"
+		"made at the first start, printed once and written here." },
+	{ "server.web_owner_password", _config_string, "\"\"", "HALO_SERVER_WEB_OWNER_PASSWORD", _environment_value,
+		_platform_server,
+		"A password with the owner role (quit, sv_restart, sv_stop, the owner's\n"
+		"settings, the game's console), for a supervisor on this machine: it\n"
+		"signs in from 127.0.0.0/8 alone. 8 characters or more; empty for none." },
+	{ "server.web_moderator_password", _config_string, "\"\"", "HALO_SERVER_WEB_MODERATOR_PASSWORD",
+		_environment_value, _platform_server,
+		"A second password, with the moderator role (kick, mute, say, the next\n"
+		"map, bans of a day at most); empty for none." },
+	{ "server.web_viewer_password", _config_string, "\"\"", "HALO_SERVER_WEB_VIEWER_PASSWORD", _environment_value,
+		_platform_server,
+		"A password with the viewer role (the status, the players, the log: no\n"
+		"changes); empty for none." },
+	{ "server.web_ui", _config_boolean, "true", "HALO_SERVER_WEB_UI", _environment_value, _platform_server,
+		"Serve the admin page on the web port; false: its API and RCON only." },
+	{ "server.web_trusted_proxy", _config_string, "\"\"", "HALO_SERVER_WEB_TRUSTED_PROXY", _environment_value,
+		_platform_server,
+		"The address of a reverse proxy in front of the web port, whose\n"
+		"X-Forwarded-For (its last entry, the proxy's), -Host and -Proto are\n"
+		"believed; empty for none." },
+	{ "server.metrics", _config_boolean, "true", "HALO_SERVER_METRICS", _environment_value, _platform_server,
+		"Serve /metrics (Prometheus) on the web port without a password." },
+	{ "server.log_format", _config_string, "\"text\"", "HALO_SERVER_LOG_FORMAT", _environment_value,
+		_platform_server,
+		"The standard output's lines: \"text\" or \"json\"." },
+	{ "server.log_addresses", _config_boolean, "false", "HALO_SERVER_LOG_ADDRESSES", _environment_value,
+		_platform_server,
+		"Players' internet addresses and hardware ids in the log, the events and\n"
+		"the API for every role (the owner's console has them always)." },
+	{ "server.log_debug_echo", _config_boolean, "false", "HALO_SERVER_LOG_DEBUG_ECHO", _environment_value,
+		_platform_server,
+		"Also write debug.txt's lines to the standard error." },
+	{ "server.status_file", _config_string, "\"\"", "HALO_SERVER_STATUS_FILE", _environment_value,
+		_platform_server,
+		"A file the status (as /api/status) is written to every 2 seconds, for a\n"
+		"panel without HTTP; empty for none." },
+	{ "server.auto_update", _config_string, "\"install\"", "HALO_SERVER_AUTO_UPDATE", _environment_value,
+		_platform_server,
+		"\"install\" installs a newer release at once, on a thread of its own,\n"
+		"and stops (exit code 5) to be started again: once the server has been\n"
+		"empty for 10 minutes, or, for a new network version, once the game\n"
+		"being played is over (server.update_game_minutes at most). \"check\"\n"
+		"logs a newer release; \"off\" looks for none. A server whose files it\n"
+		"may not write (a container's image) is \"check\"." },
+	{ "server.update_check_minutes", _config_integer, "30", "HALO_SERVER_UPDATE_CHECK_MINUTES", _environment_value,
+		_platform_server,
+		"Minutes between looks for a newer release, with server.auto_update\n"
+		"(5 to 1440; a tenth either way at random)." },
+	{ "server.update_game_minutes", _config_integer, "30", "HALO_SERVER_UPDATE_GAME_MINUTES", _environment_value,
+		_platform_server,
+		"A new network version installed: the minutes a game may go on before\n"
+		"it is ended (its scores and postgame shown) and the server restarts\n"
+		"(0: it waits for the game's end)." },
+	{ "server.upnp", _config_boolean, "false", "HALO_SERVER_UPNP", _environment_value, _platform_server,
+		"Ask the router (UPnP) to forward the tunnel's port (network.allow_upnp,\n"
+		"for a server at home)." },
+	{ "server.coop_difficulty", _config_string, "\"normal\"", "HALO_SERVER_COOP_DIFFICULTY", _environment_value,
+		_platform_server,
+		"Co-op rotation entries' (<level>:coop) difficulty: \"easy\", \"normal\",\n"
+		"\"hard\" or \"impossible\"." },
+	{ "server.list_on_brokers", _config_boolean, "false", "HALO_SERVER_LIST_ON_BROKERS", _environment_value,
+		_platform_server,
+		"Also list the server among the games players host (through the\n"
+		"signalling brokers), for server browsers with no master server." },
+	{ "server.master_publish", _config_boolean, "true", "HALO_SERVER_MASTER_PUBLISH", _environment_value,
+		_platform_server,
+		"Publish a public server to the official master servers, signed with\n"
+		"the publisher key (publisher_key_file)." },
+	{ "server.masters_file", _config_string, "\"masters.txt\"", "HALO_SERVER_MASTERS_FILE", _environment_value,
+		_platform_server,
+		"The master servers published to, beside this file unless a full path:\n"
+		"an https:// URL and its key (ed25519:<hex>) on each line. None named:\n"
+		"the official masters, built in." },
+	{ "server.publisher_key_file", _config_string, "\"publisher.key\"", "HALO_SERVER_PUBLISHER_KEY_FILE",
+		_environment_value, _platform_server,
+		"The operator's Ed25519 key for the master servers (halo --server\n"
+		"--keygen makes it), beside this file unless a full path.\n"
+		"HALO_SERVER_PUBLISHER_KEY holds the key itself for containers." },
+	{ "server.instance", _config_string, "\"\"", "HALO_SERVER_INSTANCE", _environment_value, _platform_server,
+		"A short name telling this server from the operator's others on the\n"
+		"master servers (letters, digits, - and _); empty: from server.name." },
+	{ "server.region", _config_string, "\"\"", "HALO_SERVER_REGION", _environment_value, _platform_server,
+		"A region shown in the server browser (eu, na-east...): 16 characters;\n"
+		"empty for none." },
+	{ "server.chat_filter", _config_string, "\"off\"", "HALO_SERVER_CHAT_FILTER", _environment_value, _platform_server | _platform_host,
+		"The words the server keeps out of its chat and its players' names\n"
+		"(streamer mode's list, by chat_filter_slurs, _swearing and _insults):\n"
+		"\"off\"; \"censor\", a line's words shown as stars; \"block\", a line\n"
+		"with them refused (its sender is told why) and a player whose name has\n"
+		"them refused at the door. Links are network.text_chat's." },
+	{ "server.chat_filter_slurs", _config_string, "\"mild\"", "HALO_SERVER_CHAT_FILTER_SLURS", _environment_value,
+		_platform_server | _platform_host,
+		"With server.chat_filter, the slurs (race, sexuality, gender, disability)\n"
+		"kept out: \"off\", \"severe\" (the worst), \"strong\" or \"mild\" (all)." },
+	{ "server.chat_filter_swearing", _config_string, "\"off\"", "HALO_SERVER_CHAT_FILTER_SWEARING",
+		_environment_value, _platform_server | _platform_host,
+		"With server.chat_filter, the swearing and sexual words kept out: \"off\",\n"
+		"\"severe\", \"strong\" or \"mild\" (all)." },
+	{ "server.chat_filter_insults", _config_string, "\"off\"", "HALO_SERVER_CHAT_FILTER_INSULTS",
+		_environment_value, _platform_server | _platform_host,
+		"With server.chat_filter, the insults that are not slurs kept out: \"off\",\n"
+		"\"severe\", \"strong\" or \"mild\" (all)." },
+	{ "server.master_publish_address", _config_boolean, "false", "HALO_SERVER_MASTER_PUBLISH_ADDRESS",
+		_environment_value, _platform_server,
+		"Let the master servers give this server's address to players; false:\n"
+		"only their reachability probe uses it." },
+	{ "server.vpn_policy", _config_string, "\"link\"", "HALO_SERVER_VPN_POLICY", _environment_value, _platform_server,
+		"Machines joining from the address of a VPN, a Tor exit or a datacenter\n"
+		"(the master servers' netlist): \"link\", refused unless the player shows\n"
+		"a Discord account linked at a master server this server publishes to;\n"
+		"\"block\", refused; \"off\", let in." },
+	{ "server.vpn_fail", _config_string, "\"open\"", "HALO_SERVER_VPN_FAIL", _environment_value, _platform_server,
+		"Until a netlist is held: \"open\" lets every machine in, \"closed\"\n"
+		"refuses those from the internet as server.vpn_policy \"block\" would." },
+	{ "server.vpn_list", _config_string, "\"\"", "HALO_SERVER_VPN_LIST", _environment_value, _platform_server,
+		"A netlist file checked besides the master servers' (beside this file\n"
+		"unless a full path): for a server that publishes nowhere, or a test.\n"
+		"Read at the start and by sv_reload." },
+	{ "server.vpn_check_lan", _config_boolean, "false", "HALO_SERVER_VPN_CHECK_LAN", _environment_value,
+		_platform_server,
+		"Check the LAN's machines' addresses against the netlist too (tests)." },
+	{ "server.link_min_age_days", _config_integer, "365", "HALO_SERVER_LINK_MIN_AGE_DAYS", _environment_value,
+		_platform_server,
+		"A machine joining over a VPN with a linked Discord account is refused\n"
+		"when the account is younger than this many days (0: any age)." },
+	{ "server.link_one_seat", _config_boolean, "true", "HALO_SERVER_LINK_ONE_SEAT", _environment_value,
+		_platform_server,
+		"Refuse a second machine of a linked Discord account already in the game." },
+	{ "server.max_machines_per_address", _config_integer, "0", "HALO_SERVER_MAX_MACHINES_PER_ADDRESS",
+		_environment_value, _platform_server | _platform_host,
+		"The most machines that play from one address (an internet play peer's\n"
+		"real one); one more is refused (0: no limit). Households, LAN cafes\n"
+		"and mobile carriers share one address among many players." },
+	{ "server.afk_kick_minutes", _config_integer, "5", "HALO_SERVER_AFK_KICK_MINUTES", _environment_value,
+		_platform_server | _platform_host,
+		"Minutes a player may stand idle in a game (no move, look or button)\n"
+		"before the server kicks them, told a minute before (0: never). The\n"
+		"lobby, the postgame, cutscenes and waiting to respawn do not count." },
+	{ "server.afk_kick_when_full", _config_boolean, "false", "HALO_SERVER_AFK_KICK_WHEN_FULL", _environment_value,
+		_platform_server | _platform_host,
+		"Kick idle players only when the server is full, after\n"
+		"server.afk_kick_full_minutes (server.afk_kick_minutes is not used)." },
+	{ "server.afk_kick_full_minutes", _config_integer, "3", "HALO_SERVER_AFK_KICK_FULL_MINUTES", _environment_value,
+		_platform_server | _platform_host,
+		"With server.afk_kick_when_full, the minutes a player may stand idle while\n"
+		"the server is full (told a minute before)." },
+	{ "server.coop_bsp_switch", _config_string, "\"majority\"", "HALO_SERVER_COOP_BSP_SWITCH", _environment_value,
+		_platform_server,
+		"A co-op game's loading zones: \"majority\", a zone switches the level's\n"
+		"part only once more than half of the living players who are not idle\n"
+		"stand in zones to the same part (the others are told how many more it\n"
+		"needs); \"anyone\", any player's crossing brings everyone. The\n"
+		"mission's own switches are never held." },
+	{ "server.coop_bsp_switch_cooldown_seconds", _config_integer, "15", "HALO_SERVER_COOP_BSP_SWITCH_COOLDOWN_SECONDS",
+		_environment_value, _platform_server,
+		"Seconds after a co-op loading zone switched the level's part before\n"
+		"another may (0 to 300)." },
+	{ "server.vehicle_riding_override_gametype", _config_boolean, "false", "HALO_SERVER_VEHICLE_RIDING_OVERRIDE_GAMETYPE",
+		_environment_value, _platform_server | _platform_host,
+		"True: on a dedicated server, turns the gametype's riding override\n"
+		"off, so multiplayer uses network.vehicle_riding. A map's own choice\n"
+		"still wins. Changes count from the next map." },
+	{ "server.map_vote", _config_boolean, "false", "HALO_SERVER_MAP_VOTE", _environment_value, _platform_server | _platform_host,
+		"As the lobby opens after a game, the players vote for the next among\n"
+		"server.map_vote_choices entries of the rotation picked at random (not\n"
+		"the one just played); the rotation goes on after the winner." },
+	{ "server.map_vote_choices", _config_integer, "4", "HALO_SERVER_MAP_VOTE_CHOICES", _environment_value,
+		_platform_server | _platform_host,
+		"The entries a map vote offers (2 to 8)." },
+	{ "server.map_vote_seconds", _config_integer, "20", "HALO_SERVER_MAP_VOTE_SECONDS", _environment_value,
+		_platform_server | _platform_host,
+		"How long a map vote runs (5 to 120 seconds); it ends sooner once every\n"
+		"player has voted." },
+	{ "streamer.enabled", _config_boolean, "false", "HALO_STREAMER_MODE", _environment_value, _platform_all,
+		"Hide offensive words in names and text from other players, maps and mods\n"
+		"as stars, at the levels below (Settings > Network Setup > Streamer Mode)." },
+	{ "streamer.slurs", _config_string, "\"mild\"", "HALO_STREAMER_SLURS", _environment_value, _platform_all,
+		"With streamer.enabled, the slurs (race, sexuality, gender, disability)\n"
+		"hidden: \"off\", \"severe\", \"strong\" (and severe) or \"mild\" (all)." },
+	{ "streamer.swearing", _config_string, "\"strong\"", "HALO_STREAMER_SWEARING", _environment_value, _platform_all,
+		"With streamer.enabled, the swearing and sexual words hidden: \"off\",\n"
+		"\"severe\", \"strong\" (and severe) or \"mild\" (all)." },
+	{ "streamer.insults", _config_string, "\"off\"", "HALO_STREAMER_INSULTS", _environment_value, _platform_all,
+		"With streamer.enabled, the insults that are not slurs hidden: \"off\",\n"
+		"\"severe\", \"strong\" (and severe) or \"mild\" (all)." },
+	{ "crash_reports.upload", _config_string, "\"ask\"", "HALO_CRASH_REPORTS", _environment_value, _platform_windows,
+		"Send a report of each crash (a minidump and halo.log) to the developers'\n"
+		"Sentry project (port/windows/src/win32_crash.c): \"yes\" sends them, \"no\"\n"
+		"never does, \"ask\" asks at the next crash and writes the answer here." },
+
+#ifdef HALO_SWITCH
+	{ "display.particle_limit", _config_integer, "2048", "HALO_PARTICLE_LIMIT", _environment_value, _platform_all,
+#else
+	{ "display.particle_limit", _config_integer, "4096", "HALO_PARTICLE_LIMIT", _environment_value, _platform_all,
+#endif
+		"The most particles (sparks, smoke, casings, debris) alive at once; past\n"
+		"it the oldest goes to make room for each new one. The Xbox's limit was\n"
+		"1024. 0 for the port's own 8192 (a 64-player firefight fills them, and\n"
+		"every one costs the processor and the GPU: 2048 on the Switch, 4096\n"
+		"elsewhere). Changes at once." },
+	{ "debug.original_particles", _config_boolean, "false", "HALO_ORIGINAL_PARTICLES", _environment_value, _platform_all,
+		"Move the particles that are not attached to an object (sparks, casings,\n"
+		"debris) at every frame drawn, as before, rather than once a 30 Hz tick\n"
+		"as on the Xbox and drawn between their ticks (which spares the CPU two\n"
+		"in three of their collision tests at 60 frames a second, more at 120).\n"
+		"Takes effect at the next map." },
+	{ "debug.benchmark", _config_string, "\"\"", "HALO_BENCHMARK", _environment_value, _platform_all,
+		"A benchmark run, the same each time (port/linux/game/benchmark.c):\n"
+		"\"standard\" plays a10, a30, b30, c10 and c40 30 seconds each and Blood\n"
+		"Gulch, Damnation, Sidewinder and Chill Out 15 seconds each with 63\n"
+		"bots, the view turning, and\n"
+		"writes the frame rates to benchmark.txt (in the data folder, or the\n"
+		"run's profile folder: debug.profile_run); or a list of map:seconds\n"
+		"(\"a30:30,bloodgulch:15\"). Empty: none, the game as it is." },
+	{ "debug.benchmark_bots", _config_integer, "63", "HALO_BENCHMARK_BOTS", _environment_value, _platform_all,
+		"The computer players in the benchmark's multiplayer games: 63, with the\n"
+		"player 64 in all; 0 to 127." },
+	{ "debug.benchmark_manual", _config_boolean, "false", "HALO_BENCHMARK_MANUAL", _environment_set_is_true,
+		_platform_all,
+		"The benchmark leaves the player's view to the player rather than turning\n"
+		"it, to measure the game as it is played (the player still cannot be hurt)." },
+	{ "debug.benchmark_weapon", _config_string, "\"\"", "HALO_BENCHMARK_WEAPON", _environment_value, _platform_all,
+		"Everyone in the benchmark's multiplayer games starts with this weapon, with\n"
+		"no others on the map, playing to 1000 kills: \"assault_rifle\", \"pistol\",\n"
+		"\"shotgun\", \"sniper_rifle\", \"rocket_launcher\", \"plasma_pistol\",\n"
+		"\"plasma_rifle\" or \"needler\". Empty: the map's weapons, as usual." },
+	{ "debug.benchmark_quit", _config_boolean, "true", "HALO_BENCHMARK_QUIT", _environment_value, _platform_all,
+		"Quit the game once the benchmark is done; false goes back to the main\n"
+		"menu." },
+	{ "debug.core_dump_tick", _config_integer, "0", "HALO_CORE_DUMP_TICK", _environment_value, _platform_all,
+		"A core of the first level played (d:\\core\\game_state_<address>.bin,\n"
+		"named for where the game state is) written at this game tick, for\n"
+		"comparing saved games across runs; 0 for none." },
+	{ "debug.core_load", _config_string, "\"\"", "HALO_CORE_LOAD", _environment_value, _platform_all,
+		"A core (a file in d:\\core, as debug.core_dump_tick writes) loaded into\n"
+		"the first level played at debug.core_dump_tick, in place of writing\n"
+		"one: a core of a run whose window lay elsewhere, for trying saved games\n"
+		"across windows; empty for none." },
+	{ "debug.network_test", _config_string, "\"\"", "HALO_NETWORK_TEST", _environment_value, _platform_all,
+		"Automated system link sessions for testing (port/linux/game/network_test.c):\n"
+		"\"host:<map>\" hosts a game on that map, \"local:<map>\" plays a local (split\n"
+		"screen) game on it, \"join\" joins the first game found,\n"
+		"\"browse\" the one with the most players the server browser lists (not\n"
+		"co-op, if it can), \"log\" logs the game that runs (and runs its cues);\n"
+		"empty for none." },
+	{ "debug.network_test_start", _config_real, "15.0", "HALO_NETWORK_TEST_START", _environment_value, _platform_all,
+		"Seconds after hosting that an automated test game starts." },
+	{ "debug.network_test_kill", _config_real, "0.0", "HALO_NETWORK_TEST_KILL", _environment_value, _platform_all,
+		"Every this many seconds an automated test host kills its last player; 0 never." },
+	{ "debug.network_test_score", _config_integer, "0", "HALO_NETWORK_TEST_SCORE", _environment_value, _platform_all,
+		"The score an automated test host's game type plays to (a short game, to\n"
+		"test the next); 0 the game type's own." },
+	{ "debug.network_test_shoot", _config_real, "0.0", "HALO_NETWORK_TEST_SHOOT", _environment_value, _platform_all,
+		"Every this many seconds each automated test player hits the next with\n"
+		"their weapon, within its reach (the host brings far players near the\n"
+		"first a second before); 0 never." },
+	{ "debug.network_test_vehicle", _config_real, "0.0", "HALO_NETWORK_TEST_VEHICLE", _environment_value, _platform_all,
+		"This many seconds into an automated test game the host seats its last\n"
+		"player as a vehicle's driver (and out 15 seconds on); 0 never." },
+	{ "debug.network_test_pickup", _config_real, "0.0", "HALO_NETWORK_TEST_PICKUP", _environment_value, _platform_all,
+		"This many seconds into an automated test game the host stands its last\n"
+		"player on a weapon, which a joining player then picks up; 0 never." },
+	{ "debug.network_test_chat", _config_real, "0.0", "HALO_NETWORK_TEST_CHAT", _environment_value, _platform_all,
+		"This many seconds into an automated test game each machine's player\n"
+		"says a chat line to everyone, then to the team and to the vehicle (the\n"
+		"host seats the last two players in one first), then the host mutes and\n"
+		"unmutes a player, refuses a link and turns the chat off, and the\n"
+		"clients type on the on-screen keyboard (port/linux/NETCODE.md); 0 never." },
+	{ "debug.network_test_name", _config_string, "\"\"", "HALO_NETWORK_TEST_NAME", _environment_value, _platform_all,
+		"The name this machine's player takes in an automated test game (ASCII);\n"
+		"empty keeps its profile's." },
+	{ "debug.network_test_pickup_weapon", _config_string, "\"\"", "HALO_NETWORK_TEST_PICKUP_WEAPON", _environment_value,
+		_platform_all,
+		"The weapon network_test_pickup stands the player on: the first whose tag\n"
+		"name has this in it (\"sniper\", say); empty any." },
+	{ "debug.network_test_cues", _config_string, "\"\"", "HALO_NETWORK_TEST_CUES", _environment_value, _platform_all,
+		"Console lines an automated test runs at a game second, from the first tick\n"
+		"every player of debug.network_test_cue_players has a unit:\n"
+		"\"<second> <line>|<second> <line>...\" (the host's, or a game of one machine;\n"
+		"not on the web)." },
+	{ "debug.network_test_cue_players", _config_integer, "1", "HALO_NETWORK_TEST_CUE_PLAYERS", _environment_value,
+		_platform_all,
+		"The players debug.network_test_cues waits for." },
+	{ "debug.network_test_public", _config_boolean, "false", "HALO_NETWORK_TEST_PUBLIC", _environment_value,
+		_platform_all,
+		"The network test's host lists its game in the server browser, as Create\n"
+		"Game > Internet's PUBLIC does (debug.network_test \"browse\" joins it)." },
+	{ "debug.telnet_console", _config_boolean, "false", "HALO_TELNET_CONSOLE", _environment_set_is_true, _platform_all,
+		"Listen on 127.0.0.1 (port telnet_console_port) for a script console that\n"
+		"runs what it is sent as the game's console does, with no password; false\n"
+		"none." },
+	{ "debug.telnet_console_port", _config_integer, "2323", "HALO_TELNET_CONSOLE_PORT", _environment_value,
+		_platform_all,
+		"The port of the script console (telnet_console); the Xbox's was 23, which\n"
+		"only the administrator can listen on." },
+	{ "debug.touch_targets", _config_boolean, "false", "HALO_TOUCH_TARGETS", _environment_set_is_true, _platform_all,
+		"Outline the menus' tap targets (item green, value blue, list slot yellow,\n"
+		"legend button red, the band beside a list's slots orange; the virtual\n"
+		"keyboard's keys white), mark where the last finger went down and the\n"
+		"last tap landed for 3 seconds, and log each tap with the target it hit\n"
+		"(and a value's split); to judge touch accuracy." },
+	{ "debug.log_addresses", _config_boolean, "false", "HALO_LOG_ADDRESSES", _environment_set_is_true, _platform_all,
+		"Write other machines' internet addresses whole in debug.txt and the\n"
+		"console, for debugging your own network. False writes each public\n"
+		"address as a tag (addr#3f2a9c) that only matches up within one run;\n"
+		"local network addresses are always whole. Do not post a debug.txt\n"
+		"written with this on: it has the address of everyone you played with." },
+	{ "debug.network_latency", _config_real, "0.0", "HALO_NETWORK_LATENCY", _environment_value, _platform_all,
+		"Milliseconds everything received is held back (a round trip between two\n"
+		"machines of twice it), to test the netcode as over the internet; 0 none." },
+	{ "debug.network_loss", _config_real, "0.0", "HALO_NETWORK_LOSS", _environment_value, _platform_all,
+		"Percent of datagrams received that are dropped, for the same; 0 none." },
+	{ "debug.network_corrupt", _config_real, "0.0", "HALO_NETWORK_CORRUPT", _environment_value, _platform_all,
+		"Percent of the datagrams received that are damaged at random, to test\n"
+		"that nothing a machine sends can crash the game; 0 none." },
+	{ "debug.network_corrupt_stream", _config_real, "0.0", "HALO_NETWORK_CORRUPT_STREAM", _environment_value,
+		_platform_all,
+		"Percent of the reads of streams that are damaged at random, for the\n"
+		"same (a damaged stream is closed, so a little goes a long way); 0 none." },
+	{ "debug.network_corrupt_after", _config_real, "0.0", "HALO_NETWORK_CORRUPT_AFTER", _environment_value,
+		_platform_all,
+		"Seconds after the start before anything is damaged, so that a game can\n"
+		"be set up and started first (a host's messages to its own client are\n"
+		"damaged too)." },
+	{ "debug.riding_damage_speed", _config_real, "0.0", "HALO_RIDING_DAMAGE_SPEED", _environment_value, _platform_all,
+		"Riding: the closing speed (world units a tick) above which a vehicle\n"
+		"still hurts a player who just left it; 0 takes twice the player's own\n"
+		"run and jump speed." },
+	{ "debug.riding_teleport_step", _config_real, "4.0", "HALO_RIDING_TELEPORT_STEP", _environment_value, _platform_all,
+		"Riding: a vehicle that moves further in one update is teleported; its\n"
+		"riders are not carried along but put in the air from it, keeping\n"
+		"their motion, as if they had jumped." },
+	{ "debug.riding_moved_alone", _config_real, "0.25", "HALO_RIDING_MOVED_ALONE", _environment_value, _platform_all,
+		"Riding: a rider this far from where it ended its last tick was moved\n"
+		"by something else, and is put in the air from the vehicle, keeping\n"
+		"its motion, as if it had jumped." },
+	{ "debug.riding_transition_leash", _config_real, "0.25", "HALO_RIDING_TRANSITION_LEASH", _environment_value, _platform_all,
+		"Riding: the host's position allowance in world units during takeoff\n"
+		"and landing disagreement; never a velocity or accumulated movement\n"
+		"allowance. Non-finite or negative values mean none." },
+	{ "debug.riding_look_carry", _config_boolean, "true", "HALO_RIDING_LOOK_CARRY", _environment_value, _platform_all,
+		"Riding: the vehicle's turn turns the rider's view; false keeps the\n"
+		"view where the player put it (a test aid)." },
+	{ "debug.riding_air_grip", _config_real, "0.045", "HALO_RIDING_AIR_GRIP", _environment_value, _platform_all,
+		"Riding: how much, each tick, the motion of a player in the air over\n"
+		"the vehicle they left may change to follow its turns and its speed\n"
+		"back up to the speed they jumped with, or inside a vehicle that\n"
+		"encloses them any speeding up (world units a tick); a slowing\n"
+		"vehicle is followed at once, never ahead of it." },
+	{ "debug.riding_enclosure_grace_ticks", _config_real, "4", "HALO_RIDING_ENCLOSURE_GRACE_TICKS", _environment_value,
+		_platform_all,
+		"Riding: how many player ticks in a row a rider standing in an enclosed\n"
+		"vehicle may miss its cabin test (sliding about) before the cabin counts\n"
+		"as open (0 to 30)." },
+	{ "debug.test_input", _config_string, "\"\"", "HALO_TEST_INPUT", _environment_value, _platform_all,
+		"\"bot:<seed>\" plays controller 1 with a scripted pattern (automated\n"
+		"network tests); \"look:<seed>\" stands still, only turning and looking\n"
+		"up and down; \"menu:<buttons>\" presses menu buttons one a second (a,\n"
+		"b, x, y, up, down, left, right, start, back or wait, separated by\n"
+		"spaces or commas), for testing the menus; empty for none." },
+	{ "debug.virtual_gamepads", _config_integer, "0", "HALO_VIRTUAL_GAMEPADS", _environment_value, _platform_desktop,
+		"Attach this many SDL virtual gamepads (0 to 4), which the game takes for\n"
+		"gamepads plugged in, for testing split screen; debug.virtual_gamepad_script\n"
+		"drives them." },
+	{ "debug.virtual_gamepad_script", _config_string, "\"\"", "HALO_VIRTUAL_GAMEPAD_SCRIPT", _environment_value,
+		_platform_desktop,
+		"What debug.virtual_gamepads press: \"<seconds> <pad> <what>; ...\", the\n"
+		"seconds from when the network lobby first opens, the pad 1 to 4 (0: the\n"
+		"keyboard, a SPACE and start Enter), and a button (a, b, x, y, start, back,\n"
+		"up, down, left, right, lb, rb, lt, rt: pressed for 150 ms),\n"
+		"\"walk\" (the sticks move from then on) or \"still\"." },
+	{ "debug.bot_trace", _config_integer, "0", "HALO_BOT_TRACE", _environment_value, _platform_all,
+		"Log each bot's state (bots.count) every this many seconds: where it is\n"
+		"and goes, its path, target and weapon; 0 never." },
+	{ "debug.update_answer", _config_string, "\"\"", "HALO_UPDATE_ANSWER", _environment_value, _platform_desktop,
+		"The answer to the new version question, for automated tests: \"yes\",\n"
+		"\"no\" or \"never\" (do not ask again, confirmed); empty asks." },
+	{ "debug.fixed_step", _config_boolean, "false", "HALO_FIXED_STEP", _environment_set_is_true, _platform_all,
+		"A game of this machine alone runs one tick a frame, whatever time has\n"
+		"passed, so that it plays the same every time (tests); game_speed has no\n"
+		"effect." },
+	{ "debug.exit_after", _config_real, "0.0", "HALO_EXIT_AFTER", _environment_value, _platform_all,
+		"Quit this many seconds after the window opens (without a window, after\n"
+		"the first frame); 0 never." },
+	{ "debug.hidden_window", _config_boolean, "false", "HALO_HIDDEN_WINDOW", _environment_set_is_true, _platform_desktop,
+		"Keep the window hidden (and never fullscreen)." },
+	{ "debug.voice_test", _config_boolean, "false", "HALO_VOICE_TEST", _environment_set_is_true, _platform_all,
+		"Voice chat's automated tests: a tone instead of the microphone, and\n"
+		"each voice heard logged once a second." },
+	{ "debug.null_renderer", _config_boolean, "false", "HALO_NULL_RENDERER", _environment_set_is_true, _platform_all,
+		"Run without a window, drawing nothing." },
+	{ "debug.gl_debug", _config_boolean, "false", "HALO_GL_DEBUG", _environment_set_is_true, _platform_all,
+		"Report OpenGL errors in the log." },
+	{ "debug.menu_open", _config_string, "\"\"", "HALO_MENU_OPEN", _environment_value, _platform_all,
+		"Start on this screen of the menus (port/assets/menus) instead of the main\n"
+		"menu, a player profile being edited; empty for the main menu." },
+	{ "debug.network_extensions_require", _config_string, "\"\"", "HALO_NETWORK_EXTENSIONS_REQUIRE", _environment_value,
+		_platform_all,
+		"Capabilities (docs/network_extensions.md) this machine's games require when it\n"
+		"hosts, separated by commas, whatever the game is: a machine without them is\n"
+		"told and removed (for testing the handshake); empty for none." },
+	{ "debug.custom_campaign", _config_string, "\"\"", "HALO_CUSTOM_CAMPAIGN", _environment_value, _platform_all,
+		"Mount this folder of custom_campaigns as the game starts, its own menus\n"
+		"and maps played instead of the stock ones (docs/custom_campaigns.md);\n"
+		"empty for none." },
+	{ "debug.gpu_flush_draws", _config_integer, "-1", "HALO_GPU_FLUSH_DRAWS", _environment_value, _platform_desktop,
+		"Flush the GPU's pipeline every this many draws: -1 for every 3 on Intel\n"
+		"graphics with Mesa's driver (which can hang without), 0 never." },
+	{ "debug.gpu_stats", _config_boolean, "false", "HALO_GPU_STATS", _environment_set_is_true, _platform_all,
+		"Log the renderer's draw counts once a second (otherwise, on Android's Vulkan,\n"
+		"only a second whose draws were skipped), and what dynamic lighting's fields did." },
+	{ "debug.gpu_trace_frame", _config_integer, "-1", "HALO_GPU_TRACE", _environment_value, _platform_all,
+		"Log every draw of this frame; -1 none." },
+	{ "debug.gpu_trace_constants", _config_boolean, "false", "HALO_GPU_TRACE_CONSTANTS", _environment_set_is_true, _platform_all,
+		"With gpu_trace_frame, also the vertex shader constants." },
+	{ "debug.gpu_skip_vertex_shaders", _config_string, "\"\"", "HALO_GPU_SKIP_VS", _environment_value, _platform_all,
+		"Comma-separated ids of vertex shaders not to draw with." },
+	{ "debug.gpu_dump_shaders", _config_string, "\"\"", "HALO_GPU_DUMP_SHADERS", _environment_value, _platform_all,
+		"A folder to write the generated GLSL to; empty none." },
+	{ "debug.gpu_debug_expression", _config_string, "\"\"", "HALO_GPU_DEBUG_EXPR", _environment_value, _platform_all,
+		"A GLSL expression every pixel shader shows instead of its result." },
+	{ "debug.gpu_debug_texture0", _config_boolean, "false", "HALO_GPU_DEBUG_T0", _environment_set_is_true, _platform_all,
+		"Pixel shaders show their first texture." },
+	{ "debug.gpu_debug_flat", _config_boolean, "false", "HALO_GPU_DEBUG_FLAT", _environment_set_is_true, _platform_all,
+		"Pixel shaders show their vertex colour." },
+	{ "debug.screenshot_directory", _config_string, "\"\"", "HALO_SCREENSHOT_DIR", _environment_value, _platform_all,
+		"A folder to save frames to (with screenshot_every); empty none." },
+	{ "debug.screenshot_every", _config_integer, "0", "HALO_SCREENSHOT_EVERY", _environment_value, _platform_all,
+		"Save every this many frames to screenshot_directory; 0 none." },
+	{ "debug.texture_dump_directory", _config_string, "\"\"", "HALO_TEXTURE_DUMP", _environment_value, _platform_all,
+		"A folder to write every texture to as it is uploaded; empty none." },
+	{ "debug.log_files", _config_boolean, "true", "HALO_LOG_FILES", _environment_value, _platform_all,
+		"Write the game's log to debug.txt, beside the data. false writes none,\n"
+		"which spares the storage a write for each line; nothing is kept to say\n"
+		"what went wrong. Changes at once." },
+#if defined(HALO_ANDROID) || defined(HALO_PS5)
+	/* (read by the host before the game starts: port/android/host/host_main.c,
+	port/switch/host/host_main.c, port/ps5/host/host_main.c) */
+	{ "debug.halo_log", _config_boolean, "true", "HALO_HALO_LOG", _environment_value, PLATFORM_HOST,
+		"Write the program's log to halo.log too, begun again each start: beside\n"
+		"the data on Android (logcat's lines of tag \"halo\"), beside the program\n"
+		"on the Switch (nxlink's), in /data/halo on the PS5 (the kernel log's).\n"
+		"false writes none. Takes effect the next start." },
+#endif
+	{ "debug.texture_log", _config_boolean, "false", "HALO_TEXTURE_LOG", _environment_set_is_true, _platform_all,
+		"Log texture uploads." },
+	{ "debug.texture_no_cache", _config_boolean, "false", "HALO_TEXTURE_NO_CACHE", _environment_set_is_true, _platform_all,
+		"Upload textures again every time they are used." },
+	{ "debug.sample_seconds", _config_real, "0.0", "HALO_SAMPLE", _environment_value, _platform_android | _platform_guest,
+		"Log where every game thread is this often, in seconds (read by the\n"
+		"host, port/android/host/host_debug.c); 0 never." },
+	{ "debug.memory_watch", _config_boolean, "true", "HALO_MEMORY_WATCH", _environment_value, _platform_android | _platform_guest,
+		"Notice the game's writes to cached textures and vertices by page\n"
+		"protection; false compares page contents once a frame instead, which is\n"
+		"slower. Under ARM translation (the x86 emulator) the app always compares\n"
+		"contents. Read by the host from the file (port/android/host/host_common.c)." },
+#ifdef HALO_PROFILE
+	{ "debug.profile_record", _config_boolean, "false", "HALO_PROFILE_RECORD", _environment_value, _platform_all,
+		"Record a profile with no command (configure.py --profile builds): from\n"
+		"when profile_record_when says until profile_stop, a map change or the\n"
+		"end, into numbered part files in the data folder's profiles folder\n"
+		"(tools/net_report.py reads it)." },
+	{ "debug.profile_record_when", _config_string, "\"start\"", "HALO_PROFILE_RECORD_WHEN", _environment_value,
+		_platform_all,
+		"\"start\": from the first frame until the first map change; \"game\":\n"
+		"each game that is not the main menu, a recording each, until its map\n"
+		"goes." },
+	{ "debug.profile_memory", _config_integer, "256", "HALO_PROFILE_MEMORY", _environment_value, _platform_all,
+		"Megabytes a recording keeps in memory, 4 to 1024: two halves, each\n"
+		"written out as a part when it fills." },
+#endif
+	/* (the phone's gyroscope on Android, the controller's on the Switch, the
+	PS5 and with one that has it anywhere) */
+	{ "input.gyro_aim", _config_string, "\"false\"", "HALO_GYRO_AIM", _environment_value, PLATFORM_GYRO,
+#ifdef HALO_PS5
+		"Aim with the DualSense's gyroscope, each local player with their own.\n"
+#else
+		"Aim with the gyroscope: the phone's on Android; on the Switch the\n"
+		"controller's, each local player from their own (a Pro Controller, the\n"
+		"console held in the hands, or one Joy-Con; of two, the right one);\n"
+		"elsewhere a controller's that has one (a DualSense, a DualShock 4, a\n"
+		"Switch Pro Controller), each local player from their own.\n"
+#endif
+		"\"false\" is the stick only, \"true\" adds the turn to the view. \"zoom\" is\n"
+		"the same as \"true\" with input.gyro_zoom_only. Settings > Gamepads >\n"
+		"Gyro Aim, or here." },
+	{ "input.gyro_zoom_only", _config_boolean, "false", "HALO_GYRO_ZOOM_ONLY", _environment_value, PLATFORM_GYRO,
+		"While input.gyro_aim is on, the gyroscope turns the view only while the\n"
+		"player is zoomed in (a scope), for fine aiming. false: it aims all the\n"
+		"time it is on. An older input.gyro_aim of \"zoom\", with this line not yet\n"
+		"in the file, is read as this on." },
+	{ "input.gyro_sensitivity_horizontal", _config_real, "1.0", "HALO_GYRO_SENSITIVITY_HORIZONTAL",
+		_environment_value, PLATFORM_GYRO,
+		"How far the view turns left and right for the gyroscope, when\n"
+		"input.gyro_aim is true. 1 is the sensor's own turn. 0.25 to 10." },
+	{ "input.gyro_sensitivity_vertical", _config_real, "1.0", "HALO_GYRO_SENSITIVITY_VERTICAL",
+		_environment_value, PLATFORM_GYRO,
+		"How far the view turns up and down for the gyroscope, when\n"
+		"input.gyro_aim is true. 1 is the sensor's own turn. 0.25 to 10." },
+	{ "input.gyro_invert_horizontal", _config_boolean, "false", "HALO_GYRO_INVERT_HORIZONTAL",
+		_environment_value, PLATFORM_GYRO,
+		"Invert the gyroscope's yaw. false: turning the phone or controller right\n"
+		"looks right. true: turning it right looks left. The stick's invert is its own." },
+	{ "input.gyro_invert_vertical", _config_boolean, "false", "HALO_GYRO_INVERT_VERTICAL",
+		_environment_value, PLATFORM_GYRO,
+		"Invert the gyroscope's pitch. false: tilting the phone or controller up\n"
+		"looks up. true: tilting it up looks down. The stick's invert is its own." },
+#if defined(HALO_ANDROID) && !defined(HALO_SWITCH)
+	/* (the phone's: sdl_platform.c's platform_resolution_scale. The screen's
+	own by default) */
+	{ "display.resolution_limit", _config_string, "\"native\"", "HALO_RESOLUTION_LIMIT", _environment_value,
+		_platform_android,
+		"The most lines the game draws at, no more than the screen has: \"native\"\n"
+		"(the screen's own), \"2160\", \"1440\", \"1080\", \"720\" or \"480\" (the game's\n"
+		"own), in the screen's shape. More lines are sharper and work the GPU\n"
+		"harder. Changes at once." },
+	{ "debug.original_sun_glow", _config_boolean, "false", "HALO_ORIGINAL_SUN_GLOW", _environment_value, _platform_android,
+		"Make the sun's glow from a copy of the screen in the middle of each frame,\n"
+		"as the game does, rather than at the frame's end for the next frame\n"
+		"(which spares the GPU storing the screen and loading it back; the\n"
+		"glow follows what is in front of the sun a frame later). Takes effect\n"
+		"the next start." },
+	{ "debug.original_water", _config_boolean, "false", "HALO_ORIGINAL_WATER", _environment_value, _platform_android,
+		"Make the water's ripples in the middle of each frame, as the game does,\n"
+		"rather than at the frame's end for the next frame (which spares the\n"
+		"GPU storing the screen and loading it back; the ripples move a frame\n"
+		"later). Takes effect the next start." },
+	{ "debug.original_multisample", _config_boolean, "false", "HALO_ORIGINAL_MULTISAMPLE", _environment_value, _platform_android,
+		"Under Vulkan with display.anti_aliasing's multisampling: draw the colour\n"
+		"into images of the samples beside the screen's, resolved as each\n"
+		"rendering ends, rather than keeping its samples in the GPU's tile memory\n"
+		"only (where the phone's driver can,\n"
+		"VK_EXT_multisampled_render_to_single_sampled), which spares storing and\n"
+		"loading them at every break of the frame. Takes effect the next start." },
+	{ "debug.gpu_split_parts", _config_boolean, "false", "HALO_GPU_SPLIT_PARTS", _environment_value, _platform_android,
+		"With debug.profile_run under Vulkan: end the GPU's rendering at each part\n"
+		"of the frame the game names (the sky, the objects, the particles...), so\n"
+		"that gpu.txt times each part on its own. The stores and loads it adds\n"
+		"make every frame slower: for ranking the parts, in a run of its own.\n"
+		"Takes effect the next start." },
+	{ "debug.profile_run", _config_boolean, "false", "HALO_PROFILE_RUN", _environment_set_is_true, _platform_android,
+		"Profile each run, to send to the developers: a folder of its own in the\n"
+		"phone's Download/halo_profiles (named for the day and time it started:\n"
+		"DDMMYYYY_HHMMSS) gets where the game's threads spend their time\n"
+		"(profile.bin, sampled debug.profile_hz times a second, 500 if that is\n"
+		"0), the GPU's time by part of the frame (gpu.txt, under Vulkan), the\n"
+		"log and the phone's details (run.txt). Android 9 and 10 ask for storage\n"
+		"once. Costs a little speed. Takes effect the next start." },
+#endif
+#if (defined(HALO_ANDROID) || defined(HALO_PS5) || defined(HALO_MACOS)) && !defined(HALO_SWITCH)
+	/* the Vulkan renderer's (port/android/guest/d3d8_vk.c), Android's and the PS5's: the GPU's savings the Switch's
+	renderer made first, which the Switch's own rows below name for it. Declared only there, these were not settings
+	here, and the draw scissor, false when a setting is not one, was off */
+	{ "debug.gpu_draw_scissor", _config_boolean, "true", "HALO_GPU_DRAW_SCISSOR", _environment_value,
+		PLATFORM_VULKAN,
+		"Rasterize an object's shadow and a dynamic light's pass only inside the\n"
+		"rectangle of the screen they can change; false rasterizes their whole\n"
+		"triangles, to compare. Takes effect the next start." },
+	{ "debug.gpu_texture_clip", _config_string, "\"on\"", "HALO_GPU_TEXTURE_CLIP", _environment_value,
+		PLATFORM_VULKAN,
+		"Shadows cast on the level drawn only over their map: \"on\", \"off\", or\n"
+		"\"wide\" (clipped by limits nothing reaches, to tell the clip's own effect).\n"
+		"Takes effect the next start." },
+	{ "debug.original_zoom", _config_boolean, "false", "HALO_ORIGINAL_ZOOM", _environment_value,
+		PLATFORM_VULKAN,
+		"Draw the zoom's blur as the game does, in passes over the whole screen,\n"
+		"rather than on a small copy blended over it once. Takes effect the next\n"
+		"start." },
+	{ "debug.original_blur", _config_boolean, "false", "HALO_ORIGINAL_BLUR", _environment_value,
+		PLATFORM_VULKAN,
+		"Draw a blur screen effect (the cryo bay's waking up, cutscenes) as the\n"
+		"game does, in passes over the whole screen, rather than its passes on\n"
+		"smaller copies of it. Takes effect the next start." },
+#endif
+#ifdef HALO_SWITCH
+	/* (720 by default: a handheld console's own lines, 1280x720) */
+	{ "display.resolution_limit", _config_string, "\"720\"", "HALO_RESOLUTION_LIMIT", _environment_value,
+		_platform_android,
+		"The lines the game draws at: \"480\" (the game's own), \"720\", \"900\" or\n"
+		"\"1080\" (or any number between), no more than the console shows (1280x720\n"
+		"in handheld, 1920x1080 docked), which the picture is scaled up to. Changes\n"
+		"at once." },
+	{ "display.dynamic_resolution", _config_boolean, "false", "HALO_DYNAMIC_RESOLUTION", _environment_value,
+		_platform_android,
+		"While the GPU would hold the game under 55 frames a second (for half a\n"
+		"second), draw one step lower (1080 to 900, 900 to 720, 720 to 480: never\n"
+		"more), and go back once the frame would fit in 90% of a 60 Hz frame for\n"
+		"a second. Video Setup, or here. debug.show_resolution shows it. Changes\n"
+		"at once." },
+	{ "debug.resolution_uncapped", _config_boolean, "false", "HALO_RESOLUTION_UNCAPPED", _environment_value,
+		_platform_android,
+		"Draw at display.resolution_limit's lines even past what the console\n"
+		"shows, scaled down to it: a Switch Lite (720p) drawing 1080p, to test\n"
+		"a docked console's GPU load. Changes at once." },
+	{ "performance.cpu_clock", _config_string, "\"1785\"", "HALO_CPU_CLOCK", _environment_value, _platform_android,
+		"The CPU's clock: \"1785\" (1.7 GHz, the most Nintendo's own games use),\n"
+		"\"1020\" (1 GHz, the console's handheld rate: cooler, and the battery\n"
+		"lasts longer) or \"stock\" (left as the console has it). Changes at once." },
+	{ "debug.profiler", _config_boolean, "false", "HALO_PROFILER", _environment_set_is_true, _platform_android,
+		"Profile the game: sample where its threads are (debug.profile_hz times a\n"
+		"second) and write the counts to the profile folder every 20 s, for\n"
+		"tools/switch_profile.py. Takes effect the next start." },
+	{ "debug.profile_hz", _config_integer, "500", "HALO_PROFILE_HZ", _environment_value, _platform_android,
+		"The profiler's samples a second, when debug.profiler is true." },
+	{ "debug.mic_probe", _config_boolean, "false", "HALO_MIC_PROBE", _environment_set_is_true, _platform_android,
+		"For two minutes from the start, log what the console's microphone input\n"
+		"hears (port/switch/host/host_mic_probe.c): its inputs, the format it gives\n"
+		"and the sound's level each second. Takes effect the next start." },
+	{ "debug.texture_verify_compressed", _config_boolean, "false", "HALO_TEXTURE_VERIFY_COMPRESSED",
+		_environment_set_is_true, _platform_android,
+		"Read each DXT-compressed texture back out of its image after it is written,\n"
+		"and log where it differs from the game's bytes (port/switch/host/host_dk.c).\n"
+		"Slow: it waits for the GPU each time. Takes effect the next start." },
+	{ "debug.gpu_trace", _config_boolean, "false", "HALO_GPU_TRACE_FAULTS", _environment_set_is_true, _platform_android,
+		"Keep a record of the GPU's last commands, and after a GPU fault write it and\n"
+		"the console's account of the fault to halo.log (port/switch/host/host_dk.c).\n"
+		"It costs the GPU some time. Takes effect the next start." },
+	{ "debug.gpu_fault_test", _config_boolean, "false", "HALO_GPU_FAULT_TEST", _environment_set_is_true,
+		_platform_android,
+		"Make the GPU fault on purpose at the 1200th frame, to see gpu_trace's record.\n"
+		"Takes effect the next start." },
+	{ "debug.gpu_profile", _config_boolean, "false", "HALO_GPU_PROFILE", _environment_set_is_true, _platform_android,
+		"Every 300 frames, log the GPU's time by part of the frame (the sky, the\n"
+		"objects, the fog...) and what a frame asks of it. Takes effect the next start." },
+	{ "debug.gpu_capture", _config_boolean, "false", "HALO_GPU_CAPTURE", _environment_set_is_true, _platform_android,
+		"With gpu_profile, time one frame of every 300 draw by draw, and log the GPU's\n"
+		"time by shader, target and kind of command. Takes effect the next start." },
+	{ "debug.gpu_experiment", _config_string, "\"\"", "HALO_GPU_EXPERIMENT", _environment_value, _platform_android,
+		"Measurements of what a change could save, comma-separated:\n"
+		"\"no_compression\" (render targets without hardware compression),\n"
+		"\"no_target_barriers\" (no wait before a render target change; may draw\n"
+		"wrong), \"lod_bias\" (textures sampled three levels smaller: blurry).\n"
+		"Empty for none. Takes effect the next start." },
+	{ "debug.gpu_shader_ranges", _config_boolean, "true", "HALO_GPU_SHADER_RANGES", _environment_value,
+		_platform_android,
+		"Leave out of the pixel shaders the clamps their values cannot need\n"
+		"(port/switch/guest/nv2a_psh_dk.c); false writes them all, as before, to\n"
+		"compare the two. Takes effect the next start." },
+	{ "debug.gpu_texture_clip", _config_string, "\"on\"", "HALO_GPU_TEXTURE_CLIP", _environment_value,
+		_platform_android,
+		"Shadows cast on the level drawn only over their map: \"on\", \"off\", or\n"
+		"\"wide\" (clipped by limits nothing reaches, to tell the clip's own effect).\n"
+		"Takes effect the next start." },
+	{ "debug.original_zoom", _config_boolean, "false", "HALO_ORIGINAL_ZOOM", _environment_value, _platform_android,
+		"Draw the zoom's blur as the game does, in passes over the whole screen,\n"
+		"rather than on a small copy blended over it once (about 3.7 ms less of\n"
+		"the GPU's frame at 720p). Takes effect the next start." },
+	{ "debug.mod_models_in_heap", _config_boolean, "false", "HALO_MOD_MODELS_IN_HEAP", _environment_value,
+		_platform_android,
+		"Keep the mods' models outside the Xbox's contiguous memory, as a model past\n"
+		"their budget is, to try that path with any mod. Takes effect the next map." },
+	{ "debug.gpu_blend_discard", _config_boolean, "true", "HALO_GPU_BLEND_DISCARD", _environment_value,
+		_platform_android,
+		"Let a blended draw's pixels go where they would leave the screen as it was\n"
+		"(the empty parts of particles and glows); false blends them all in, as\n"
+		"before, to compare. Takes effect the next start." },
+	{ "debug.render_thread", _config_boolean, "true", "HALO_RENDER_THREAD", _environment_value, _platform_android,
+		"Turn the game's drawing commands into the GPU's on a thread of their own,\n"
+		"on another core, while the game goes on with its next frame; false runs\n"
+		"them on the game's thread, as before. Takes effect the next start." },
+#ifdef HALO_SWITCH
+	{ "debug.frame_pace_ahead", _config_boolean, "false", "HALO_FRAME_PACE_AHEAD", _environment_value, _platform_android,
+		"With the render thread, let the game begin a frame while the one before\n"
+		"waits to be presented, a refresh more lag; false waits for that present.\n"
+		"Takes effect the next start." },
+#endif
+	{ "debug.gpu_draw_scissor", _config_boolean, "true", "HALO_GPU_DRAW_SCISSOR", _environment_value,
+		_platform_android,
+		"Rasterize an object's shadow and a dynamic light's pass only inside the\n"
+		"rectangle of the screen they can change; false rasterizes their whole\n"
+		"triangles, as before, to compare. Takes effect the next start." },
+	{ "debug.original_blur", _config_boolean, "false", "HALO_ORIGINAL_BLUR", _environment_value, _platform_android,
+		"Draw a blur screen effect (cutscenes) as the game does, in passes over the\n"
+		"whole screen, rather than its passes on a small copy of it. Takes effect\n"
+		"the next start." },
+	{ "debug.gpu_glsl_folder", _config_string, "\"\"", "HALO_GPU_GLSL_FOLDER", _environment_value, _platform_android,
+		"A folder to write each shader the game draws with to, as GLSL named by its\n"
+		"hash (the names gpu_capture logs); the folder must exist. Empty for none." },
+#endif
+#ifndef HALO_SWITCH
+	{ "debug.vk_present_marker", _config_boolean, "false", "HALO_VK_PRESENT_MARKER", _environment_set_is_true, PLATFORM_VULKAN,
+		"Under the Vulkan renderer, draw a red square at the top left and a green one\n"
+		"at the top right of the picture, so that a screenshot shows which way up it is." },
+	{ "debug.vk_static_geometry", _config_boolean, "true", "HALO_VK_STATIC_GEOMETRY", _environment_set_is_true,
+		PLATFORM_VULKAN,
+		"Under the Vulkan renderer, draw the map's geometry (written once as it loads)\n"
+		"from a copy made the first time it is drawn, rather than copying it at each\n"
+		"draw. false copies it at each draw, as before." },
+	{ "debug.custom_edition_elsewhere", _config_boolean, "false", "HALO_CUSTOM_EDITION_ELSEWHERE", _environment_set_is_true,
+		PLATFORM_HOST,
+		"Put Custom Edition's tag cache somewhere other than 0x40440000 even where\n"
+		"that address is free, and move its maps' addresses there, as on a phone\n"
+		"whose Java runtime holds 0x40440000. For testing that move." },
+	{ "debug.mcc_elsewhere", _config_boolean, "false", "HALO_MCC_ELSEWHERE", _environment_set_is_true,
+		PLATFORM_HOST,
+		"Put an MCC map's tags somewhere other than the address they were written for\n"
+		"(0x50000000) even where it is free, and move their addresses there, as when\n"
+		"the launcher has put something there first. For testing that move." },
+	{ "debug.vk_static_check", _config_boolean, "false", "HALO_VK_STATIC_CHECK", _environment_set_is_true, PLATFORM_VULKAN,
+		"Under the Vulkan renderer, compare the game's static geometry with what was\n"
+		"copied every 60 frames and log a range that changed (it would be drawn stale)." },
+	{ "debug.vk_render_thread", _config_boolean, "true", "HALO_VK_RENDER_THREAD", _environment_set_is_true, _platform_android,
+		"Under the Vulkan renderer, record the game's commands, hand them to the\n"
+		"driver and present on a thread of their own, while the game makes the next\n"
+		"frame. false runs them on the game's thread, as before." },
+	{ "debug.vk_self_test", _config_boolean, "false", "HALO_VK_SELF_TEST", _environment_set_is_true, PLATFORM_VULKAN,
+		"Under the Vulkan renderer, try the renderer's clears and the copying of a\n"
+		"draw's data on small targets of its own at start-up; the log says ok or FAILED." },
+	/* the Android app's Vulkan probe and profiler (port/android/host); the Switch's
+	profiler has its own debug.profile_hz above */
+	{ "debug.vk_probe", _config_string, "\"\"", "HALO_VK_PROBE", _environment_value, _platform_android,
+		"Run the Vulkan probe (port/android/host/host_vk_probe.c) instead of the\n"
+		"game: \"all\", or a list of caps, memory, compile, pipelines, draw, present;\n"
+		"empty runs the game. It writes vk_probe.txt." },
+	{ "debug.vk_validation", _config_boolean, "false", "HALO_VK_VALIDATION", _environment_set_is_true, PLATFORM_VULKAN,
+		"Turn on Vulkan's validation layer in the probe and in the Vulkan renderer,\n"
+		"when the app carries it." },
+	{ "debug.profile_hz", _config_integer, "0", "HALO_PROFILE_HZ", _environment_value, _platform_android,
+		"Sample every game thread this many times a second into profile.bin\n"
+		"(port/android/host/host_debug.c); 0 off." },
+#endif
+};
+
+#define NUMBER_OF_CONFIG_SETTINGS (sizeof(config_settings) / sizeof(config_settings[0]))
+
+#ifdef HALO_ANDROID
+#define CONFIG_BUILD_PLATFORM (_platform_android | _platform_host)
+#elif defined(HALO_WEB)
+#define CONFIG_BUILD_PLATFORM (_platform_desktop | _platform_web)
+#elif defined(_WIN32)
+#define CONFIG_BUILD_PLATFORM (_platform_desktop | _platform_windows)
+#elif defined(HALO_PS5)
+#define CONFIG_BUILD_PLATFORM (_platform_desktop | _platform_guest | _platform_ps5 | _platform_host)
+#elif defined(HALO_MACOS)
+#define CONFIG_BUILD_PLATFORM (_platform_desktop | _platform_guest | _platform_macos)
+#elif defined(HALO_GUEST)
+#define CONFIG_BUILD_PLATFORM (_platform_desktop | _platform_guest)
+#else
+#define CONFIG_BUILD_PLATFORM _platform_desktop
+#endif
+
+/* a dedicated server (server.enabled, --server, HALO_SERVER: decided as the
+file is read): its settings are written into the file too */
+static int config_server_mode;
+/* a run that only answers its command line (--version...): nothing written */
+static int config_answer_only;
+/* halo --probe [<invite>]: a list site's look at a game (network_test.c's
+"probe"), headless */
+static int config_probe_mode;
+#define CONFIG_PLATFORM (CONFIG_BUILD_PLATFORM | (config_server_mode ? _platform_server : 0))
+
+struct config_value
+{
+	int boolean;
+	long integer;
+	double real;
+	char *string;
+};
+
+static struct config_value config_values[NUMBER_OF_CONFIG_SETTINGS];
+/* the settings a daily challenge sets for its run (config_override), in
+place of the file's, which they leave as they are */
+static struct config_value config_overrides[NUMBER_OF_CONFIG_SETTINGS];
+static unsigned char config_overridden[NUMBER_OF_CONFIG_SETTINGS];
+static int config_loaded = 0;
+static pthread_mutex_t config_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---------- the command line */
+
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+/* whether the command line has the argument name ("--server"), and with
+value, the one after it (or after "=": --config=<path>) */
+static int config_argument(const char *name, char *value, size_t size)
+{
+	char text[1024];
+	size_t length = strlen(name);
+	int index;
+
+	for (index = 1; posix_command_line_argument(index, text, (posix_ulong)sizeof(text)); index++)
+	{
+		if (!strcmp(text, name))
+			return !value || posix_command_line_argument(index + 1, value, (posix_ulong)size);
+		if (value && !strncmp(text, name, length) && text[length] == '=')
+		{
+			snprintf(value, size, "%s", text + length + 1);
+			return 1;
+		}
+	}
+	return 0;
+}
+#endif
+
+/* ---------- the file */
+
+static void config_path(char *path, size_t size)
+{
+#if defined(HALO_ANDROID) || defined(HALO_WEB)
+	/* the data folder, which the app names (port/android/host/host_main.c;
+	on the web, port/web/src/web_main.c) */
+	const char *root = getenv("HALO_DATA_ROOT");
+
+	snprintf(path, size, "%s/config.toml", root && *root ? root : ".");
+#else
+	/* HALO_CONFIG_FILE or --config <path> (a dedicated server's instance's
+	own), else the executable's folder's, with its separator */
+	const char *file = getenv("HALO_CONFIG_FILE");
+	const char *base;
+
+	if (file && *file)
+	{
+		snprintf(path, size, "%s", file);
+		return;
+	}
+	if (config_argument("--config", path, size) && *path)
+		return;
+	base = SDL_GetBasePath();
+	snprintf(path, size, "%sconfig.toml", base ? base : "");
+#endif
+}
+
+/* the folder config.toml is in, with its separator, for a file kept beside it */
+void config_directory(char *path, unsigned int size)
+{
+	char file[1024];
+	char *slash;
+
+	config_path(file, sizeof(file));
+	slash = strrchr(file, '/');
+	if (!slash)
+		slash = strrchr(file, '\\');
+	if (slash)
+		slash[1] = 0;
+	snprintf(path, size, "%s", slash ? file : "");
+}
+
+/* the whole file, NUL terminated, or NULL; free() it */
+static char *config_read_file(const char *path, size_t *size)
+{
+#ifdef HALO_GUEST
+	FILE *file = fopen(path, "rb");
+	char *text = NULL;
+	long length;
+
+	if (!file)
+		return NULL;
+	if (fseek(file, 0, SEEK_END) == 0 && (length = ftell(file)) >= 0 && fseek(file, 0, SEEK_SET) == 0)
+	{
+		text = malloc((size_t)length + 1);
+		if (text && fread(text, 1, (size_t)length, file) == (size_t)length)
+		{
+			text[length] = 0;
+			*size = (size_t)length;
+		}
+		else
+		{
+			free(text);
+			text = NULL;
+		}
+	}
+	fclose(file);
+	return text;
+#else
+	/* SDL's, for UTF-8 paths on Windows */
+	void *data = SDL_LoadFile(path, size);
+	char *text;
+
+	if (!data)
+		return NULL;
+	text = malloc(*size + 1);
+	if (text)
+	{
+		memcpy(text, data, *size);
+		text[*size] = 0;
+	}
+	SDL_free(data);
+	return text;
+#endif
+}
+
+#ifdef HALO_GUEST
+/* (msvc_crt.c's: the file made 0666; by its host path, if it is there) */
+void platform_share_file(FILE *file);
+void platform_share_path(const char *path);
+/* (platform.h's: a d:\ path's file on the host) */
+void platform_translate_path(const char *xbox_path, char *host_path, unsigned long host_path_size);
+#endif
+
+static int config_write_file(const char *path, const char *text)
+{
+#ifdef HALO_GUEST
+	FILE *file = fopen(path, "wb");
+	int written;
+
+	if (!file)
+		return 0;
+	/* (0666: the player edits it from outside the game too) */
+	platform_share_file(file);
+	written = fwrite(text, 1, strlen(text), file) == strlen(text);
+	if (written)
+		fflush(file);
+#ifdef HALO_SWITCH
+	/* leaving the game is _exit, which does not flush the card; without a
+	commit here a setting is kept for this run and gone on the next */
+	if (written)
+		fsync(fileno(file));
+#endif
+	if (fclose(file) != 0)
+		written = 0;
+#ifdef HALO_SWITCH
+	if (written)
+		host_storage_commit();
+#endif
+	return written;
+#elif !defined(HALO_ANDROID) && !defined(HALO_WEB)
+	/* (a dedicated server's holds its passwords: its user's to read alone) */
+	if (!SDL_SaveFile(path, text, strlen(text)))
+		return 0;
+	if (config_server_mode)
+		posix_server_private_file(path);
+	return 1;
+#else
+	return SDL_SaveFile(path, text, strlen(text));
+#endif
+}
+
+struct config_text
+{
+	char *buffer;
+	size_t length, capacity;
+};
+
+static void config_append(struct config_text *text, const char *string)
+{
+	size_t length = strlen(string);
+
+	if (text->length + length + 1 > text->capacity)
+	{
+		size_t capacity = (text->capacity ? text->capacity : 4096) * 2 + length;
+		char *buffer = realloc(text->buffer, capacity);
+
+		if (!buffer)
+			return;
+		text->buffer = buffer;
+		text->capacity = capacity;
+	}
+	memcpy(text->buffer + text->length, string, length + 1);
+	text->length += length;
+}
+
+/* the first length characters of text, as a string of their own */
+static char *config_copy(const char *text, size_t length)
+{
+	char *copy = malloc(length + 1);
+
+	if (copy)
+	{
+		memcpy(copy, text, length);
+		copy[length] = 0;
+	}
+	return copy;
+}
+
+static int config_text_is_false(const char *text);
+static long config_setting_index(const char *name);
+
+/* the line "key = value": the setting's default, or, once the values are
+loaded, the value it already has when that is not the default (an older
+setting copied onto a new one) */
+static int config_values_ready;
+
+/* the longest value a setting is written with (the skulls' lists of names
+are the longest), and a line of it: its key, its quotes, each character
+escaped at worst */
+#define CONFIG_VALUE_MAXIMUM 1024
+#define CONFIG_LINE_MAXIMUM (2 * CONFIG_VALUE_MAXIMUM + 80)
+
+static int config_append_value_line(struct config_text *text, const struct config_setting *setting)
+{
+	const char *dot = strchr(setting->name, '.');
+	long index = config_setting_index(setting->name);
+	char buffer[CONFIG_LINE_MAXIMUM];
+	int at_default = 1;
+
+	if (config_values_ready && index >= 0 && setting->type == _config_string)
+	{
+		const char *def = setting->default_value;
+		size_t length = strlen(def);
+		const char *live = config_values[index].string ? config_values[index].string : "";
+
+		if (!(length >= 2 && def[0] == '"' && def[length - 1] == '"' &&
+			strlen(live) == length - 2 && !strncmp(live, def + 1, length - 2)))
+		{
+			char *end = buffer + snprintf(buffer, sizeof(buffer), "%s = \"", dot + 1);
+			const char *character;
+
+			at_default = 0;
+			for (character = live; *character && end < buffer + sizeof(buffer) - 3; character++)
+			{
+				if (*character == '"' || *character == '\\')
+					*end++ = '\\';
+				*end++ = *character;
+			}
+			strcpy(end, "\"\n");
+			config_append(text, buffer);
+			return at_default;
+		}
+	}
+	else if (config_values_ready && index >= 0 && setting->type == _config_boolean &&
+		config_values[index].boolean != !config_text_is_false(setting->default_value))
+	{
+		snprintf(buffer, sizeof(buffer), "%s = %s\n", dot + 1, config_values[index].boolean ? "true" : "false");
+		config_append(text, buffer);
+		return 0;
+	}
+	snprintf(buffer, sizeof(buffer), "%s = %s\n", dot + 1, setting->default_value);
+	config_append(text, buffer);
+	return at_default;
+}
+
+/* one setting as the file holds it: its comment, and its key */
+static int config_append_setting(struct config_text *text, const struct config_setting *setting)
+{
+	const char *line;
+	char buffer[256];
+	int at_default;
+
+	config_append(text, "\n");
+	for (line = setting->comment; *line;)
+	{
+		size_t length = strcspn(line, "\n");
+
+		snprintf(buffer, sizeof(buffer), "# %.*s\n", (int)length, line);
+		config_append(text, buffer);
+		line += length;
+		if (*line)
+			line++;
+	}
+#ifndef HALO_ANDROID
+	/* (Android apps have no environment to set; a setting without a variable
+	names none) */
+	if (setting->environment)
+	switch (setting->environment_style)
+	{
+	case _environment_value:
+		snprintf(buffer, sizeof(buffer), "# (for one run: %s=<value>)\n", setting->environment);
+		break;
+	case _environment_set_is_true:
+		snprintf(buffer, sizeof(buffer), "# (for one run: %s=1 makes it true)\n", setting->environment);
+		break;
+	case _environment_set_is_false:
+		snprintf(buffer, sizeof(buffer), "# (for one run: %s=1 makes it false)\n", setting->environment);
+		break;
+	}
+	config_append(text, buffer);
+#endif
+	at_default = config_append_value_line(text, setting);
+	return at_default;
+}
+
+/* the file with every setting of this build at its default. Each section
+once, where its first setting is, with all of its settings: TOML refuses a
+section twice, and the whole file would go unread (config_join_sections). A
+later setting in a section already opened (display.viewmodel_shield after
+[game], the gyroscope's input.gyro_aim after [debug]) does not open it again */
+static char *config_default_text(void)
+{
+	struct config_text text = { NULL, 0, 0 };
+	char section[32] = "";
+	size_t index;
+
+#ifdef HALO_ANDROID
+	config_append(&text,
+		"# Halo settings\n"
+		"#\n"
+		"# The game writes this file with the defaults when it is missing: delete\n"
+		"# it to go back to them.\n");
+#else
+	config_append(&text,
+		"# Halo settings\n"
+		"#\n"
+		"# The game writes this file with the defaults when it is missing: delete\n"
+		"# it to go back to them. Each setting can also be set for one run with\n"
+		"# the environment variable named with it, which wins over this file.\n");
+#endif
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		const struct config_setting *setting = &config_settings[index];
+		const char *dot = strchr(setting->name, '.');
+		size_t length, other;
+		char buffer[64];
+
+		if (!(setting->platforms & CONFIG_PLATFORM) || !dot)
+			continue;
+		length = (size_t)(dot - setting->name);
+		for (other = 0; other < index; other++)
+		{
+			if ((config_settings[other].platforms & CONFIG_PLATFORM) &&
+				!strncmp(config_settings[other].name, setting->name, length + 1))
+				break;
+		}
+		if (other < index)
+			continue;
+		snprintf(section, sizeof(section), "%.*s", (int)length, setting->name);
+		snprintf(buffer, sizeof(buffer), "\n[%s]\n", section);
+		config_append(&text, buffer);
+		for (other = index; other < NUMBER_OF_CONFIG_SETTINGS; other++)
+		{
+			if ((config_settings[other].platforms & CONFIG_PLATFORM) &&
+				!strncmp(config_settings[other].name, setting->name, length + 1))
+				config_append_setting(&text, &config_settings[other]);
+		}
+	}
+	return text.buffer;
+}
+
+/* the settings of this build that text (the file, parsed as table) lacks,
+added to it in their sections, keeping the rest as it is: a newer version's
+settings appear in an older file. Returns the new text, or NULL if nothing
+was missing */
+static char *config_add_missing(const char *text, toml_datum_t table)
+{
+	char *result = NULL;
+	size_t index;
+
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		const struct config_setting *setting = &config_settings[index];
+		const char *dot = strchr(setting->name, '.');
+		const char *current = result ? result : text;
+		struct config_text block = { NULL, 0, 0 };
+		struct config_text updated = { NULL, 0, 0 };
+		char header[40];
+		const char *line;
+		const char *insert = NULL;
+		int at_default = 1;
+
+		if (!(setting->platforms & CONFIG_PLATFORM) || !dot || toml_seek(table, setting->name).type != TOML_UNKNOWN)
+			continue;
+		snprintf(header, sizeof(header), "[%.*s]", (int)(dot - setting->name), setting->name);
+		/* the end of the section's last line that is not blank */
+		for (line = current; *line; )
+		{
+			const char *start = line;
+			size_t length = strcspn(line, "\n");
+
+			while (*start == ' ' || *start == '\t')
+				start++;
+			if (insert && *start == '[')
+				break;
+			if (!insert && !strncmp(start, header, strlen(header)))
+				insert = line + length;
+			else if (insert && start < line + length && *start != '\r')
+				insert = line + length;
+			line += length;
+			if (*line)
+				line++;
+		}
+		if (insert)
+		{
+			if (*insert)
+				insert++;
+			at_default = config_append_setting(&block, setting);
+		}
+		else
+		{
+			/* no such section: a new one at the end */
+			insert = current + strlen(current);
+			config_append(&block, current[0] && insert[-1] != '\n' ? "\n\n" : "\n");
+			config_append(&block, header);
+			config_append(&block, "\n");
+			at_default = config_append_setting(&block, setting);
+		}
+		if (!block.buffer)
+			continue;
+		{
+			char *before = config_copy(current, (size_t)(insert - current));
+
+			if (before)
+				config_append(&updated, before);
+			free(before);
+		}
+		if (insert > current && insert[-1] != '\n')
+			config_append(&updated, "\n");
+		config_append(&updated, block.buffer);
+		config_append(&updated, insert);
+		free(block.buffer);
+		if (updated.buffer)
+		{
+			free(result);
+			result = updated.buffer;
+			platform_log("settings: added %s (new in this version)%s", setting->name,
+				at_default ? " at its default" : " from an older setting");
+		}
+	}
+	return result;
+}
+
+static int config_line_section(const char *line, const char *end, char *section, size_t size);
+
+/* text from start to end, appended */
+static void config_append_range(struct config_text *text, const char *start, const char *end)
+{
+	char *copy = config_copy(start, (size_t)(end - start));
+
+	if (copy)
+		config_append(text, copy);
+	free(copy);
+}
+
+/* a file with a section twice, which TOML refuses (the defaults of the
+versions from 2026-10-10 had a second [display] after [game]): each
+section's later parts moved to the end of its first, the rest kept as it
+is. Returns the new text, or NULL if no section is there twice */
+static char *config_join_sections(const char *text)
+{
+	enum { PARTS_MAXIMUM = 64 };
+	struct
+	{
+		char name[64];
+		const char *start, *end;
+	} parts[PARTS_MAXIMUM];
+	struct config_text joined = { NULL, 0, 0 };
+	const char *line;
+	const char *first_part = NULL;
+	int count = 0, repeated = 0, index, other;
+
+	/* the parts, each from its section's line to the next one's */
+	for (line = text; *line; )
+	{
+		size_t length = strcspn(line, "\n");
+		char name[64];
+
+		if (config_line_section(line, line + length, name, sizeof(name)))
+		{
+			if (count == PARTS_MAXIMUM)
+				return NULL;
+			if (count)
+				parts[count - 1].end = line;
+			else
+				first_part = line;
+			for (other = 0; other < count; other++)
+				repeated |= !strcmp(parts[other].name, name);
+			strcpy(parts[count].name, name);
+			parts[count].start = line;
+			count++;
+		}
+		line += length;
+		if (*line)
+			line++;
+	}
+	if (!repeated)
+		return NULL;
+	parts[count - 1].end = line;
+
+	config_append_range(&joined, text, first_part);
+	for (index = 0; index < count; index++)
+	{
+		for (other = 0; other < index && strcmp(parts[other].name, parts[index].name); other++)
+			;
+		if (other < index)
+			continue;
+		config_append_range(&joined, parts[index].start, parts[index].end);
+		for (other = index + 1; other < count; other++)
+		{
+			const char *body;
+
+			if (strcmp(parts[other].name, parts[index].name))
+				continue;
+			/* (its settings, without its section's line) */
+			body = memchr(parts[other].start, '\n', (size_t)(parts[other].end - parts[other].start));
+			if (!body)
+				continue;
+			if (joined.length && joined.buffer[joined.length - 1] != '\n')
+				config_append(&joined, "\n");
+			config_append_range(&joined, body + 1, parts[other].end);
+		}
+	}
+	return joined.buffer;
+}
+
+/* ---------- values */
+
+static int config_text_is_false(const char *text)
+{
+	char lower[8];
+	size_t index;
+
+	for (index = 0; index + 1 < sizeof(lower) && text[index]; index++)
+		lower[index] = (char)tolower((unsigned char)text[index]);
+	lower[index] = 0;
+	return !strcmp(lower, "0") || !strcmp(lower, "false") || !strcmp(lower, "no") || !strcmp(lower, "off");
+}
+
+/* whether a variable that only has to be set (_environment_set_is_true or
+_environment_set_is_false) is: empty, "0", "false", "no" or "off" is not */
+static int config_environment_set(const char *text)
+{
+	return text[0] && !config_text_is_false(text);
+}
+
+static void config_set_from_text(struct config_value *value, enum config_type type, const char *text)
+{
+	switch (type)
+	{
+	case _config_boolean:
+		value->boolean = !config_text_is_false(text);
+		break;
+	case _config_integer:
+		value->integer = strtol(text, NULL, 10);
+		break;
+	case _config_real:
+		value->real = strtod(text, NULL);
+		break;
+	case _config_string:
+		/* (the old string is kept, not freed: config_string's callers hold
+		its pointer, and Settings writes few, seldom) */
+		value->string = strdup(text);
+		break;
+	}
+}
+
+/* the value in the file, if it is there and of the setting's type */
+static void config_set_from_file(struct config_value *value, const struct config_setting *setting,
+	toml_datum_t table)
+{
+	toml_datum_t datum = toml_seek(table, setting->name);
+	int wrong_type = 0;
+
+	if (datum.type == TOML_UNKNOWN)
+		return;
+	switch (setting->type)
+	{
+	case _config_boolean:
+		if (datum.type == TOML_BOOLEAN)
+			value->boolean = datum.u.boolean;
+		else
+			wrong_type = 1;
+		break;
+	case _config_integer:
+		if (datum.type == TOML_INT64)
+			value->integer = (long)datum.u.int64;
+		else
+			wrong_type = 1;
+		break;
+	case _config_real:
+		if (datum.type == TOML_FP64)
+			value->real = datum.u.fp64;
+		else if (datum.type == TOML_INT64)
+			value->real = (double)datum.u.int64;
+		else
+			wrong_type = 1;
+		break;
+	case _config_string:
+		if (datum.type == TOML_STRING)
+		{
+			free(value->string);
+			value->string = strdup(datum.u.s);
+		}
+		/* (a setting that was true or false before it had more values, as
+		input.gyro_aim was, reads its old value as that word) */
+		else if (datum.type == TOML_BOOLEAN)
+		{
+			free(value->string);
+			value->string = strdup(datum.u.boolean ? "true" : "false");
+		}
+		else
+		{
+			wrong_type = 1;
+		}
+		break;
+	}
+	if (wrong_type)
+	{
+		static const char *const expected[] = { "true or false", "a whole number", "a number", "a quoted string" };
+
+		platform_log("config.toml line %d: %s should be %s; using %s", datum.lineno, setting->name,
+			expected[setting->type], setting->default_value);
+	}
+}
+
+/* how many times a setting has been written (config_write): readers that
+keep a setting watch this, to read it again */
+static volatile unsigned long config_change_count;
+
+static long config_setting_index(const char *name)
+{
+	size_t index;
+
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		if (!strcmp(config_settings[index].name, name))
+			return (long)index;
+	}
+	return -1;
+}
+
+/* a key in the file that is no setting, likely misspelt or in the wrong
+section: said in the log, with the section of a setting of that name */
+static void config_report_unknown_key(int line, const char *name)
+{
+	const char *key = strrchr(name, '.');
+	const char *found = NULL;
+	size_t index, count = 0;
+
+	key = key ? key + 1 : name;
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		const char *dot = strchr(config_settings[index].name, '.');
+
+		if (dot && !strcmp(dot + 1, key))
+		{
+			found = config_settings[index].name;
+			count++;
+		}
+	}
+	/* (only a name one setting has: the section is then sure) */
+	if (count == 1)
+	{
+		platform_log("config.toml line %d: unknown setting %s, ignored (%s goes under [%.*s])", line, name, key,
+			(int)(strchr(found, '.') - found), found);
+	}
+	else
+	{
+		platform_log("config.toml line %d: unknown setting %s, ignored", line, name);
+	}
+}
+
+/* keys in the file that are no setting, likely misspelt */
+static void config_report_unknown_keys(toml_datum_t table)
+{
+	int section_index;
+
+	for (section_index = 0; section_index < table.u.tab.size; section_index++)
+	{
+		toml_datum_t section = table.u.tab.value[section_index];
+		int key_index;
+
+		if (section.type != TOML_TABLE)
+		{
+			config_report_unknown_key(section.lineno, table.u.tab.key[section_index]);
+			continue;
+		}
+		for (key_index = 0; key_index < section.u.tab.size; key_index++)
+		{
+			toml_datum_t value = section.u.tab.value[key_index];
+			char name[128];
+
+			snprintf(name, sizeof(name), "%s.%s", table.u.tab.key[section_index], section.u.tab.key[key_index]);
+			/* (a dotted key, game.maps.path's maps.path: the table it makes,
+			each of its keys a setting's or not) */
+			if (value.type == TOML_TABLE)
+			{
+				int inner_index;
+
+				for (inner_index = 0; inner_index < value.u.tab.size; inner_index++)
+				{
+					char inner[192];
+
+					snprintf(inner, sizeof(inner), "%s.%s", name, value.u.tab.key[inner_index]);
+					if (config_setting_index(inner) < 0)
+						config_report_unknown_key(value.u.tab.value[inner_index].lineno, inner);
+				}
+				continue;
+			}
+			if (config_setting_index(name) < 0)
+				config_report_unknown_key(value.lineno, name);
+		}
+	}
+}
+
+/* defined with the line readers below: a file whose section headers repeat,
+joined so it parses, or NULL if it should be left alone */
+static char *config_repair_repeated_sections(const char *text, toml_result_t *parsed);
+/* (below too) a file with a line the parser cannot read, that line set aside
+so the rest parses, or NULL */
+static char *config_repair_unreadable_lines(const char *text, const char *message, toml_result_t *parsed,
+	int *first_line);
+
+/* a string setting, replaced (the old one freed: callers of config_string
+hold the pointer only after load) */
+static void config_replace_string(const char *name, const char *text)
+{
+	long index = config_setting_index(name);
+	char *copy;
+
+	if (index < 0 || config_settings[index].type != _config_string || !text)
+		return;
+	copy = strdup(text);
+	if (!copy)
+		return;
+	free(config_values[index].string);
+	config_values[index].string = copy;
+}
+
+/* settings added after an older one that meant both: a file that has
+game.ragdoll and not game.ragdoll_players or game.ragdoll_ai gives that
+value to the one it lacks (a new file has both, at "none"). An older
+input.gyro_aim of "zoom", with input.gyro_zoom_only not yet in the file,
+is that setting on, and one with debug.log_files false and no
+debug.halo_log has that false too */
+static void config_apply_older_settings(toml_datum_t table)
+{
+	toml_datum_t legacy = toml_seek(table, "game.ragdoll");
+	toml_datum_t aim = toml_seek(table, "input.gyro_aim");
+	toml_datum_t zoom = toml_seek(table, "input.gyro_zoom_only");
+	long index;
+
+	if (legacy.type == TOML_STRING)
+	{
+		if (toml_seek(table, "game.ragdoll_players").type == TOML_UNKNOWN)
+			config_replace_string("game.ragdoll_players", legacy.u.s);
+		if (toml_seek(table, "game.ragdoll_ai").type == TOML_UNKNOWN)
+			config_replace_string("game.ragdoll_ai", legacy.u.s);
+	}
+	if (aim.type == TOML_STRING && !strcmp(aim.u.s, "zoom") && zoom.type == TOML_UNKNOWN)
+	{
+		index = config_setting_index("input.gyro_zoom_only");
+		if (index >= 0 && config_settings[index].type == _config_boolean)
+			config_values[index].boolean = 1;
+	}
+#if defined(HALO_ANDROID) || defined(HALO_PS5)
+	/* (debug.log_files false once meant no log file at all: the Switch's
+	halo.log neither) */
+	legacy = toml_seek(table, "debug.log_files");
+	if (legacy.type == TOML_BOOLEAN && !legacy.u.boolean &&
+		toml_seek(table, "debug.halo_log").type == TOML_UNKNOWN && config_setting_index("debug.halo_log") >= 0)
+	{
+		config_values[config_setting_index("debug.halo_log")].boolean = 0;
+	}
+#endif
+}
+
+/* whether length bytes of text are word, in any case (ASCII) */
+static int config_word_is(const char *text, size_t length, const char *word)
+{
+	size_t index;
+
+	if (strlen(word) != length)
+		return 0;
+	for (index = 0; index < length; index++)
+	{
+		if (tolower((unsigned char)text[index]) != word[index])
+			return 0;
+	}
+	return 1;
+}
+
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+/* a config.toml the game never reads, likely edited in its place: said in
+the log, with the one it reads (path) */
+static void config_report_unread(const char *path)
+{
+	char other[1100];
+#ifndef _WIN32
+	/* in the folder the game was started from, when that is not the
+	executable's (the game's is beside the executable) */
+	char folder[1024];
+
+	if (getcwd(folder, sizeof(folder)))
+	{
+		snprintf(other, sizeof(other), "%s/config.toml", folder);
+		if (strcmp(other, path) && SDL_GetPathInfo(other, NULL))
+		{
+			SDL_PathInfo mine, theirs;
+
+			/* (the same file by another name is the one read) */
+			if (!SDL_GetPathInfo(path, &mine) || !SDL_GetPathInfo(other, &theirs) ||
+				mine.size != theirs.size || mine.modify_time != theirs.modify_time)
+			{
+				platform_log("settings: %s is not read; the game's settings are %s", other, path);
+			}
+		}
+	}
+#endif
+	/* the file saved with .txt after it, by an editor that adds it (and
+	Windows Explorer hides it) */
+	snprintf(other, sizeof(other), "%s.txt", path);
+	if (SDL_GetPathInfo(other, NULL))
+	{
+#ifdef _WIN32
+		platform_log("settings: %s is not read: Windows saved it as config.toml.txt; rename it to config.toml", other);
+#else
+		platform_log("settings: %s is not read; rename it to config.toml", other);
+#endif
+	}
+}
+#endif
+
+/* ---------- words */
+
+/* the settings that take one of a few words: one in any case is taken (as
+written here: "Windowed" is "windowed"), and another is said once in the
+log */
+static const struct
+{
+	const char *name;
+	/* NULL ended; "" where empty is one */
+	const char *words[24];
+	/* what the game does with another, for the log (NULL: not said) */
+	const char *otherwise;
+} config_words[] =
+{
+	{ "display.mode", { "", "fullscreen", "borderless", "windowed", NULL }, "display.fullscreen's" },
+	{ "display.resolution_scaling", { "native", "75%", "50%", "25%", "original", NULL }, NULL },
+	{ "display.anti_aliasing", { "off", "fxaa", "smaa", "ssaa2x", "msaa2x", "msaa4x", "msaa8x", NULL }, NULL },
+	{ "display.hud_button_style", { "classic", "gems", "menu_gems", "dark_gems", "xbox_modern",
+		"ps_classic", "ps_gems", "ps_dark_gems", "ps_modern", "switch_classic", "switch_gems", "switch_modern", "keyboard", NULL }, NULL },
+	{ "display.hud_button_style_xbox", { "classic", "gems", "menu_gems", "dark_gems", "xbox_modern", NULL }, NULL },
+	{ "display.hud_bumper_style", { "original", "modern", NULL }, NULL },
+	{ "display.hud_button_style_ps", { "ps_classic", "ps_gems", "ps_dark_gems", "ps_modern", NULL }, NULL },
+	{ "display.hud_button_style_switch", { "switch_classic", "switch_gems", "switch_modern", NULL }, NULL },
+	{ "server.listing", { "internet_public", "internet_private", "lan", NULL }, NULL },
+	{ "display.menus", { "pc", "xbox", NULL }, NULL },
+	{ "display.player_names", { "all", "allies", "enemies", "none", NULL }, NULL },
+	{ "display.scoreboard_team_layout", { "teams", "score", NULL }, NULL },
+	{ "display.chat_style", { "colors", "white", NULL }, NULL },
+	{ "display.shield_glow_intensity", { "stock", "default", "1.5x", "2x", "light_show", NULL }, NULL },
+	{ "display.shield_color", { "default", "white", "black", "red", "blue", "gray", "yellow", "green", "pink",
+		"purple", "cyan", "cobalt", "orange", "teal", "sage", "brown", "tan", "maroon", "salmon", NULL }, NULL },
+	{ "game.score_hud_color", { "default", "spartan", "custom", NULL }, NULL },
+	{ "game.score_hud_custom_color", { "white", "black", "red", "blue", "gray", "yellow", "green", "pink",
+		"purple", "cyan", "cobalt", "orange", "teal", "sage", "brown", "tan", "maroon", "salmon", NULL }, NULL },
+	{ "audio.resampler", { "xbox", "sinc", "linear", NULL }, NULL },
+	{ "audio.voice_chat", { "push_to_talk", "open_mic", "off", NULL }, NULL },
+	{ "input.touch_controls", { "auto", "on", "off", NULL }, NULL },
+	{ "game.console_log", { "important", "all", "none", NULL }, NULL },
+	{ "game.language", { "", "ja", "de", "fr", "es", "it", NULL }, NULL },
+	{ "network.text_chat", { "on", "links", "off", NULL }, NULL },
+	{ "bots.routes", { "direct", "lanes", "mixed", NULL }, "\"direct\"'s" },
+	{ "bots.kind", { "birchwood", "provinggrounds", NULL }, "\"birchwood\"'s" },
+	{ "server.chat_filter", { "off", "censor", "block", NULL }, NULL },
+	{ "server.chat_filter_slurs", { "off", "severe", "strong", "mild", NULL }, NULL },
+	{ "server.chat_filter_swearing", { "off", "severe", "strong", "mild", NULL }, NULL },
+	{ "server.chat_filter_insults", { "off", "severe", "strong", "mild", NULL }, NULL },
+	{ "server.vpn_policy", { "link", "block", "off", NULL }, NULL },
+	{ "server.vpn_fail", { "open", "closed", NULL }, NULL },
+	{ "network.votekick_threshold", { "dynamic", "static", NULL }, NULL },
+	{ "server.coop_bsp_switch", { "majority", "anyone", NULL }, NULL },
+	{ "network.link_share", { "when_needed", "always", "never", NULL }, NULL },
+	{ "network.voice_mode", { "off", "team_proximity", "team_enemy_proximity", "team_global",
+		"team_global_enemy_proximity", NULL }, NULL },
+	{ "network.coop_team_wipe", { "auto", "revert", "respawn", NULL }, NULL },
+	{ "network.coop_friendly_fire", { "off", "on", "shields_only", "explosives_only", NULL }, NULL },
+	{ "network.shield_effects", { "stock", "glow", "light_show", "overshield", "glow_overshield",
+		"light_show_overshield", "players", NULL }, NULL },
+	{ "network.coop_enemies_mode", { "none", "per_player", "multiplier", NULL }, NULL },
+	{ "network.coop_score_type", { "cooperative", "competitive", NULL }, NULL },
+	{ "streamer.slurs", { "off", "severe", "strong", "mild", NULL }, NULL },
+	{ "streamer.swearing", { "off", "severe", "strong", "mild", NULL }, NULL },
+	{ "streamer.insults", { "off", "severe", "strong", "mild", NULL }, NULL },
+	{ "crash_reports.upload", { "ask", "yes", "no", NULL }, NULL },
+};
+
+#define NUMBER_OF_CONFIG_WORDS (sizeof(config_words) / sizeof(config_words[0]))
+
+/* the word settings' values as their readers compare them (lowercase), and
+the log told of one that is none of its words */
+static void config_check_words(void)
+{
+	size_t word_index;
+
+	for (word_index = 0; word_index < NUMBER_OF_CONFIG_WORDS; word_index++)
+	{
+		long index = config_setting_index(config_words[word_index].name);
+		const char *const *words = config_words[word_index].words;
+		struct config_value *value;
+		char list[400] = "";
+		size_t word;
+
+		if (index < 0 || !(config_settings[index].platforms & CONFIG_PLATFORM))
+			continue;
+		value = &config_values[index];
+		for (word = 0; words[word] && !config_word_is(value->string, strlen(value->string), words[word]); word++)
+		{
+		}
+		if (words[word])
+		{
+			if (strcmp(value->string, words[word]))
+			{
+				free(value->string);
+				value->string = strdup(words[word]);
+			}
+			continue;
+		}
+		/* ("a", "b" or "c", and "or empty" for "") */
+		for (word = 0; words[word]; word++)
+		{
+			size_t length = strlen(list);
+
+			if (!words[word][0])
+				continue;
+			snprintf(list + length, sizeof(list) - length, "%s\"%s\"",
+				!length ? "" : !words[word + 1] && words[0][0] ? " or " : ", ", words[word]);
+		}
+		if (!words[0][0])
+			snprintf(list + strlen(list), sizeof(list) - strlen(list), " or empty");
+		platform_log("settings: %s = \"%s\" is not %s%s%s", config_words[word_index].name, value->string, list,
+			config_words[word_index].otherwise ? "; using " : "",
+			config_words[word_index].otherwise ? config_words[word_index].otherwise : "");
+	}
+}
+
+/* the passwords a file may hold instead of their variable (a container's
+secrets): <variable>_FILE names it, and its first line is the value */
+static const char *const config_secret_files[] =
+{
+	"server.password", "server.web_password", "server.web_owner_password", "server.web_moderator_password",
+	"server.web_viewer_password",
+};
+#define NUMBER_OF_CONFIG_SECRET_FILES (sizeof(config_secret_files) / sizeof(config_secret_files[0]))
+
+/* the value of the setting's <variable>_FILE (read once, at the first
+question: a file changed after the start is not read again), NULL if
+there is none, it cannot be read or its first line is empty */
+static const char *config_environment_file(const struct config_setting *setting)
+{
+	static char values[NUMBER_OF_CONFIG_SECRET_FILES][512];
+	static signed char read[NUMBER_OF_CONFIG_SECRET_FILES];
+	size_t index;
+
+	for (index = 0; index < NUMBER_OF_CONFIG_SECRET_FILES && strcmp(config_secret_files[index], setting->name); index++)
+	{
+	}
+	if (index == NUMBER_OF_CONFIG_SECRET_FILES || !setting->environment)
+		return NULL;
+	if (!read[index])
+	{
+		char variable[96];
+		const char *path;
+		char *text;
+		size_t size = 0, length;
+
+		read[index] = -1;
+		snprintf(variable, sizeof(variable), "%s_FILE", setting->environment);
+		path = getenv(variable);
+		if (!path || !path[0])
+			return NULL;
+		text = config_read_file(path, &size);
+		if (!text)
+		{
+			platform_log("settings: %s names %s, which cannot be read: %s is not set by it", variable, path,
+				setting->name);
+			return NULL;
+		}
+		/* (the first line, its CR and LF off) */
+		length = strcspn(text, "\n");
+		if (length && text[length - 1] == '\r')
+			length--;
+		if (length >= sizeof(values[index]))
+		{
+			platform_log("settings: the first line of %s (%s) is longer than %d characters: %s is not set by it",
+				path, variable, (int)sizeof(values[index]) - 1, setting->name);
+			length = 0;
+		}
+		memcpy(values[index], text, length);
+		values[index][length] = 0;
+		memset(text, 0, size);
+		free(text);
+		read[index] = length ? 1 : -1;
+	}
+	return read[index] > 0 ? values[index] : NULL;
+}
+
+/* a setting's environment variable, NULL if it is not set; a dedicated
+server's settings' empty ones are not set either (a panel passes every
+variable it has, empty ones too: an empty password must not stand for one).
+A password's variable that is not set may be read from its file
+(<variable>_FILE: config_environment_file) */
+static const char *config_environment(const struct config_setting *setting)
+{
+	const char *environment = setting->environment ? getenv(setting->environment) : NULL;
+
+	if (environment && !environment[0] &&
+		(setting->platforms == _platform_server || !strcmp(setting->name, "network.public_address")))
+	{
+		environment = NULL;
+	}
+	if (!environment)
+		environment = config_environment_file(setting);
+	return environment;
+}
+
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+/* a dedicated server (port/linux/src/server_mode.c) has no window, sound,
+microphone or player, never asks anything, and is reached only as its
+settings say, whatever the file and the environment say of these (for this
+run: nothing of it is written) */
+/* halo --probe: no window, sound, update, Discord or menus' test; the
+network test's probe, and a deadline (internet play as set: on by default,
+which an invite needs) */
+static void config_apply_probe_mode(void)
+{
+	static const char *const forced[][2] =
+	{
+		{ "debug.null_renderer", "true" },
+		{ "debug.hidden_window", "true" },
+		{ "display.fullscreen", "false" },
+		{ "audio.enabled", "false" },
+		{ "audio.voice_chat", "off" },
+		{ "network.join_from_clipboard", "false" },
+		{ "update.auto", "false" },
+		{ "crash_reports.upload", "no" },
+		{ "discord.application_id", "" },
+		{ "debug.network_test", "probe" },
+		{ "server.enabled", "false" },
+		{ "debug.test_input", "" },
+		{ "debug.menu_open", "" },
+		{ "debug.exit_after", "45" },
+	};
+	size_t index;
+
+	for (index = 0; index < sizeof(forced) / sizeof(forced[0]); index++)
+	{
+		long found = config_setting_index(forced[index][0]);
+
+		if (found >= 0)
+			config_set_from_text(&config_values[found], config_settings[found].type, forced[index][1]);
+	}
+}
+
+static void config_apply_server_mode(void)
+{
+	static const char *const forced[][2] =
+	{
+		{ "server.enabled", "true" },
+		{ "debug.null_renderer", "true" },
+		{ "debug.hidden_window", "true" },
+		{ "display.fullscreen", "false" },
+		{ "display.vsync", "false" },
+		{ "display.interpolation", "false" },
+		{ "display.high_res_hud", "false" },
+		{ "display.high_res_text", "false" },
+		{ "display.anti_aliasing", "off" },
+		{ "audio.enabled", "false" },
+		{ "audio.voice_chat", "off" },
+		{ "network.join_from_clipboard", "false" },
+		{ "update.auto", "false" },
+		{ "crash_reports.upload", "no" },
+		{ "discord.application_id", "" },
+		{ "debug.network_test", "" },
+		{ "debug.test_input", "" },
+		{ "debug.menu_open", "" },
+		{ "debug.custom_campaign", "" },
+	};
+	const char *tunnel_port = getenv("HALO_NET_TUNNEL_PORT");
+	size_t index;
+
+	for (index = 0; index < sizeof(forced) / sizeof(forced[0]); index++)
+	{
+		long found = config_setting_index(forced[index][0]);
+
+		if (found >= 0)
+			config_set_from_text(&config_values[found], config_settings[found].type, forced[index][1]);
+	}
+	/* (the tunnel's port fixed, Halo PC's 2302, unless one is given: a
+	server's players and firewall need to know it; a router asked to
+	forward it only as server.upnp says) */
+	if ((!tunnel_port || !*tunnel_port) && !config_values[config_setting_index("network.tunnel_port")].integer)
+		config_values[config_setting_index("network.tunnel_port")].integer = 2302;
+	config_values[config_setting_index("network.allow_upnp")].boolean =
+		config_values[config_setting_index("server.upnp")].boolean;
+}
+#endif
+
+static void config_load(void)
+{
+	char path[1024];
+	size_t size = 0;
+	char *text;
+	size_t index;
+
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		const char *default_value = config_settings[index].default_value;
+
+		if (config_settings[index].type == _config_string)
+		{
+			/* written as a TOML basic string without escapes */
+			size_t length = strlen(default_value);
+
+			config_values[index].string = length >= 2 ? config_copy(default_value + 1, length - 2) : strdup("");
+		}
+		else
+		{
+			config_set_from_text(&config_values[index], config_settings[index].type, default_value);
+		}
+	}
+	config_values_ready = 1;
+
+	config_path(path, sizeof(path));
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+	config_report_unread(path);
+	/* (a dedicated server's file has its settings too: asked for by the
+	command line or the environment, or by the file's server.enabled; a
+	probe is never one, whatever they say) */
+	config_probe_mode = config_argument("--probe", NULL, 0);
+	{
+		const char *environment = getenv("HALO_SERVER");
+
+		config_server_mode = !config_probe_mode && (config_argument("--server", NULL, 0) ||
+			(environment && config_environment_set(environment)));
+	}
+	/* (a run that only answers its command line, halo --version, writes no
+	settings: the file read is left as it is) */
+	config_answer_only = config_argument("--help", NULL, 0) || config_argument("--version", NULL, 0) ||
+		config_argument("--keygen", NULL, 0) || config_argument("--sign", NULL, 0) || config_probe_mode;
+#endif
+	text = config_read_file(path, &size);
+	if (text)
+	{
+		char *joined = config_join_sections(text);
+		char *parsed;
+		toml_result_t result;
+		int ok;
+
+		/* a section twice is joined so the file parses. A key that is still
+		there twice keeps its earlier line (config_repair_repeated_sections),
+		which is the one a menu save writes */
+		if (joined)
+		{
+			free(text);
+			text = joined;
+			size = strlen(text);
+		}
+		parsed = text;
+		result = toml_parse(text, (int)size);
+		ok = result.ok;
+		if (!ok)
+		{
+			char reason[200];
+			char *repaired;
+
+			snprintf(reason, sizeof(reason), "%s", result.errmsg);
+			toml_free(result);
+			repaired = config_repair_repeated_sections(text, &result);
+			if (repaired)
+			{
+				parsed = repaired;
+				ok = 1;
+				platform_log("settings: joined the sections %s had twice; a repeated key keeps its earlier value", path);
+			}
+			else
+			{
+				int line;
+
+				repaired = config_repair_unreadable_lines(text, reason, &result, &line);
+				if (repaired)
+				{
+					parsed = repaired;
+					ok = 1;
+					platform_log("settings: line %d of %s could not be read (%s); it is set aside as a comment, "
+						"and the rest is read", line, path, reason);
+				}
+				else
+				{
+					platform_log("config.toml: %s; using the defaults", reason);
+				}
+			}
+		}
+		if (ok)
+		{
+			char *completed;
+
+			if (joined && parsed == text && !config_answer_only)
+			{
+				if (config_write_file(path, text))
+					platform_log("settings: joined the sections %s had twice", path);
+				else
+					platform_log("settings: cannot write %s", path);
+			}
+			for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+				config_set_from_file(&config_values[index], &config_settings[index], result.toptab);
+			config_apply_older_settings(result.toptab);
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+			if (config_values[config_setting_index("server.enabled")].boolean && !config_probe_mode)
+				config_server_mode = 1;
+#endif
+			config_report_unknown_keys(result.toptab);
+			platform_log("settings: %s", path);
+			/* (a run that only answers its command line writes nothing) */
+			if (!config_answer_only)
+			{
+				completed = config_add_missing(parsed, result.toptab);
+				if ((parsed != text || completed) && !config_write_file(path, completed ? completed : parsed))
+					platform_log("settings: cannot write %s", path);
+				free(completed);
+			}
+			toml_free(result);
+		}
+		if (parsed != text)
+			free(parsed);
+		free(text);
+	}
+	else if (!config_answer_only)
+	{
+		char *defaults = config_default_text();
+
+		if (defaults && config_write_file(path, defaults))
+			platform_log("settings: wrote the defaults to %s", path);
+		else
+			platform_log("settings: cannot write %s; using the defaults", path);
+		free(defaults);
+	}
+
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		const struct config_setting *setting = &config_settings[index];
+		const char *environment = config_environment(setting);
+
+		if (!environment || (setting->environment_style != _environment_value && !config_environment_set(environment)))
+			continue;
+		switch (setting->environment_style)
+		{
+		case _environment_value:
+			config_set_from_text(&config_values[index], setting->type, environment);
+			break;
+		case _environment_set_is_true:
+			config_values[index].boolean = 1;
+			break;
+		case _environment_set_is_false:
+			config_values[index].boolean = 0;
+			break;
+		}
+	}
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+	if (config_server_mode)
+		config_apply_server_mode();
+	else if (config_probe_mode)
+		config_apply_probe_mode();
+#endif
+	config_check_words();
+}
+
+/* values a setting no longer takes, written over as the file is first read:
+display.vk_driver's "auto" (Turnip, which the launcher downloads, chosen by
+the GPU) is the phone's own driver now, and the downloaded archive a driver
+of the list like any other (Video Setup) */
+static void config_retire_values(void)
+{
+#if defined(HALO_ANDROID) || defined(HALO_PS5)
+	/* (server.name's old default, which the builds that host from the menus
+	wrote before they had a name of their own to ask for: no name set,
+	which Server Settings asks for before the first game) */
+	{
+		long name = config_setting_index("server.name");
+
+		if (name >= 0 && config_values[name].string && !strcmp(config_values[name].string, "OpenCE Server"))
+		{
+			platform_log("settings: server.name \"OpenCE Server\" was the old default; \"\" (Server Settings sets it)");
+			config_write("server.name", "");
+		}
+	}
+#endif
+#if defined(HALO_ANDROID) && !defined(HALO_SWITCH) && !defined(HALO_PS5)
+	long index = config_setting_index("display.vk_driver");
+
+	if (index >= 0 && config_values[index].string && !strcmp(config_values[index].string, "auto"))
+	{
+		platform_log("settings: display.vk_driver \"auto\" is no more; \"\" (the phone's own driver)");
+		config_write("display.vk_driver", "");
+	}
+#endif
+}
+
+/* the file read, the first time a setting is asked for */
+#ifdef HALO_GUEST
+/* the files the player reads, edits or deletes from outside the game made
+0666 at each launch, whatever made them or with what mode (an older build, a
+umask): config.toml, debug.txt, gamestate.txt and halo.log. After the file is
+read, as d:\'s folder may be paths.data's */
+static void config_share_files(void)
+{
+	static char const *const files[] = { "d:\\debug.txt", "d:\\gamestate.txt", "d:\\halo.log" };
+	char path[1024];
+	size_t index;
+
+	config_path(path, sizeof(path));
+	platform_share_path(path);
+	for (index = 0; index < sizeof(files) / sizeof(files[0]); index++)
+	{
+		platform_translate_path(files[index], path, sizeof(path));
+		platform_share_path(path);
+	}
+}
+#endif
+
+static void config_ensure_loaded(void)
+{
+	int first = 0;
+
+	pthread_mutex_lock(&config_lock);
+	if (!config_loaded)
+	{
+		config_load();
+		config_loaded = 1;
+		first = 1;
+	}
+	pthread_mutex_unlock(&config_lock);
+	/* (config_write takes the lock itself) */
+	if (first)
+		config_retire_values();
+#ifdef HALO_GUEST
+	if (first)
+		config_share_files();
+#endif
+}
+
+static const struct config_value *config_profile_value(int player, long index);
+
+static const struct config_value *config_value(const char *name, enum config_type type)
+{
+	static const struct config_value none = { 0, 0, 0.0, "" };
+	long index;
+
+	config_ensure_loaded();
+	index = config_setting_index(name);
+	if (index < 0 || config_settings[index].type != type)
+	{
+		platform_log("settings: no %s setting %s", type == _config_string ? "string" : "such", name);
+		return &none;
+	}
+	if (config_overridden[index])
+		return &config_overrides[index];
+	/* (a setting each profile keeps: player 1's profile's, if it has set
+	it) */
+	{
+		const struct config_value *own = config_profile_value(0, index);
+
+		if (own)
+			return own;
+	}
+	return &config_values[index];
+}
+
+/* ---------- writing a setting */
+
+/* the line's key, if it is "key = ..." (after spaces), in key */
+static int config_line_key(const char *line, const char *end, const char *key)
+{
+	size_t length = strlen(key);
+
+	while (line < end && (*line == ' ' || *line == '\t'))
+		line++;
+	if ((size_t)(end - line) <= length || strncmp(line, key, length) != 0)
+		return 0;
+	line += length;
+	while (line < end && (*line == ' ' || *line == '\t'))
+		line++;
+	return line < end && *line == '=';
+}
+
+/* the section the line opens, if it is "[section]" (after spaces) */
+static int config_line_section(const char *line, const char *end, char *section, size_t size)
+{
+	const char *close;
+
+	while (line < end && (*line == ' ' || *line == '\t'))
+		line++;
+	if (line >= end || *line != '[')
+		return 0;
+	close = memchr(line, ']', (size_t)(end - line));
+	if (!close || (size_t)(close - line - 1) >= size)
+		return 0;
+	memcpy(section, line + 1, (size_t)(close - line - 1));
+	section[close - line - 1] = 0;
+	return 1;
+}
+
+/* the line's key, if it is "key = ..." (after spaces) */
+static int config_line_key_name(const char *line, const char *end, char *key, size_t size)
+{
+	const char *start;
+	size_t length;
+
+	while (line < end && (*line == ' ' || *line == '\t'))
+		line++;
+	start = line;
+	while (line < end && *line != ' ' && *line != '\t' && *line != '=' && *line != '\r')
+		line++;
+	length = (size_t)(line - start);
+	if (!length || length >= size)
+		return 0;
+	while (line < end && (*line == ' ' || *line == '\t'))
+		line++;
+	if (line >= end || *line != '=')
+		return 0;
+	memcpy(key, start, length);
+	key[length] = 0;
+	return 1;
+}
+
+static void config_append_span(struct config_text *text, const char *start, const char *end)
+{
+	char *copy = config_copy(start, (size_t)(end - start));
+
+	if (copy)
+	{
+		config_append(text, copy);
+		free(copy);
+	}
+}
+
+static int config_text_has_key(const struct config_text *text, const char *key)
+{
+	const char *line;
+
+	if (!text->buffer)
+		return 0;
+	for (line = text->buffer; *line; )
+	{
+		const char *end = line + strcspn(line, "\n");
+		const char *next = *end ? end + 1 : end;
+
+		if (config_line_key(line, end, key))
+			return 1;
+		line = next;
+	}
+	return 0;
+}
+
+#define CONFIG_SECTION_LIMIT 32
+
+struct config_section_piece
+{
+	char name[64];
+	struct config_text text;
+};
+
+static void config_pieces_free(struct config_text *preamble, struct config_section_piece *pieces, size_t count)
+{
+	size_t index;
+
+	free(preamble->buffer);
+	preamble->buffer = NULL;
+	for (index = 0; index < count; index++)
+	{
+		free(pieces[index].text.buffer);
+		pieces[index].text.buffer = NULL;
+	}
+}
+
+/* a section header the default file used to open again when a later setting
+returned to an earlier section. The second header makes the whole file fail
+to parse, so every setting stays at its default while the saved lines are
+still in the file. Joined into the first header. A key that appears twice
+keeps its earlier line, which is the one a menu save writes. NULL if no
+header or key was repeated, or the text cannot be rebuilt */
+static char *config_collapse_repeated_sections(const char *text)
+{
+	struct config_text preamble = { 0 };
+	struct config_section_piece pieces[CONFIG_SECTION_LIMIT];
+	struct config_text out = { 0 };
+	size_t count = 0;
+	size_t index;
+	long current = -1;
+	int repeated = 0;
+	int overflow = 0;
+	const char *line;
+
+	memset(pieces, 0, sizeof(pieces));
+	for (line = text; *line && !overflow; )
+	{
+		const char *end = line + strcspn(line, "\n");
+		const char *next = *end ? end + 1 : end;
+		char name[64];
+		char key[64];
+
+		if (config_line_section(line, end, name, sizeof(name)))
+		{
+			current = -1;
+			for (index = 0; index < count; index++)
+			{
+				if (!strcmp(pieces[index].name, name))
+				{
+					current = (long)index;
+					break;
+				}
+			}
+			if (current >= 0)
+			{
+				repeated = 1;
+				line = next;
+				continue;
+			}
+			if (count >= CONFIG_SECTION_LIMIT)
+			{
+				platform_log("settings: too many sections to join %s", name);
+				overflow = 1;
+				break;
+			}
+			snprintf(pieces[count].name, sizeof(pieces[count].name), "%s", name);
+			current = (long)count;
+			count++;
+		}
+		else if (current >= 0 && config_line_key_name(line, end, key, sizeof(key)) &&
+			config_text_has_key(&pieces[current].text, key))
+		{
+			repeated = 1;
+			line = next;
+			continue;
+		}
+		config_append_span(current < 0 ? &preamble : &pieces[current].text, line, next);
+		line = next;
+	}
+	if (!repeated || overflow)
+	{
+		config_pieces_free(&preamble, pieces, count);
+		return NULL;
+	}
+	if (preamble.buffer)
+		config_append(&out, preamble.buffer);
+	for (index = 0; index < count; index++)
+	{
+		if (pieces[index].text.buffer)
+			config_append(&out, pieces[index].text.buffer);
+	}
+	config_pieces_free(&preamble, pieces, count);
+	return out.buffer;
+}
+
+/* that text, if it then parses. NULL if there is nothing to join or the
+joined text still does not parse, and the file is left alone. parsed
+receives the successful parse */
+static char *config_repair_repeated_sections(const char *text, toml_result_t *parsed)
+{
+	char *collapsed = config_collapse_repeated_sections(text);
+
+	if (!collapsed)
+		return NULL;
+	*parsed = toml_parse(collapsed, (int)strlen(collapsed));
+	if (!parsed->ok)
+	{
+		toml_free(*parsed);
+		free(collapsed);
+		return NULL;
+	}
+	return collapsed;
+}
+
+/* the line a parse error names ("(line 179) invalid value"), or 0 */
+static int config_error_line(const char *message)
+{
+	const char *at = strstr(message, "line ");
+
+	return at ? atoi(at + 5) : 0;
+}
+
+/* the text with its line'th line (from 1) set aside as a comment, which keeps
+what it said; NULL if the text has no such line */
+static char *config_set_aside_line(const char *text, int line)
+{
+	struct config_text out = { 0 };
+	const char *at = text;
+	int number;
+
+	for (number = 1; number < line && at; number++)
+	{
+		at = strchr(at, '\n');
+		if (at)
+			at++;
+	}
+	if (!at || !*at)
+		return NULL;
+	{
+		char *before = config_copy(text, (size_t)(at - text));
+
+		if (!before)
+			return NULL;
+		config_append(&out, before);
+		free(before);
+	}
+	config_append(&out, "# (unreadable, set aside) ");
+	config_append(&out, at);
+	return out.buffer;
+}
+
+/* A file that does not parse for a line the parser cannot read (a value
+cut short by the game ending as the file was written, a hand edit): each
+such line set aside as a comment, a few at most, with the repeated sections
+joined too, if the rest then parses; NULL otherwise, and the file is left
+alone. One bad line otherwise sent every setting back to its default at
+each start, and a menu's save kept the line. parsed receives the parse,
+and line the first line set aside */
+static char *config_repair_unreadable_lines(const char *text, const char *message, toml_result_t *parsed,
+	int *first_line)
+{
+	char *current = NULL;
+	char reason[200];
+	int attempt;
+
+	*first_line = 0;
+	snprintf(reason, sizeof(reason), "%s", message);
+	for (attempt = 0; attempt < 8; attempt++)
+	{
+		int line = config_error_line(reason);
+		char *next;
+		char *joined;
+
+		if (line <= 0)
+			break;
+		next = config_set_aside_line(current ? current : text, line);
+		if (!next)
+			break;
+		free(current);
+		current = next;
+		if (!*first_line)
+			*first_line = line;
+		*parsed = toml_parse(current, (int)strlen(current));
+		if (parsed->ok)
+			return current;
+		snprintf(reason, sizeof(reason), "%s", parsed->errmsg);
+		toml_free(*parsed);
+		joined = config_repair_repeated_sections(current, parsed);
+		if (joined)
+		{
+			free(current);
+			return joined;
+		}
+	}
+	free(current);
+	return NULL;
+}
+/* the longest string config_write takes */
+#define CONFIG_MAXIMUM_WRITTEN_STRING 4096
+
+/* the setting's line as a file holds it ("key = value\n", the key without
+its section), for its value; NULL if it cannot be made. free() it */
+static char *config_value_line(long index, const struct config_value *value)
+{
+	const char *key = strchr(config_settings[index].name, '.') + 1;
+	const char *string = value->string ? value->string : "";
+	/* (its value with each character escaped as \uXXXX at most) */
+	size_t line_size = strlen(key) + 6 * strlen(string) + 64;
+	char *line_text = malloc(line_size);
+
+	if (!line_text)
+		return NULL;
+	switch (config_settings[index].type)
+	{
+	case _config_boolean:
+		snprintf(line_text, line_size, "%s = %s\n", key, value->boolean ? "true" : "false");
+		break;
+	case _config_integer:
+		snprintf(line_text, line_size, "%s = %ld\n", key, value->integer);
+		break;
+	case _config_real:
+		/* (with its point: TOML reads 1 as an integer) */
+		snprintf(line_text, line_size, "%s = %.15g", key, value->real);
+		if (!strpbrk(line_text + strlen(key) + 3, ".en"))
+			strcat(line_text, ".0");
+		strcat(line_text, "\n");
+		break;
+	case _config_string:
+	{
+		char *end = line_text + snprintf(line_text, line_size, "%s = \"", key);
+		const char *character;
+
+		/* (a TOML basic string: quotes and backslashes escaped, and control
+		characters, so that a value cannot end its line) */
+		for (character = string; *character; character++)
+		{
+			if ((unsigned char)*character < 0x20 || *character == 0x7F)
+			{
+				end += sprintf(end, "\\u%04x", (unsigned)(unsigned char)*character);
+				continue;
+			}
+			if (*character == '"' || *character == '\\')
+				*end++ = '\\';
+			*end++ = *character;
+		}
+		strcpy(end, "\"\n");
+		break;
+	}
+	}
+	return line_text;
+}
+
+/* the setting's line in the file at path changed to line_text (or added, at
+the end of its section, which is opened if the file has none), the rest of
+the file kept as it is; a file that is not there is begun with preamble */
+static int config_file_set_line(const char *path, long index, const char *line_text, const char *preamble)
+{
+	const char *name = config_settings[index].name;
+	const char *dot = strchr(name, '.');
+	char section[64], key[64], current[64] = "";
+	struct config_text out = { 0 };
+	size_t size = 0;
+	char *text;
+	const char *line;
+	int written = 0, in_section = 0, succeeded;
+
+	snprintf(section, sizeof(section), "%.*s", (int)(dot - name), name);
+	snprintf(key, sizeof(key), "%s", dot + 1);
+	text = config_read_file(path, &size);
+	if (!text && preamble)
+		config_append(&out, preamble);
+	for (line = text ? text : ""; *line;)
+	{
+		const char *end = line + strcspn(line, "\n");
+		const char *next = *end ? end + 1 : end;
+
+		if (config_line_section(line, end, current, sizeof(current)))
+		{
+			/* (leaving the section without the key: it goes at its end) */
+			if (in_section && !written)
+			{
+				config_append(&out, line_text);
+				written = 1;
+			}
+			in_section = !strcmp(current, section);
+		}
+		else if (in_section && !written && config_line_key(line, end, key))
+		{
+			config_append(&out, line_text);
+			written = 1;
+			line = next;
+			continue;
+		}
+		{
+			char *copy = config_copy(line, (size_t)(next - line));
+
+			if (copy)
+			{
+				config_append(&out, copy);
+				free(copy);
+			}
+		}
+		line = next;
+	}
+	if (!written)
+	{
+		if (out.length && out.buffer[out.length - 1] != '\n')
+			config_append(&out, "\n");
+		if (!in_section)
+		{
+			char header[80];
+
+			snprintf(header, sizeof(header), "%s[%s]\n", out.length ? "\n" : "", section);
+			config_append(&out, header);
+		}
+		config_append(&out, line_text);
+	}
+	succeeded = out.buffer && config_write_file(path, out.buffer);
+	free(out.buffer);
+	free(text);
+	return succeeded;
+}
+
+/* ---------- a profile's own settings */
+
+static void config_value_text(long index, const struct config_value *value, char *text, size_t size);
+
+/* the settings each player profile keeps for itself, in settings.toml
+beside its blam.sav: Controls Setup's keys, Mouse Settings' and Gyro Aim's.
+config.toml's are those a profile has not set, and a game's with no profile;
+an environment variable still sets one for every profile */
+static const char *const config_profile_names[] =
+{
+	"controls.move_forward", "controls.move_backward", "controls.strafe_left", "controls.strafe_right",
+	"controls.jump", "controls.crouch", "controls.fire", "controls.throw_grenade", "controls.melee",
+	"controls.reload", "controls.zoom", "controls.switch_weapon", "controls.switch_grenade", "controls.action",
+	"controls.flashlight", "controls.scoreboard", "controls.pause", "controls.screenshot",
+	"controls.push_to_talk", "controls.chat", "controls.team_chat", "controls.vote_yes", "controls.vote_no",
+	"input.mouse_sensitivity", "input.mouse_vertical_sensitivity", "input.invert_mouse", "input.mouse_aim_assist",
+	"input.stick_vertical_sensitivity",
+	"input.gyro_aim", "input.gyro_zoom_only", "input.gyro_sensitivity_horizontal", "input.gyro_sensitivity_vertical",
+	"input.gyro_invert_horizontal", "input.gyro_invert_vertical",
+};
+#define NUMBER_OF_CONFIG_PROFILE_SETTINGS (sizeof(config_profile_names) / sizeof(config_profile_names[0]))
+
+/* (written at the top of a profile's file, the first time it has one) */
+static const char config_profile_preamble[] =
+	"# This profile's own settings: its keys (Controls Setup), its mouse's and\n"
+	"# its gyroscope's (Gyro Aim). Those not here are config.toml's.\n\n";
+
+/* the profile each local player plays with: its folder, with its
+separator ("" for none), and the settings its file sets */
+static struct
+{
+	char folder[1024];
+	struct config_value values[NUMBER_OF_CONFIG_PROFILE_SETTINGS];
+	unsigned char set[NUMBER_OF_CONFIG_PROFILE_SETTINGS];
+} config_profiles[CONFIG_PROFILE_PLAYERS];
+
+/* the setting's place in config_profile_names, or -1 for one config.toml
+keeps for everyone */
+static int config_profile_slot(long index)
+{
+	size_t slot;
+
+	if (index < 0)
+		return -1;
+	for (slot = 0; slot < NUMBER_OF_CONFIG_PROFILE_SETTINGS; slot++)
+	{
+		if (!strcmp(config_profile_names[slot], config_settings[index].name))
+			return (int)slot;
+	}
+	return -1;
+}
+
+static void config_profile_path(const char *folder, char *path, size_t size)
+{
+	size_t length = strlen(folder);
+	int separated = length && (folder[length - 1] == '/' || folder[length - 1] == '\\');
+
+	snprintf(path, size, "%s%ssettings.toml", folder, separated ? "" : "/");
+}
+
+/* the profile's file's settings into values, those it has marked in set */
+static void config_profile_read(const char *folder, struct config_value *values, unsigned char *set)
+{
+	char path[1100];
+	size_t size = 0, slot;
+	char *text;
+	toml_result_t result;
+
+	memset(set, 0, NUMBER_OF_CONFIG_PROFILE_SETTINGS);
+	config_profile_path(folder, path, sizeof(path));
+	text = config_read_file(path, &size);
+	if (!text)
+		return;
+	result = toml_parse(text, (int)size);
+	if (!result.ok)
+	{
+		platform_log("settings: %s cannot be read (%s); config.toml's are used", path, result.errmsg);
+		toml_free(result);
+		free(text);
+		return;
+	}
+	for (slot = 0; slot < NUMBER_OF_CONFIG_PROFILE_SETTINGS; slot++)
+	{
+		long index = config_setting_index(config_profile_names[slot]);
+		toml_datum_t datum = toml_seek(result.toptab, config_profile_names[slot]);
+		enum config_type type = config_settings[index].type;
+
+		if (datum.type == TOML_UNKNOWN)
+			continue;
+		/* (of its type, as config_set_from_file takes it: otherwise that
+		reports it, and config.toml's is used) */
+		set[slot] = (type == _config_boolean && datum.type == TOML_BOOLEAN) ||
+			(type == _config_integer && datum.type == TOML_INT64) ||
+			(type == _config_real && (datum.type == TOML_FP64 || datum.type == TOML_INT64)) ||
+			(type == _config_string && (datum.type == TOML_STRING || datum.type == TOML_BOOLEAN));
+		/* (a string read before is kept, not freed, as config_set_from_text
+		keeps them) */
+		values[slot].string = NULL;
+		config_set_from_file(&values[slot], &config_settings[index], result.toptab);
+	}
+	toml_free(result);
+	free(text);
+}
+
+/* the player's profile's value of the setting, NULL if it has none (no
+profile, a setting config.toml keeps for everyone or the profile has not
+set, or one its environment variable sets) */
+static const struct config_value *config_profile_value(int player, long index)
+{
+	int slot = config_profile_slot(index);
+
+	if (player < 0 || player >= CONFIG_PROFILE_PLAYERS || slot < 0 || !config_profiles[player].folder[0] ||
+		!config_profiles[player].set[slot] || config_environment(&config_settings[index]))
+	{
+		return NULL;
+	}
+	return &config_profiles[player].values[slot];
+}
+
+static int config_same_folder(const char *a, const char *b)
+{
+	return a && b && *a && !strcmp(a, b);
+}
+
+/* (with config_lock held) the setting written into the profile's file, and
+set for the players playing with it */
+static int config_profile_write_locked(const char *folder, long index, const char *value)
+{
+	int slot = config_profile_slot(index);
+	struct config_value written = { 0, 0, 0.0, NULL };
+	char path[1100];
+	char *line_text;
+	int player, succeeded;
+
+	config_set_from_text(&written, config_settings[index].type, value);
+	for (player = 0; player < CONFIG_PROFILE_PLAYERS; player++)
+	{
+		if (config_same_folder(config_profiles[player].folder, folder))
+		{
+			config_profiles[player].values[slot] = written;
+			config_profiles[player].set[slot] = 1;
+		}
+	}
+	config_change_count++;
+	if (config_answer_only)
+		return 1;
+	line_text = config_value_line(index, &written);
+	config_profile_path(folder, path, sizeof(path));
+	succeeded = line_text && config_file_set_line(path, index, line_text, config_profile_preamble);
+	if (!succeeded)
+		platform_log("settings: cannot write %s", path);
+	free(line_text);
+	return succeeded;
+}
+
+int config_setting_per_profile(const char *name)
+{
+	return config_profile_slot(config_setting_index(name)) >= 0;
+}
+
+void config_profile_use(int player, const char *folder)
+{
+	if (player < 0 || player >= CONFIG_PROFILE_PLAYERS)
+		return;
+	config_ensure_loaded();
+	pthread_mutex_lock(&config_lock);
+	if (folder && *folder)
+	{
+		snprintf(config_profiles[player].folder, sizeof(config_profiles[player].folder), "%s", folder);
+		config_profile_read(folder, config_profiles[player].values, config_profiles[player].set);
+	}
+	else
+	{
+		config_profiles[player].folder[0] = 0;
+		memset(config_profiles[player].set, 0, sizeof(config_profiles[player].set));
+	}
+	config_change_count++;
+	pthread_mutex_unlock(&config_lock);
+}
+
+int config_profile_text(const char *folder, const char *name, char *text, size_t size)
+{
+	long index = config_setting_index(name);
+	int slot = config_profile_slot(index);
+	struct config_value values[NUMBER_OF_CONFIG_PROFILE_SETTINGS];
+	unsigned char set[NUMBER_OF_CONFIG_PROFILE_SETTINGS];
+
+	size_t each;
+
+	if (index < 0)
+		return 0;
+	config_ensure_loaded();
+	if (slot < 0 || !folder || !*folder || config_environment(&config_settings[index]))
+	{
+		config_value_text(index, &config_values[index], text, size);
+		return 1;
+	}
+	memset(values, 0, sizeof(values));
+	config_profile_read(folder, values, set);
+	config_value_text(index, set[slot] ? &values[slot] : &config_values[index], text, size);
+	for (each = 0; each < NUMBER_OF_CONFIG_PROFILE_SETTINGS; each++)
+		free(values[each].string);
+	return 1;
+}
+
+int config_profile_write(const char *folder, const char *name, const char *value)
+{
+	long index = config_setting_index(name);
+	int succeeded;
+
+	if (config_profile_slot(index) < 0 || !folder || !*folder)
+		return config_write(name, value);
+	if (strlen(value) > (config_settings[index].type == _config_string ? CONFIG_MAXIMUM_WRITTEN_STRING : 256))
+		return 0;
+	config_ensure_loaded();
+	pthread_mutex_lock(&config_lock);
+	succeeded = config_profile_write_locked(folder, index, value);
+	pthread_mutex_unlock(&config_lock);
+	return succeeded;
+}
+
+static const struct config_value *config_player_value(int player, const char *name, enum config_type type)
+{
+	const struct config_value *base = config_value(name, type);
+	long index = config_setting_index(name);
+	const struct config_value *own;
+
+	if (index < 0 || config_settings[index].type != type)
+		return base;
+	own = config_profile_value(player, index);
+	return own ? own : &config_values[index];
+}
+
+int config_player_boolean(int player, const char *name)
+{
+	return config_player_value(player, name, _config_boolean)->boolean;
+}
+
+double config_player_real(int player, const char *name)
+{
+	return config_player_value(player, name, _config_real)->real;
+}
+
+const char *config_player_string(int player, const char *name)
+{
+	const char *string = config_player_value(player, name, _config_string)->string;
+
+	return string ? string : "";
+}
+
+/* sets a setting, for now and in config.toml, from its value as text
+("true", "60", "1.5", "all"): its line there is changed (or added), the rest
+of the file kept as it is. A setting each profile keeps (config_setting_per_profile)
+goes into player 1's profile's instead, while it plays with one */
+int config_write(const char *name, const char *value)
+{
+	const char *dot = strchr(name, '.');
+	long index = config_setting_index(name);
+	char path[1024];
+	char *line_text;
+	int succeeded;
+
+	/* (a string as long as a server's rotation, server_rotation.h's
+	SERVER_ROTATION_MAXIMUM_TEXT; any other value is a word or a number) */
+	if (index < 0 || !dot || (size_t)(dot - name) >= 64 ||
+		strlen(value) > (config_settings[index].type == _config_string ? CONFIG_MAXIMUM_WRITTEN_STRING : 256))
+	{
+		return 0;
+	}
+	/* (the file read first, as the other settings are) */
+	config_value(name, config_settings[index].type);
+	pthread_mutex_lock(&config_lock);
+	if (config_profile_slot(index) >= 0 && config_profiles[0].folder[0])
+	{
+		succeeded = config_profile_write_locked(config_profiles[0].folder, index, value);
+		pthread_mutex_unlock(&config_lock);
+		return succeeded;
+	}
+	config_set_from_text(&config_values[index], config_settings[index].type, value);
+	/* (a run that only answers its command line, a probe's too, writes
+	nothing: the value is this run's alone) */
+	if (config_answer_only)
+	{
+		config_change_count++;
+		pthread_mutex_unlock(&config_lock);
+		return 1;
+	}
+	line_text = config_value_line(index, &config_values[index]);
+	config_path(path, sizeof(path));
+	succeeded = line_text && config_file_set_line(path, index, line_text, NULL);
+	config_change_count++;
+	pthread_mutex_unlock(&config_lock);
+	free(line_text);
+	return succeeded;
+}
+
+int config_write_boolean(const char *name, int value)
+{
+	long index = config_setting_index(name);
+
+	return index >= 0 && config_settings[index].type == _config_boolean && config_write(name, value ? "true" : "false");
+}
+
+/* sets a setting as config_write does, from its value as config.toml writes it ("true", "4096", "1.5", "\"900\"": a
+string in double quotes, or bare); 0, with why in error, for no such setting or a value not of its type (the overlay
+menu's "config <setting> <value>": port/linux/game/overlay_menu.c) */
+int config_set_text(const char *name, const char *value, char *error, size_t error_size)
+{
+	long index = config_setting_index(name);
+	char text[260];
+	size_t length = strlen(value);
+	char *end = NULL;
+
+	if (index < 0)
+	{
+		snprintf(error, error_size, "no such setting: %s", name);
+		return 0;
+	}
+	if (length >= sizeof(text))
+	{
+		snprintf(error, error_size, "the value is too long");
+		return 0;
+	}
+	/* (a TOML string's quotes taken off; the escapes it may have are not written by the game's own file) */
+	if (length >= 2 && value[0] == '"' && value[length - 1] == '"')
+		snprintf(text, sizeof(text), "%.*s", (int)(length - 2), value + 1);
+	else
+		snprintf(text, sizeof(text), "%s", value);
+	switch (config_settings[index].type)
+	{
+	case _config_boolean:
+		if (!strcmp(text, "on") || !strcmp(text, "1"))
+			snprintf(text, sizeof(text), "true");
+		else if (!strcmp(text, "off") || !strcmp(text, "0"))
+			snprintf(text, sizeof(text), "false");
+		if (strcmp(text, "true") && strcmp(text, "false"))
+		{
+			snprintf(error, error_size, "%s is true or false, not %s", name, value);
+			return 0;
+		}
+		break;
+	case _config_integer:
+		(void)strtol(text, &end, 10);
+		if (!*text || *end)
+		{
+			snprintf(error, error_size, "%s is a whole number, not %s", name, value);
+			return 0;
+		}
+		break;
+	case _config_real:
+		(void)strtod(text, &end);
+		if (!*text || *end)
+		{
+			snprintf(error, error_size, "%s is a number, not %s", name, value);
+			return 0;
+		}
+		break;
+	case _config_string:
+		break;
+	}
+	if (!config_write(name, text))
+	{
+		snprintf(error, error_size, "%s could not be saved to config.toml", name);
+		return 0;
+	}
+	return 1;
+}
+
+/* the value as text ("true", "60", "1.5", "all") */
+static void config_value_text(long index, const struct config_value *value, char *text, size_t size)
+{
+	switch (config_settings[index].type)
+	{
+	case _config_boolean:
+		snprintf(text, size, "%s", value->boolean ? "true" : "false");
+		break;
+	case _config_integer:
+		snprintf(text, size, "%ld", value->integer);
+		break;
+	case _config_real:
+		snprintf(text, size, "%.15g", value->real);
+		break;
+	case _config_string:
+		snprintf(text, size, "%s", value->string ? value->string : "");
+		break;
+	}
+}
+
+/* a setting's value as text ("true", "60", "1.5", "all"): 0 if there is no
+such setting */
+int config_text(const char *name, char *text, size_t size)
+{
+	long index = config_setting_index(name);
+
+	if (index < 0)
+		return 0;
+	config_value_text(index, config_value(name, config_settings[index].type), text, size);
+	return 1;
+}
+
+void config_folder(char *path, size_t size)
+{
+	char file[1024];
+	char *separator;
+
+	config_path(file, sizeof(file));
+	separator = strrchr(file, '/');
+#ifndef HALO_ANDROID
+	if (!separator || (strrchr(file, '\\') && strrchr(file, '\\') > separator))
+		separator = strrchr(file, '\\');
+#endif
+	if (separator)
+		separator[1] = 0;
+	else
+		file[0] = 0;
+	snprintf(path, size, "%s", file);
+}
+
+/* ---------- public code */
+
+char *config_file_read(const char *path, size_t *size)
+{
+	return config_read_file(path, size);
+}
+
+unsigned long config_changes(void)
+{
+	return config_change_count;
+}
+
+int config_override(const char *name, const char *value)
+{
+	long index = config_setting_index(name);
+
+	if (index < 0 || !value || strlen(value) > CONFIG_VALUE_MAXIMUM)
+		return 0;
+	/* (the file read first, so that loading it later does not undo this) */
+	config_value(name, config_settings[index].type);
+	pthread_mutex_lock(&config_lock);
+	config_set_from_text(&config_overrides[index], config_settings[index].type, value);
+	config_overridden[index] = 1;
+	config_change_count++;
+	pthread_mutex_unlock(&config_lock);
+	return 1;
+}
+
+void config_overrides_clear(void)
+{
+	size_t index;
+	int any = 0;
+
+	pthread_mutex_lock(&config_lock);
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		if (config_overridden[index])
+		{
+			config_overridden[index] = 0;
+			any = 1;
+		}
+	}
+	if (any)
+		config_change_count++;
+	pthread_mutex_unlock(&config_lock);
+}
+
+int config_server_mode_enabled(void)
+{
+	config_value("server.enabled", _config_boolean);
+	return config_server_mode;
+}
+
+int config_setting_info(int index, struct config_setting_info *info)
+{
+	static const char *const types[] = { "boolean", "integer", "real", "string" };
+	const struct config_setting *setting;
+	const char *environment;
+
+	if (index < 0 || (size_t)index >= NUMBER_OF_CONFIG_SETTINGS)
+		return 0;
+	setting = &config_settings[index];
+	memset(info, 0, sizeof(*info));
+	info->name = setting->name;
+	info->type = types[setting->type];
+	info->environment = setting->environment;
+	info->comment = setting->comment;
+	config_default(setting->name, info->default_text, sizeof(info->default_text));
+	environment = config_environment(setting);
+	info->pinned = environment && (setting->environment_style == _environment_value || config_environment_set(environment));
+	info->written = (setting->platforms & CONFIG_PLATFORM) != 0;
+	return 1;
+}
+
+int config_reload(const char *prefix)
+{
+	char path[1024];
+	size_t size = 0;
+	size_t length = strlen(prefix);
+	char *text;
+	toml_result_t result;
+	size_t index;
+
+	config_ensure_loaded();
+	config_path(path, sizeof(path));
+	text = config_read_file(path, &size);
+	if (!text)
+		return 0;
+	result = toml_parse(text, (int)size);
+	if (!result.ok)
+	{
+		platform_log("settings: %s cannot be read again (%s); the settings stay as they were", path, result.errmsg);
+		toml_free(result);
+		free(text);
+		return 0;
+	}
+	pthread_mutex_lock(&config_lock);
+	for (index = 0; index < NUMBER_OF_CONFIG_SETTINGS; index++)
+	{
+		const struct config_setting *setting = &config_settings[index];
+		const char *environment = config_environment(setting);
+		struct config_value value;
+
+		/* (the setting's own: those of the environment stay its) */
+		if (strncmp(setting->name, prefix, length) ||
+			(environment && (setting->environment_style == _environment_value || config_environment_set(environment))))
+		{
+			continue;
+		}
+		memset(&value, 0, sizeof(value));
+		if (setting->type == _config_string)
+		{
+			size_t default_length = strlen(setting->default_value);
+
+			value.string = default_length >= 2 ? config_copy(setting->default_value + 1, default_length - 2) : strdup("");
+		}
+		else
+		{
+			config_set_from_text(&value, setting->type, setting->default_value);
+		}
+		config_set_from_file(&value, setting, result.toptab);
+		/* (the old string kept, as config_set_from_text keeps it) */
+		config_values[index] = value;
+	}
+#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
+	/* (what the run forces, forced again: a server started by --server
+	stays one whatever the file's server.enabled says, and its router asked
+	as its server.upnp now says) */
+	if (config_server_mode)
+		config_apply_server_mode();
+	else if (config_probe_mode)
+		config_apply_probe_mode();
+#endif
+	config_change_count++;
+	pthread_mutex_unlock(&config_lock);
+	toml_free(result);
+	free(text);
+	config_check_words();
+	return 1;
+}
+
+int config_default(const char *name, char *text, size_t size)
+{
+	long index = config_setting_index(name);
+	const char *value;
+	size_t length;
+
+	if (index < 0)
+		return 0;
+	value = config_settings[index].default_value;
+	length = strlen(value);
+	/* (a string's without its quotes: the defaults have no escapes) */
+	if (config_settings[index].type == _config_string && length >= 2 && value[0] == '"')
+	{
+		value++;
+		length -= 2;
+	}
+	snprintf(text, size, "%.*s", (int)length, value);
+	return 1;
+}
+
+int config_boolean(const char *name)
+{
+	return config_value(name, _config_boolean)->boolean;
+}
+
+int halo_fixed_step(void)
+{
+	static int fixed_step = -1;
+
+	if (fixed_step < 0)
+		fixed_step = config_boolean("debug.fixed_step") != 0;
+	return fixed_step;
+}
+
+long config_integer(const char *name)
+{
+	return config_value(name, _config_integer)->integer;
+}
+
+unsigned long network_client_timeout_milliseconds(void)
+{
+	long seconds = config_integer("network.client_timeout_seconds");
+
+	if (seconds < 5)
+		seconds = 5;
+	if (seconds > 300)
+		seconds = 300;
+	return (unsigned long)seconds * 1000UL;
+}
+
+double config_real(const char *name)
+{
+	return config_value(name, _config_real)->real;
+}
+
+const char *config_string(const char *name)
+{
+	const char *string = config_value(name, _config_string)->string;
+
+	return string ? string : "";
+}
+
+#ifdef HALO_CONFIG_SECTIONS_TEST
+/* tools/test_linux_port.py compiles this file with these defined and runs
+it. Not part of the game. */
+
+void platform_log(const char *format, ...)
+{
+	(void)format;
+}
+
+#ifdef HALO_SWITCH
+void host_storage_commit(void)
+{
+}
+#endif
+
+static int config_header_count(const char *text, const char *header)
+{
+	int count = 0;
+	const char *line;
+
+	for (line = text; *line; )
+	{
+		const char *end = line + strcspn(line, "\n");
+		const char *next = *end ? end + 1 : end;
+		char name[64];
+
+		if (config_line_section(line, end, name, sizeof(name)) && !strcmp(name, header))
+			count++;
+		line = next;
+	}
+	return count;
+}
+
+static int config_fail(const char *message)
+{
+	fprintf(stderr, "%s\n", message);
+	return 1;
+}
+
+int main(void)
+{
+	char *defaults;
+	char *repaired;
+	toml_result_t parsed;
+	toml_datum_t aim;
+	static const char duplicated[] =
+		"[display]\n"
+		"fov = 0.0\n"
+		"\n"
+		"[input]\n"
+		"touch_controls = \"auto\"\n"
+		"\n"
+		"[game]\n"
+		"custom_edition = true\n"
+		"\n"
+		"[display]\n"
+		"viewmodel_shield = false\n"
+		"\n"
+		"[input]\n"
+		"gyro_aim = true\n"
+		"\n"
+		"[debug]\n"
+		"profiler = false\n"
+		"\n"
+		"[debug]\n"
+		"profile_hz = 500\n";
+	static const char earlier_wins[] =
+		"[input]\n"
+		"gyro_aim = true\n"
+		"\n"
+		"[input]\n"
+		"gyro_aim = false\n";
+	static const char broken[] =
+		"[input]\n"
+		"gyro_aim = \"unterminated\n";
+	static const char still_broken[] =
+		"[input]\n"
+		"gyro_aim = \"unterminated\n"
+		"[display]\n"
+		"fov = 0.0\n"
+		"[input]\n"
+		"touch_controls = \"auto\"\n";
+
+	defaults = config_default_text();
+	if (!defaults)
+		return config_fail("no default text");
+	if (config_header_count(defaults, "display") != 1 ||
+		config_header_count(defaults, "input") != 1 ||
+		config_header_count(defaults, "debug") != 1)
+		return config_fail("default file repeats a section");
+	parsed = toml_parse(defaults, (int)strlen(defaults));
+	if (!parsed.ok)
+		return config_fail(parsed.errmsg);
+	aim = toml_seek(parsed.toptab, "input.gyro_aim");
+	if (aim.type != TOML_STRING || strcmp(aim.u.s, "false"))
+		return config_fail("default gyro_aim is not \"false\"");
+	toml_free(parsed);
+	free(defaults);
+
+	repaired = config_repair_repeated_sections(duplicated, &parsed);
+	if (!repaired)
+		return config_fail("duplicated sections were not joined");
+	if (config_header_count(repaired, "display") != 1 ||
+		config_header_count(repaired, "input") != 1 ||
+		config_header_count(repaired, "debug") != 1)
+		return config_fail("joined file repeats a section");
+	aim = toml_seek(parsed.toptab, "input.gyro_aim");
+	if (aim.type != TOML_BOOLEAN || !aim.u.boolean)
+		return config_fail("saved gyro_aim was not kept");
+	if (toml_seek(parsed.toptab, "display.viewmodel_shield").type == TOML_UNKNOWN)
+		return config_fail("a display key stayed in the wrong section");
+	toml_free(parsed);
+	free(repaired);
+
+	repaired = config_repair_repeated_sections(earlier_wins, &parsed);
+	if (!repaired)
+		return config_fail("a repeated key was not joined");
+	aim = toml_seek(parsed.toptab, "input.gyro_aim");
+	if (aim.type != TOML_BOOLEAN || !aim.u.boolean)
+		return config_fail("the earlier gyro_aim was not kept");
+	toml_free(parsed);
+	free(repaired);
+
+	if (config_repair_repeated_sections(broken, &parsed))
+		return config_fail("a file with no repeated section was rewritten");
+	if (config_repair_repeated_sections(still_broken, &parsed))
+		return config_fail("a file that still does not parse was rewritten");
+
+	/* a value cut short: that line set aside, the rest read */
+	{
+		static const char cut_short[] =
+			"[display]\n"
+			"fov = 90.0\n"
+			"[input]\n"
+			"gyro_sensitivity_horizontal =\n"
+			"gyro_aim = \"zoom\"\n";
+		int line;
+
+		parsed = toml_parse(cut_short, (int)strlen(cut_short));
+		if (parsed.ok)
+			return config_fail("a value cut short parsed");
+		{
+			char message[200];
+
+			snprintf(message, sizeof(message), "%s", parsed.errmsg);
+			toml_free(parsed);
+			repaired = config_repair_unreadable_lines(cut_short, message, &parsed, &line);
+		}
+		if (!repaired)
+			return config_fail("a file with a value cut short was not read");
+		if (line != 4 || !strstr(repaired, "# (unreadable, set aside) gyro_sensitivity_horizontal ="))
+			return config_fail("the line cut short was not the one set aside");
+		aim = toml_seek(parsed.toptab, "input.gyro_aim");
+		if (aim.type != TOML_STRING || strcmp(aim.u.s, "zoom"))
+			return config_fail("a setting after the line cut short was lost");
+		aim = toml_seek(parsed.toptab, "display.fov");
+		if (aim.type != TOML_FP64 || aim.u.fp64 != 90.0)
+			return config_fail("a setting before the line cut short was lost");
+		toml_free(parsed);
+		free(repaired);
+	}
+
+	/* a profile's own settings: its file's over config.toml's, written there
+	while player 1 plays with it, and config.toml's where it has none */
+	{
+		char root[] = "/tmp/halo_config_profileXXXXXX";
+		char profile[64], path[128], text[64];
+		char *written;
+		size_t size;
+
+		if (!mkdtemp(root))
+			return config_fail("no folder for the profile test");
+		setenv("HALO_DATA_ROOT", root, 1);
+		unsetenv("HALO_GYRO_SENSITIVITY_HORIZONTAL");
+		snprintf(profile, sizeof(profile), "%s/profile/", root);
+		mkdir(profile, 0700);
+		if (!config_setting_per_profile("controls.jump") || config_setting_per_profile("display.fov") ||
+			config_setting_per_profile("controls.nintendo_menu_buttons"))
+			return config_fail("the wrong settings are a profile's");
+		config_profile_use(0, profile);
+		if (config_real("input.gyro_sensitivity_horizontal") != 1.0)
+			return config_fail("a profile with no file did not take config.toml's");
+		if (!config_write("input.gyro_sensitivity_horizontal", "2.5") ||
+			config_real("input.gyro_sensitivity_horizontal") != 2.5)
+			return config_fail("player 1's profile's setting was not written");
+		if (config_player_real(1, "input.gyro_sensitivity_horizontal") != 1.0)
+			return config_fail("player 2, with no profile, did not keep config.toml's");
+		config_profile_text(NULL, "input.gyro_sensitivity_horizontal", text, sizeof(text));
+		if (strcmp(text, "1"))
+			return config_fail("config.toml's was written over");
+		config_profile_text(profile, "controls.jump", text, sizeof(text));
+		if (strcmp(text, "Space"))
+			return config_fail("a key the profile has not set is not config.toml's");
+		config_profile_use(1, profile);
+		if (config_player_real(1, "input.gyro_sensitivity_horizontal") != 2.5)
+			return config_fail("the profile's file was not read");
+		if (!config_profile_write(profile, "controls.jump", "J") || strcmp(config_player_string(1, "controls.jump"), "J") ||
+			strcmp(config_string("controls.jump"), "J"))
+			return config_fail("a write to the profile did not reach its players");
+		snprintf(path, sizeof(path), "%ssettings.toml", profile);
+		written = config_read_file(path, &size);
+		if (!written || strncmp(written, "# This profile's own settings", 29) ||
+			!strstr(written, "[input]\ngyro_sensitivity_horizontal = 2.5\n") || !strstr(written, "[controls]\njump = \"J\"\n"))
+			return config_fail(written ? written : "the profile's file was not written");
+		parsed = toml_parse(written, (int)size);
+		if (!parsed.ok)
+			return config_fail("the profile's file does not parse");
+		toml_free(parsed);
+		free(written);
+		config_profile_use(0, NULL);
+		if (config_real("input.gyro_sensitivity_horizontal") != 1.0)
+			return config_fail("no profile did not go back to config.toml's");
+	}
+	printf("PASS\n");
+	return 0;
+}
+#endif

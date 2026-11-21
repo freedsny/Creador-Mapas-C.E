@@ -1,0 +1,85 @@
+plugins {
+    id "com.android.application"
+}
+
+// The bridge: the last update of the old app, com.halo.decomp (OpenCE's id, which the game had up to build 141).
+//
+// The apps up to build 141 update to whatever a release's halo-android-*.zip holds (their Updater.java), which from
+// build 142 on is this, not the game (tools/release.py). Installed over the old app, it keeps its files, and:
+// - downloads the release's game, com.halo.contentevolved (halo-contentevolved-*.zip), and hands it to the package
+//   installer (BridgeActivity);
+// - serves the old app's files, read-only, to an app signed with its key (MigrationProvider), which the game copies on
+//   its first start (app/.../Migration.java) before it offers to uninstall this.
+//
+// Its version code is above every old build's, and stays the same from release to release: the same bridge ships in
+// each, for the players who update late. Raise it (by one) only for a bridge that changed.
+
+def signingKey = System.getenv("HALO_ANDROID_KEYSTORE")
+def applicationIdSuffix = System.getenv("HALO_APPLICATION_ID_SUFFIX") ?: ""
+def newPackage = "com.halo.contentevolved" + applicationIdSuffix
+
+// the game's launcher icon (tools/app_icon.py writes it into app/src/main/res), copied
+def iconResources = new File(projectDir, "build/generated/res/icon")
+def gameResources = new File(rootDir, "app/src/main/res")
+gameResources.eachDirMatch(~/mipmap-.*|drawable/) { folder ->
+    def into = new File(iconResources, folder.name)
+    into.mkdirs()
+    folder.eachFile { file ->
+        if (file.name.startsWith("ic_launcher"))
+            new File(into, file.name).bytes = file.bytes
+    }
+}
+
+android {
+    namespace "com.halo.bridge"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.halo.decomp" + applicationIdSuffix
+        minSdk 28
+        targetSdk 35
+        versionCode 1000000
+        versionName "bridge 1"
+        buildConfigField "String", "NEW_PACKAGE", "\"${newPackage}\""
+        manifestPlaceholders = [newPackage: newPackage]
+    }
+
+    sourceSets {
+        main {
+            res.srcDirs += iconResources
+        }
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    signingConfigs {
+        if (signingKey) {
+            halo {
+                storeFile file(signingKey)
+                storePassword System.getenv("HALO_ANDROID_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("HALO_ANDROID_KEY_ALIAS") ?: "halo"
+                keyPassword System.getenv("HALO_ANDROID_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
+    // signed as the game is (app/build.gradle), so that it installs over the old app and the game may read its files
+    buildTypes {
+        debug {
+            debuggable true
+            minifyEnabled false
+            signingConfig signingKey ? signingConfigs.halo : signingConfigs.debug
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingKey ? signingConfigs.halo : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

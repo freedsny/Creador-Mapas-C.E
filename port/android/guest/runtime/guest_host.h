@@ -1,0 +1,326 @@
+/*
+GUEST_HOST.H
+
+The host services the guest imports (the guest's view; the host defines
+them in port/android/host). Every name here must also be listed in
+port/android/host_imports.list, or for the Android app's own (the last two
+sections) in port/android/android_imports.list, or for the Switch's own in
+port/switch/host_imports.list; the lists generate the import stubs, and
+tools/check_host_imports.py checks them against this file.
+
+Parameter types follow the rules in halo_android_abi.h: 32-bit values are
+int or unsigned int, 64-bit values long long, and pointers are passed as
+they are.
+*/
+
+#ifndef __GUEST_HOST_H
+#define __GUEST_HOST_H
+
+/* ---------- process */
+
+/* performs a Linux system call on the guest's behalf, converting the
+structures whose layout differs; returns the raw result (-errno on failure) */
+long long host_syscall(long long number, long long a, long long b, long long c,
+	long long d, long long e, long long f);
+
+/* Android log priorities (android/log.h) */
+void host_log(int priority, const char *text);
+void host_abort(const char *reason) __attribute__((noreturn));
+void host_exit(int code) __attribute__((noreturn));
+/* the host's errno on this thread, after a call to a host function */
+int host_errno(void);
+
+/* ---------- threads
+
+The guest's thread pointer (its struct pthread) is kept by the host for
+each thread. */
+
+unsigned int host_get_tp(void);
+void host_set_tp(unsigned int thread);
+/* starts a host thread with a stack in guest memory that calls the image's
+__guest_thread_start(thread); returns 0 or an errno value */
+int host_thread_create(unsigned int thread, unsigned int stack_size);
+
+/* MCC tag address space (host_mcc_memory.c), independent of the guest pools.
+Reserve returns the address or negative errno; release returns zero or negative errno. */
+long long host_mcc_memory_reserve(unsigned int address, unsigned int size);
+int host_mcc_memory_release(unsigned int address, unsigned int size);
+
+/* ---------- memory write tracking (port/linux/src/memory_watch.c) */
+
+void host_memory_watch_initialize(void);
+void host_memory_watch_protect(unsigned int address, unsigned int size);
+unsigned int host_memory_watch_generation(unsigned int address, unsigned int size);
+unsigned int host_memory_watch_serial(void);
+void host_memory_watch_prepare_write(unsigned int address, unsigned int size);
+void host_memory_watch_forget(unsigned int address, unsigned int size);
+/* memory_watch_begin_frame (port/linux/src/platform.h) */
+void host_memory_watch_begin_frame(void);
+
+/* ---------- SDL (guest/runtime/guest_sdl.c)
+
+Window, context, gamepad and audio stream objects are small integer
+handles on this side. */
+
+int host_sdl_init(unsigned int flags);
+int host_sdl_set_hint(const char *name, const char *value);
+void host_sdl_get_error(char *buffer, unsigned int size);
+long long host_sdl_ticks(void);
+long long host_sdl_thread_id(void);
+unsigned int host_sdl_create_window(const char *title, int width, int height, long long flags);
+void host_sdl_window_size_in_pixels(unsigned int window, int *width, int *height);
+int host_sdl_set_relative_mouse(unsigned int window, int enabled);
+int host_sdl_gl_set_attribute(int attribute, int value);
+unsigned int host_sdl_gl_create_context(unsigned int window);
+int host_sdl_gl_make_current(unsigned int window, unsigned int context);
+int host_sdl_gl_set_swap_interval(int interval);
+int host_sdl_gl_swap_window(unsigned int window);
+int host_sdl_poll_event(void *event);
+/* text input for the window (Android's keyboard while a name is typed:
+sdl_platform.c): the game's text bar above the keyboard (TextBar.java), or
+SDL's own hidden field with no autocorrection, for the SDL_TextInputType
+given, or stopped (-1); whether it runs */
+int host_sdl_text_input(unsigned int window, int type);
+int host_sdl_set_clipboard_text(const char *text);
+void host_sdl_get_clipboard_text(char *buffer, unsigned int size);
+int host_sdl_open_url(const char *url);
+/* the keyboard's keys by name (the controls' bindings, xinput_sdl.c) */
+void host_sdl_scancode_name(int scancode, char *buffer, unsigned int size);
+int host_sdl_scancode_from_name(const char *name);
+int host_sdl_show_toast(const char *message, int duration, int gravity, int x, int y);
+int host_sdl_show_simple_message_box(unsigned int flags, const char *title, const char *message);
+/* SDL_ShowMessageBox: the question as guest_sdl.c's struct message_box (the
+host's struct host_message_box), since SDL_MessageBoxData has not the
+guest's layout and a call of seven arguments would put a pointer on the
+stack; 1 and the button chosen in the structure, else 0 */
+int host_sdl_show_message_box(void *box);
+int host_sdl_get_gamepads(unsigned int *ids, int capacity);
+unsigned int host_sdl_open_gamepad(unsigned int id);
+unsigned int host_sdl_gamepad_from_id(unsigned int id);
+int host_sdl_gamepad_axis(unsigned int gamepad, int axis);
+int host_sdl_gamepad_button(unsigned int gamepad, int button);
+int host_sdl_gamepad_type(unsigned int gamepad);
+int host_sdl_rumble_gamepad(unsigned int gamepad, unsigned int low, unsigned int high, unsigned int milliseconds);
+/* the controller's turn since the last call, in radians, into yaw and pitch
+(0 for one without a gyroscope): the Switch's (libnx), the PS5's (scePad),
+Android's and Linux's (SDL's gamepad sensors: port/android/host/host_sdl.c) */
+void host_sdl_gamepad_gyro(unsigned int gamepad, float *yaw, float *pitch);
+void host_sdl_close_gamepad(unsigned int gamepad);
+/* callback: void (*)(void *userdata, unsigned int stream, int additional, int total),
+called on the audio thread */
+unsigned int host_sdl_open_audio_stream(unsigned int device, const void *spec, unsigned int callback, unsigned int userdata);
+int host_sdl_put_audio_stream_data(unsigned int stream, const void *data, int length);
+int host_sdl_resume_audio_stream_device(unsigned int stream);
+/* (voice chat's microphone, a stream without a callback) */
+int host_sdl_get_audio_stream_data(unsigned int stream, void *data, int length);
+int host_sdl_get_audio_stream_available(unsigned int stream);
+void host_sdl_destroy_audio_stream(unsigned int stream);
+
+/* ---------- OpenGL ES */
+
+/* copies glGetString(name) (or glGetStringi when index >= 0) */
+void host_gl_get_string(unsigned int name, int index, char *buffer, unsigned int size);
+/* nonzero if the context supports the named extension */
+int host_gl_has_extension(const char *name);
+/* copies size bytes at offset of a GL buffer object into data, waiting for
+the GPU's writes to it */
+void host_gl_read_buffer(unsigned int buffer, unsigned int offset, unsigned int size, void *data);
+/* unsynchronized write into the buffer bound to target */
+void host_gl_buffer_write(unsigned int target, unsigned int offset, unsigned int size, const void *data);
+/* fences the GPU work queued so far as that of ring slot `slot`; waits for
+the GPU to finish the work last fenced for a slot */
+void host_gl_fence_frame(unsigned int slot);
+void host_gl_wait_frame(unsigned int slot);
+
+/* ---------- HTTPS (guest/runtime/guest_https.c: update.h's update_request,
+the community server's requests; port/android/host/host_https.c, and the
+Switch's own port/switch/host/host_https.c) */
+
+/* one request, as update_request has it (post: POST, else GET), in six
+arguments (x86-64's registers): the answer's status, else 0 and why in
+response */
+int host_https_request(int post, const char *url, const char *headers, const char *body, char *response,
+	int response_size);
+
+/* ---------- Android (android_imports.list) */
+
+/* SoC classification for the immutable rendering policy. */
+int host_android_chip_family(void);
+
+/* the storage directories the port uses, copied into buffer */
+void host_android_path(int which, char *buffer, unsigned int size);
+
+/* the edges where Android keeps its gestures, as left, top, right, bottom
+in pixels of the current orientation, into insets[4]; all 0 when unknown */
+void host_gesture_insets(int *insets);
+
+/* Settings > Gameplay's CUSTOM MAPS FOLDER (menu_functions.c): Android's
+folder picker opened, 1, else 0; then, asked each frame, 0 while it is open,
+1 with the folder chosen (a path, NUL terminated) in buffer, or -1 when it
+was left without one */
+int host_folder_pick_begin(void);
+int host_folder_pick_result(char *buffer, unsigned int size);
+/* the system's folder picker, after which the app copies the replays in
+folder (a path) to the folder chosen (HaloActivity.exportReplays); returns
+at once, the copy done on the app's own thread */
+void host_android_export_replays(const char *folder);
+
+/* the system's file picker, after which the app copies the replays chosen
+into folder (a path; HaloActivity.importReplays); returns at once, the copy
+done on the app's own thread */
+void host_android_import_replays(const char *folder);
+
+/* the system's file picker, after which the app takes each .zip file chosen
+into a folder of its name in folder (a path: the mods folder;
+HaloActivity.importMods); returns at once, the copy done on the app's own
+thread */
+void host_android_import_mods(const char *folder);
+
+/* the system's file picker, after which the app copies each Vulkan driver
+archive chosen (an adrenotools zip) into folder (a path: freedreno_drivers;
+HaloActivity.importVkDrivers); returns at once, the copy done on the app's
+own thread */
+void host_android_import_vk_drivers(const char *folder);
+
+/* the system's file picker, after which the app copies each Custom Edition
+map chosen, or each in a .zip file chosen, into folder (a path: custom_maps;
+HaloActivity.importMaps); returns at once, the copy done on the app's own
+thread */
+void host_android_import_maps(const char *folder);
+/* the game's files moved to the app's storage ("app") or a folder the player
+picks ("other"): the app asks, then starts the game again to move them
+(HaloActivity.moveGameFiles) */
+void host_android_move_game_files(const char *where);
+
+/* ---------- the on-screen touch controls (host_touch.c, android_imports.list) */
+
+/* the overlay's controller: the SDL axes (left x, y, right x, y, left
+trigger, right trigger) and the SDL button bits, into state[7] */
+void host_touch_read(int *state);
+/* the overlay's view swipe, then its gyroscope turn, since the last read,
+into delta[4] */
+void host_touch_look_read(float *delta);
+/* port 0's motors, for the phone's vibration */
+void host_touch_rumble(unsigned int low, unsigned int high);
+/* tells the overlay when to show: touch_input.c's _touch_scene_* */
+void host_touch_scene(int scene);
+/* the game control on each of the 16 controller buttons (touch_game.c),
+for the overlay's labels */
+void host_touch_bindings(const int *controls);
+/* the game's Gyro Aim for the overlay, which runs the phone's gyroscope: 0
+off, 1 on, 2 only while zoomed in */
+void host_touch_gyro_mode(int mode);
+/* the fingers that tap together to open the overlay menu (3 or 4), the
+overlay's General option */
+int host_touch_menu_fingers(void);
+/* the overlay's devices: 1, a touchscreen; 2, a game controller; 0 until it
+has looked */
+int host_touch_devices(void);
+/* a replay's buttons on the screen, for the overlay to press: count of
+them, each five ints (x0, y0, x1, y1 in ten-thousandths of the screen, and
+the game's controller button it holds down) */
+void host_touch_targets(const int *targets, int count);
+
+/* ---------- the server browser's master servers (host_https.c) */
+
+/* host_https_get's buffers' sizes and its answer, 32-bit members alone (the
+hosts' struct host_https_sizes): a call of nine arguments would put pointers
+on the stack */
+struct host_https_sizes
+{
+	int headers_size;
+	int body_capacity;
+	int error_size;
+	/* the answer: its status, and how much of the body came */
+	int status;
+	int body_size;
+};
+/* a GET of an https:// url (port/linux/src/master_list.c): 1 with the
+status, the headers ("Name: value" lines) and up to body_capacity bytes of
+the body (its size in body_size), else 0 and why in error */
+int host_https_get(const char *url, char *headers, char *body, char *error, struct host_https_sizes *sizes);
+
+/* ---------- a replay's records, kept in the host's memory (host_replay.c;
+port/linux/game/network_replay_playback.c) */
+
+/* size bytes at data added to the kept replay's end: 1, or 0 if the host has
+not the memory */
+int host_replay_store_append(unsigned int data, unsigned int size);
+/* up to size bytes of the kept replay from offset copied to destination; how
+many */
+unsigned int host_replay_store_read(unsigned int offset, unsigned int destination, unsigned int size);
+/* the kept replay let go */
+void host_replay_store_free(void);
+/* the map lists' IMPORT, done by the host (port/android/host/host_mcc_import.c, which
+says what each does; the guest's wrappers are port/linux/src/mcc_import.c's) */
+int host_mcc_import_start(unsigned int root, unsigned int custom_maps);
+/* the folder holding mcc_maps (game.mcc.path, else the data root), told once
+as the game starts (port/android/host/host_mcc_hash.c) */
+void host_mcc_root(unsigned int path);
+int host_mcc_import_state(void);
+void host_mcc_import_progress(unsigned int text, unsigned int size);
+int host_mcc_import_question(unsigned int title, unsigned int title_size, unsigned int destination,
+	unsigned int destination_size);
+void host_mcc_import_answer(int question, int replace);
+int host_mcc_import_finish(unsigned int report, unsigned int size);
+/* an MCC map's conversion on the host's threads (port/android/host/host_mcc_convert.c, which says
+what each does; the guest's side is port/linux/game/mcc_convert.c's) */
+int host_mcc_convert_workers(void);
+int host_mcc_convert_submit(unsigned int request);
+int host_mcc_convert_wait(int id, int milliseconds);
+unsigned int host_mcc_convert_output_size(int id);
+void host_mcc_convert_release(int id);
+long long host_mcc_audio_append(int id, unsigned int slot);
+int host_mcc_audio_read(unsigned int slot, unsigned int offset, unsigned int size, unsigned int destination);
+void host_mcc_convert_reset(void);
+/* an MCC package's fingerprint (SHA-256 and CRC32) on the host's threads, with the CPU's
+instructions, and kept on the card (port/android/host/host_mcc_hash.c, which says what each
+does; the guest's side is port/linux/game/mcc_resource_check.inl's) */
+int host_mcc_hash_start(unsigned int request);
+int host_mcc_hash_wait(int id, int milliseconds, unsigned int result);
+void host_mcc_hash_cancel(int id);
+/* a file's plain SHA-256 and size, on the host's threads (an MCC package a host offers) */
+int host_sha256_start(unsigned int path);
+int host_sha256_poll(int id, unsigned int digest, unsigned int size);
+void host_sha256_cancel(int id);
+/* files between two SlipstreamCE machines over a connection of their own
+(port/android/host/host_file_share.h says what each does) */
+int host_fs_host_frame(int hosting, unsigned int limit);
+void host_fs_rate_facts(int in_game, unsigned int game_bytes, unsigned int round_trip);
+unsigned int host_fs_allowance(void);
+int host_fs_serve_begin(unsigned int session, unsigned int token, int count);
+int host_fs_serve_file(unsigned int session, int index, unsigned int path, unsigned int size);
+int host_fs_serve_ready(unsigned int session);
+int host_fs_serve_progress(unsigned int session, unsigned int out);
+void host_fs_serve_end(unsigned int session);
+int host_fs_fetch_begin(unsigned int address, int port, unsigned int session, unsigned int token, int count);
+void host_fs_direct(unsigned int address, int port);
+int host_fs_fetch_file(int index, int file, unsigned int path, unsigned int size, unsigned int sha256);
+int host_fs_fetch_start(void);
+int host_fs_fetch_status(unsigned int out);
+void host_fs_fetch_stop(void);
+int host_fs_pieces_begin(unsigned int address, int port, unsigned int session, unsigned int token);
+int host_fs_pieces_ask(int file, unsigned int offset, unsigned int length, unsigned int hash);
+int host_fs_pieces_take(unsigned int buffer, unsigned int out);
+int host_fs_pieces_state(void);
+void host_fs_pieces_stop(void);
+
+/* an MCC package's fingerprint (SHA-256 and CRC32) on the host's threads, with the CPU's
+instructions, and kept on the card (port/android/host/host_mcc_hash.c, which says what each
+does; the guest's side is port/linux/game/mcc_resource_check.inl's) */
+int host_mcc_hash_start(unsigned int request);
+int host_mcc_hash_wait(int id, int milliseconds, unsigned int result);
+void host_mcc_hash_cancel(int id);
+/* a file's plain SHA-256 and size, on the host's threads (an MCC package a host offers) */
+int host_sha256_start(unsigned int path);
+int host_sha256_poll(int id, unsigned int digest, unsigned int size);
+void host_sha256_cancel(int id);
+/* the Steam sign-in's seal (port/android/host/host_steam_seal.c, which says what each does; the
+Steam client is the guest's, port/linux/src/steam_downloads.c): the app's private folder for its
+session file, and its refresh token sealed and opened with a key of the Android Keystore */
+int host_steam_private_folder(char *folder, int size);
+int host_steam_seal(const char *text, char *out, int out_size);
+int host_steam_unseal(const char *sealed, char *out, int out_size);
+void host_steam_seal_forget(void);
+
+#endif

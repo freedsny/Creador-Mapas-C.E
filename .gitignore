@@ -1,0 +1,54 @@
+# IDE folders
+.idea/
+.vs/
+
+# Caches
+__pycache__
+.mypy_cache
+.cache/
+
+# Build files
+build/
+.ninja_*
+build.ninja
+
+# Generated configs
+compile_commands.json
+
+# The January build and the Xbox SDK (tools/xdk_headers.py reads the
+# build's PDB); never commit
+*.exe
+*.pdb
+xbox/
+!source/**/xbox/
+
+# Locally extracted proprietary game data (never commit)
+assets/
+# (but the high-res assets, drawn for the port: tools/hud_assets.py)
+!port/assets/
+original/
+
+# CI build outputs (tools/ci_build.py)
+dist/
+
+# Reference material kept alongside the tree, not part of it: another Switch
+# port of this game and a third-party homebrew development guide, with their
+# screenshots. Thirteen megabytes of someone else's repository, useful to
+# read and no business in ours.
+reference/
+
+# SPIR-V a glslangValidator run leaves in the current folder (tools/vk_shader_check.py writes under build/)
+/*.spv
+.DS_Store
+
+/maps
+/exports
+/logs
+
+# Release files collected by tools/release.py
+/release/
+
+# a local copy of the web build (build/web/site), not ours to track
+/site/
+# User-supplied Halo 1 MCC maps and resources
+mcc_maps/
