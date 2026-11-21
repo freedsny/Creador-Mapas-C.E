@@ -76,7 +76,7 @@ drag, not a tap; a tap is at most this long */
 Forge acts as a key goes down (one frame), and lets go the next */
 #define FORGE_TOUCH_PULSE_FRAMES 2
 #define FORGE_TOUCH_MAX_FINGERS 5
-#define FORGE_TOUCH_MAX_BUTTONS 32
+#define FORGE_TOUCH_MAX_BUTTONS 64
 /* the quick bar (Minecraft's hotbar): its slots */
 #define FORGE_TOUCH_HOTBAR_SLOTS 9
 /* held this long on one spot over an object, a finger deletes it (as
@@ -88,6 +88,11 @@ Minecraft's breaks a block) */
 1.1: the palette then fills most of the screen's height) */
 #define FORGE_TOUCH_MENU_GROWTH 1.47f
 
+/* the inventory (+ OBJETOS): its columns and rows of objects, and the most it lists of a tab */
+#define FORGE_TOUCH_INVENTORY_COLUMNS 4
+#define FORGE_TOUCH_INVENTORY_ROWS 5
+#define FORGE_TOUCH_INVENTORY_MAX 512
+
 enum
 {
 	_forge_touch_gesture_none = 0,
@@ -97,7 +102,9 @@ enum
 	/* carrying what was under the finger (or what was already held) */
 	_forge_touch_gesture_carry,
 	/* on one of the Forge's buttons */
-	_forge_touch_gesture_button
+	_forge_touch_gesture_button,
+	/* on the inventory: a tap chooses, a drag scrolls */
+	_forge_touch_gesture_inventory
 };
 
 /* the Forge's touch buttons: what each does (forge_touch_press) */
@@ -126,9 +133,15 @@ enum
 	_forge_touch_button_snap,
 	_forge_touch_button_export,
 	_forge_touch_button_clear,
+	_forge_touch_button_inventory_close,
+	_forge_touch_button_inventory_full,
 	NUMBER_OF_FORGE_TOUCH_BUTTONS,
 	/* the quick bar's slots: this plus the slot's index */
-	_forge_touch_button_hotbar = 100
+	_forge_touch_button_hotbar = 100,
+	/* the inventory's tabs: this plus the category */
+	_forge_touch_button_tab = 200,
+	/* the inventory's objects: this plus the place in its list */
+	_forge_touch_button_cell = 300
 };
 
 struct forge_touch_finger
@@ -218,6 +231,22 @@ static struct
 	/* whether a finger has ever been handed over: the touch HUD shows from
 	then on (a desktop's never) */
 	int seen;
+	/* the inventory (Halo Forge Evolved's own, not the Forge's palette):
+	whether it is open, its tab (a category), how far down it is (rows),
+	the list of its tab (catalog indices) and how many each tab has */
+	int inv_open;
+	int inv_tab;
+	float inv_scroll;
+	float inv_scroll_down;
+	int inv_drag;
+	int inv_list[FORGE_TOUCH_INVENTORY_MAX];
+	int inv_count;
+	int inv_list_tab;
+	int inv_list_catalog;
+	int inv_tab_count[NUMBER_OF_FORGE_PALETTE_CATEGORIES];
+	int inv_counts_catalog;
+	/* its grid as last drawn, in shares of the screen */
+	float inv_grid_x0, inv_grid_y0, inv_grid_x1, inv_grid_y1, inv_row_h;
 } s_touch;
 /* (s_touch set up: forge_touch_ready) */
 static int s_touch_ready;
@@ -239,6 +268,10 @@ static void forge_touch_ready(void)
 	s_touch.last_ray_error = -1.0f;
 	s_touch.last_down_live = -1;
 	s_touch.last_down_object = NONE;
+	s_touch.inv_tab = _forge_cat_scenery;
+	s_touch.inv_list_tab = -1;
+	s_touch.inv_list_catalog = -1;
+	s_touch.inv_counts_catalog = -1;
 	s_touch_ready = 1;
 }
 
@@ -510,6 +543,191 @@ static void forge_touch_clear_map(void)
 	forge_set_status("Mapa vaciado: %d objetos quitados (DESHACER no lo devuelve)", removed);
 }
 
+/* ---------- the inventory (+ OBJETOS): Halo Forge Evolved's own, in big
+squares for fingers, as Minecraft's; what is chosen goes to the quick bar, in
+hand */
+
+static void forge_touch_hotbar_note(struct forge_catalog_entry const *entry);
+
+/* its tabs, in order: the categories a tap can put (the rest, as the AI and
+the volumes, stay in the Forge's full list) */
+static struct
+{
+	int category;
+	char const *name;
+} const s_forge_touch_tabs[] = {
+	{ _forge_cat_scenery, "ESCENARIO" },
+	{ _forge_cat_barriers_devices, "BARRERAS" },
+	{ _forge_cat_weapons, "ARMAS" },
+	{ _forge_cat_vehicles, "VEHICULOS" },
+	{ _forge_cat_equipment, "EQUIPO" },
+	{ _forge_cat_spawns, "REAPARICION" },
+	{ _forge_cat_objectives, "OBJETIVOS" },
+	{ _forge_cat_teleporters, "TELEPORTES" },
+	{ _forge_cat_lights, "LUCES" },
+	{ _forge_cat_effects, "EFECTOS" },
+};
+#define FORGE_TOUCH_TAB_COUNT ((int)(sizeof(s_forge_touch_tabs) / sizeof(s_forge_touch_tabs[0])))
+
+/* whether a catalog row is one object a tap can put down as it is (not a
+folder, a menu, an AI, a volume or a KOTH hill, which are placed their own way) */
+static int forge_touch_entry_placeable(struct forge_catalog_entry const *entry)
+{
+	int tab;
+
+	if (!entry || !entry->tag_path[0])
+		return 0;
+	switch (entry->group_tag)
+	{
+	case FORGE_GROUP_FOLDER:
+	case FORGE_GROUP_FF_MENU:
+	case FORGE_GROUP_AI_MENU:
+	case FORGE_GROUP_AI_SPAWN:
+	case FORGE_GROUP_VOLUME:
+	case 'ffsp':
+		return 0;
+	default:
+		break;
+	}
+	if (entry->group_tag == 'flag' && strstr(entry->tag_path, "koth") != NULL)
+		return 0;
+	if (forge_palette_is_ff_preset(entry))
+		return 0;
+	for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
+	{
+		if (s_forge_touch_tabs[tab].category == entry->category)
+			return forge_catalog_entry_allowed(entry);
+	}
+	return 0;
+}
+
+/* a name for a square or a slot: in capitals, its _ as spaces, at most size-1 long */
+static void forge_touch_label(char *out, size_t size, char const *name)
+{
+	size_t n;
+
+	snprintf(out, size, "%s", name ? name : "");
+	for (n = 0; out[n]; n++)
+	{
+		if (out[n] >= 'a' && out[n] <= 'z')
+			out[n] = (char)(out[n] - 'a' + 'A');
+		else if (out[n] == '_')
+			out[n] = ' ';
+	}
+}
+
+/* how many each tab has (again when the catalog changes) */
+static void forge_touch_inventory_counts(void)
+{
+	int i;
+
+	if (s_touch.inv_counts_catalog == g_forge.catalog_count)
+		return;
+	memset(s_touch.inv_tab_count, 0, sizeof(s_touch.inv_tab_count));
+	for (i = 0; i < g_forge.catalog_count; i++)
+	{
+		struct forge_catalog_entry const *entry = &g_forge.catalog[i];
+
+		if (entry->category < NUMBER_OF_FORGE_PALETTE_CATEGORIES && forge_touch_entry_placeable(entry))
+			s_touch.inv_tab_count[entry->category]++;
+	}
+	s_touch.inv_counts_catalog = g_forge.catalog_count;
+}
+
+/* the tab's list: its objects once each (the same tag from two places once) */
+static void forge_touch_inventory_list(void)
+{
+	int i;
+
+	if (s_touch.inv_list_tab == s_touch.inv_tab && s_touch.inv_list_catalog == g_forge.catalog_count)
+		return;
+	s_touch.inv_count = 0;
+	for (i = 0; i < g_forge.catalog_count && s_touch.inv_count < FORGE_TOUCH_INVENTORY_MAX; i++)
+	{
+		struct forge_catalog_entry const *entry = &g_forge.catalog[i];
+		int j, twice = 0;
+
+		if (entry->category != s_touch.inv_tab || !forge_touch_entry_placeable(entry))
+			continue;
+		for (j = 0; j < s_touch.inv_count; j++)
+		{
+			struct forge_catalog_entry const *other = &g_forge.catalog[s_touch.inv_list[j]];
+
+			if (other->group_tag == entry->group_tag && !_stricmp(other->tag_path, entry->tag_path))
+			{
+				twice = 1;
+				break;
+			}
+		}
+		if (!twice)
+			s_touch.inv_list[s_touch.inv_count++] = i;
+	}
+	s_touch.inv_list_tab = s_touch.inv_tab;
+	s_touch.inv_list_catalog = g_forge.catalog_count;
+}
+
+static int forge_touch_inventory_rows(void)
+{
+	return (s_touch.inv_count + FORGE_TOUCH_INVENTORY_COLUMNS - 1) / FORGE_TOUCH_INVENTORY_COLUMNS;
+}
+
+static void forge_touch_inventory_scroll_to(float rows)
+{
+	float most = (float)(forge_touch_inventory_rows() - FORGE_TOUCH_INVENTORY_ROWS);
+
+	if (most < 0.0f)
+		most = 0.0f;
+	if (rows > most)
+		rows = most;
+	if (rows < 0.0f)
+		rows = 0.0f;
+	s_touch.inv_scroll = rows;
+}
+
+static void forge_touch_inventory_open(void)
+{
+	int tab;
+
+	/* (made again each time: another map brings its own objects, its new
+	weapons too, which the catalog has as _forge_origin_map) */
+	s_touch.inv_counts_catalog = -1;
+	s_touch.inv_list_tab = -1;
+	forge_touch_inventory_counts();
+	/* (a tab with something in it, the last one used if it has) */
+	if (s_touch.inv_tab < 0 || s_touch.inv_tab >= NUMBER_OF_FORGE_PALETTE_CATEGORIES ||
+		!s_touch.inv_tab_count[s_touch.inv_tab])
+	{
+		for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
+		{
+			if (s_touch.inv_tab_count[s_forge_touch_tabs[tab].category])
+			{
+				s_touch.inv_tab = s_forge_touch_tabs[tab].category;
+				s_touch.inv_scroll = 0.0f;
+				break;
+			}
+		}
+	}
+	s_touch.inv_open = 1;
+	s_touch.chosen = -1;
+}
+
+/* a square of the inventory tapped: that object in hand, the inventory shut */
+static void forge_touch_inventory_choose(int place)
+{
+	struct forge_catalog_entry const *entry;
+
+	forge_touch_inventory_list();
+	if (place < 0 || place >= s_touch.inv_count)
+		return;
+	entry = &g_forge.catalog[s_touch.inv_list[place]];
+	if (!forge_touch_entry_placeable(entry))
+		return;
+	forge_touch_hotbar_note(entry);
+	s_touch.inv_open = 0;
+	forge_set_status("En la mano: %s. Toca el suelo para ponerlo",
+		entry->display_name[0] ? entry->display_name : entry->tag_path);
+}
+
 static void forge_touch_press(int what)
 {
 	int vk;
@@ -532,9 +750,29 @@ static void forge_touch_press(int what)
 		}
 		return;
 	}
+	/* (the inventory's tabs and squares) */
+	if (what >= _forge_touch_button_tab && what < _forge_touch_button_tab + NUMBER_OF_FORGE_PALETTE_CATEGORIES)
+	{
+		s_touch.inv_tab = what - _forge_touch_button_tab;
+		s_touch.inv_scroll = 0.0f;
+		return;
+	}
+	if (what >= _forge_touch_button_cell && what < _forge_touch_button_cell + FORGE_TOUCH_INVENTORY_MAX)
+	{
+		forge_touch_inventory_choose(what - _forge_touch_button_cell);
+		return;
+	}
 	switch (what)
 	{
 	case _forge_touch_button_palette:
+		forge_touch_inventory_open();
+		break;
+	case _forge_touch_button_inventory_close:
+		s_touch.inv_open = 0;
+		break;
+	case _forge_touch_button_inventory_full:
+		/* (the Forge's own palette, which has all: the AI, the volumes...) */
+		s_touch.inv_open = 0;
 		vk = g_forge.bind_vk[FORGE_BIND_PALETTE];
 		forge_touch_pulse(vk > 0 ? vk : VK_F2);
 		s_touch.chosen = -1;
@@ -799,7 +1037,18 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 		finger->y = finger->down_y = y;
 		finger->down_ms = (uint32_t)system_milliseconds();
 		finger->moved = 0;
-		if (s_touch.primary < 0)
+		if (s_touch.primary < 0 && s_touch.inv_open)
+		{
+			/* (the inventory: what is tapped is chosen as the finger lifts, a
+			drag on its squares scrolls them) */
+			s_touch.primary = index;
+			s_touch.gesture = _forge_touch_gesture_inventory;
+			s_touch.button = -1;
+			s_touch.inv_scroll_down = s_touch.inv_scroll;
+			s_touch.inv_drag = x >= s_touch.inv_grid_x0 && x < s_touch.inv_grid_x1 && y >= s_touch.inv_grid_y0 &&
+				y < s_touch.inv_grid_y1;
+		}
+		else if (s_touch.primary < 0)
 		{
 			int button = forge_touch_button_at(x, y);
 
@@ -826,7 +1075,7 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 				s_touch.last_down_object = s_touch.down_object;
 			}
 		}
-		else if (s_touch.gesture != _forge_touch_gesture_button)
+		else if (s_touch.gesture != _forge_touch_gesture_button && s_touch.gesture != _forge_touch_gesture_inventory)
 		{
 			/* (a second finger: the two turn what is held) */
 			struct forge_touch_finger const *first = &s_touch.fingers[s_touch.primary];
@@ -852,6 +1101,12 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 		finger->y = y;
 		if (forge_touch_abs(x - finger->down_x) > FORGE_TOUCH_SLOP || forge_touch_abs(y - finger->down_y) > FORGE_TOUCH_SLOP)
 			finger->moved = 1;
+		if (index == s_touch.primary && s_touch.gesture == _forge_touch_gesture_inventory && s_touch.inv_drag &&
+			finger->moved && s_touch.inv_row_h > 0.0f)
+		{
+			/* (the squares follow the finger: up shows the ones below) */
+			forge_touch_inventory_scroll_to(s_touch.inv_scroll_down - (y - finger->down_y) / s_touch.inv_row_h);
+		}
 		if (s_touch.twist && g_forge.grabbed_live_index >= 0)
 		{
 			int other = index == s_touch.primary ? forge_touch_second_finger() : s_touch.primary;
@@ -895,6 +1150,15 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 			if (s_touch.button >= 0)
 				forge_touch_release(s_touch.button);
 			break;
+		case _forge_touch_gesture_inventory:
+			if (!finger->moved)
+			{
+				int button = forge_touch_button_at(x, y);
+
+				if (button >= 0)
+					forge_touch_press(s_touch.buttons[button].what);
+			}
+			break;
 		case _forge_touch_gesture_pending:
 			if (!finger->moved && (uint32_t)system_milliseconds() - finger->down_ms <= FORGE_TOUCH_TAP_MS)
 			{
@@ -934,7 +1198,8 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 		s_touch.twist = 0;
 		/* (a finger left behind after two only looks) */
 		if (s_touch.primary >= 0)
-			s_touch.gesture = g_forge.grabbed_live_index >= 0 ? _forge_touch_gesture_carry : _forge_touch_gesture_look;
+			s_touch.gesture = s_touch.inv_open ? _forge_touch_gesture_none :
+				g_forge.grabbed_live_index >= 0 ? _forge_touch_gesture_carry : _forge_touch_gesture_look;
 		break;
 	case FORGE_TOUCH_CANCEL:
 		forge_touch_let_go_all();
@@ -973,6 +1238,7 @@ static void forge_touch_update(void)
 		if (s_touch.primary >= 0 || s_touch.menu_finger >= 0)
 			forge_touch_let_go_all();
 		s_touch.chosen = -1;
+		s_touch.inv_open = 0;
 		return;
 	}
 	/* (a menu opened or closed under the fingers: they start again) */
@@ -984,6 +1250,7 @@ static void forge_touch_update(void)
 		{
 			forge_touch_let_go_all();
 			s_touch.chosen = -1;
+			s_touch.inv_open = 0;
 			s_was_menu = menu;
 		}
 	}
@@ -1367,21 +1634,8 @@ static void forge_touch_hotbar_note(struct forge_catalog_entry const *entry)
 	int slot, found = FORGE_TOUCH_HOTBAR_SLOTS - 1;
 
 	forge_touch_ready();
-	if (!entry || !s_touch.seen)
+	if (!entry || !s_touch.seen || !forge_touch_entry_placeable(entry))
 		return;
-	switch (entry->group_tag)
-	{
-	case 'scen':
-	case 'vehi':
-	case 'weap':
-	case 'eqip':
-	case 'mach':
-	case 'ctrl':
-	case 'lifi':
-		break;
-	default:
-		return;
-	}
 	for (slot = 0; slot < FORGE_TOUCH_HOTBAR_SLOTS; slot++)
 	{
 		if (s_touch.hotbar[slot].used && s_touch.hotbar[slot].group_tag == entry->group_tag &&
@@ -1575,6 +1829,112 @@ static short forge_touch_row(
 	return x;
 }
 
+/* the inventory: its tabs at the left, its objects in big squares (the map's
+own, new ones in yellow), CERRAR and LISTA COMPLETA at the top */
+static void forge_touch_inventory_draw(
+	long font,
+	short window_x0, short window_y0, short window_x1, short window_y1,
+	short bh, short gap)
+{
+	short w = (short)(window_x1 - window_x0);
+	short h = (short)(window_y1 - window_y0);
+	float screen_w = (float)(window_x0 + window_x1);
+	float screen_h = (float)(window_y0 + window_y1);
+	short px0 = (short)(window_x0 + w * 0.015f);
+	short px1 = (short)(window_x1 - w * 0.015f);
+	short py0 = (short)(window_y0 + h * 0.02f);
+	short py1 = (short)(window_y0 + h * 0.80f);
+	short top1 = (short)(py0 + bh);
+	short tabs_x1 = (short)(px0 + w * 0.18f);
+	short gx0 = (short)(tabs_x1 + gap * 2);
+	short gy0 = (short)(top1 + gap * 2);
+	short gy1 = py1;
+	short cell_w, cell_h;
+	int first, i, tab, rows;
+	char label[32];
+	rectangle2d r;
+
+	forge_touch_inventory_counts();
+	forge_touch_inventory_list();
+	forge_touch_inventory_scroll_to(s_touch.inv_scroll);
+	r.x0 = px0;
+	r.y0 = py0;
+	r.x1 = px1;
+	r.y1 = py1;
+	draw_quad(&r, 0xE6040C1Cu);
+	draw_box_border(r.x0, r.y0, r.x1, r.y1, 1, 0xFF2896FFu);
+	/* (the top: its name, how many, and its two buttons) */
+	snprintf(label, sizeof(label), "INVENTARIO  %d", s_touch.inv_count);
+	draw_ce_menu_str_box(0, font, (short)(px0 + 10), (short)(py0 + bh / 2 - 7), (short)(px0 + w * 0.4f), top1, 0, label,
+		0xFFFFFFFFu);
+	forge_touch_button_draw(font, (short)(px1 - w * 0.13f - gap), py0, (short)(px1 - gap), top1, "CERRAR",
+		_forge_touch_button_inventory_close, 0, 0xFFFFFFFFu);
+	forge_touch_button_draw(font, (short)(px1 - w * 0.36f - gap * 2), py0, (short)(px1 - w * 0.13f - gap * 2), top1,
+		"LISTA COMPLETA", _forge_touch_button_inventory_full, 0, 0xFF9FD8FFu);
+	/* (the tabs: those with something) */
+	{
+		short y = gy0;
+		short tab_h = (short)((gy1 - gy0) / FORGE_TOUCH_TAB_COUNT - gap);
+
+		if (tab_h > bh)
+			tab_h = bh;
+		for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
+		{
+			int category = s_forge_touch_tabs[tab].category;
+
+			if (!s_touch.inv_tab_count[category])
+				continue;
+			forge_touch_button_draw(font, (short)(px0 + gap), y, tabs_x1, (short)(y + tab_h), s_forge_touch_tabs[tab].name,
+				_forge_touch_button_tab + category, category == s_touch.inv_tab, 0xFFFFFFFFu);
+			y = (short)(y + tab_h + gap);
+		}
+	}
+	/* (the squares) */
+	cell_w = (short)((px1 - gap - gx0 - (FORGE_TOUCH_INVENTORY_COLUMNS - 1) * gap) / FORGE_TOUCH_INVENTORY_COLUMNS);
+	cell_h = (short)((gy1 - gap - gy0 - (FORGE_TOUCH_INVENTORY_ROWS - 1) * gap) / FORGE_TOUCH_INVENTORY_ROWS);
+	if (screen_w > 0.0f && screen_h > 0.0f)
+	{
+		s_touch.inv_grid_x0 = (float)gx0 / screen_w;
+		s_touch.inv_grid_x1 = (float)(px1 - gap) / screen_w;
+		s_touch.inv_grid_y0 = (float)gy0 / screen_h;
+		s_touch.inv_grid_y1 = (float)(gy1 - gap) / screen_h;
+		s_touch.inv_row_h = (float)(cell_h + gap) / screen_h;
+	}
+	if (!s_touch.inv_count)
+	{
+		draw_ce_menu_str_box(0, font, gx0, (short)(gy0 + bh), (short)(px1 - gap), (short)(gy0 + bh * 2), 2,
+			"Este mapa no tiene objetos de este tipo", 0xFF9FD8FFu);
+		return;
+	}
+	first = (int)(s_touch.inv_scroll + 0.5f) * FORGE_TOUCH_INVENTORY_COLUMNS;
+	for (i = 0; i < FORGE_TOUCH_INVENTORY_COLUMNS * FORGE_TOUCH_INVENTORY_ROWS && first + i < s_touch.inv_count; i++)
+	{
+		struct forge_catalog_entry const *entry = &g_forge.catalog[s_touch.inv_list[first + i]];
+		short x = (short)(gx0 + (i % FORGE_TOUCH_INVENTORY_COLUMNS) * (cell_w + gap));
+		short y = (short)(gy0 + (i / FORGE_TOUCH_INVENTORY_COLUMNS) * (cell_h + gap));
+		char const *name = entry->display_name[0] ? entry->display_name : entry->tag_path;
+		char const *slash = entry->display_name[0] ? NULL : strrchr(entry->tag_path, '\\');
+
+		forge_touch_label(label, 20, slash ? slash + 1 : name);
+		forge_touch_button_draw(font, x, y, (short)(x + cell_w), (short)(y + cell_h), label, _forge_touch_button_cell + first + i,
+			0, entry->origin == _forge_origin_map ? 0xFFFFE680u : 0xFFFFFFFFu);
+	}
+	/* (where in the list: a bar at the right when there are more rows) */
+	rows = forge_touch_inventory_rows();
+	if (rows > FORGE_TOUCH_INVENTORY_ROWS)
+	{
+		short track = (short)(gy1 - gap - gy0);
+		short bar = (short)(track * FORGE_TOUCH_INVENTORY_ROWS / rows);
+		short at = (short)(gy0 + (track - bar) * s_touch.inv_scroll / (float)(rows - FORGE_TOUCH_INVENTORY_ROWS));
+
+		r.x0 = (short)(px1 - gap + 1);
+		r.x1 = (short)(px1 - 1);
+		r.y0 = at;
+		r.y1 = (short)(at + bar);
+		draw_quad(&r, 0xFF2896FFu);
+	}
+}
+
 static void forge_touch_draw(short window_x0, short window_y0, short window_x1, short window_y1, long font_index)
 {
 	short w = (short)(window_x1 - window_x0);
@@ -1618,7 +1978,8 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 		}
 		return;
 	}
-	/* the top: what is done to the map */
+	/* the top: what is done to the map (not under the inventory) */
+	if (!s_touch.inv_open)
 	{
 		static char const *const texts[] = { "+ OBJETOS", "DESHACER", "REHACER", "GUARDAR", "EXPORTAR" };
 		static int const whats[] = {
@@ -1639,6 +2000,7 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 		forge_touch_row(font, (short)(window_x0 + w * 0.65f), y0, (short)(y0 + bh), widths, gap, texts, whats, 4);
 	}
 	/* the right: up and down */
+	if (!s_touch.inv_open)
 	{
 		short x0 = (short)(window_x1 - w * 0.1f);
 		short x1 = (short)(window_x1 - w * 0.015f);
@@ -1689,6 +2051,12 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 				lit ? 0xFFFFE680u : 0xFFFFFFFFu);
 			x = (short)(x + slot_w + gap);
 		}
+	}
+	/* the inventory, over the rest but the quick bar */
+	if (s_touch.inv_open)
+	{
+		forge_touch_inventory_draw(font, window_x0, window_y0, window_x1, window_y1, bh, gap);
+		return;
 	}
 	/* (a finger held still on an object: how near it is to deleting it) */
 	if (s_touch.primary >= 0 && s_touch.gesture == _forge_touch_gesture_pending &&
@@ -1788,7 +2156,7 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 	if (s_touch.help)
 	{
 		static char const *const lines[] = {
-			"+ OBJETOS: lo que eliges queda en la barra de abajo",
+			"+ OBJETOS: el inventario. Toca un objeto y queda en tu mano (amarillo: del mapa)",
 			"Con algo en la mano (barra de abajo): toca el suelo y lo pones",
 			"Manten el dedo quieto sobre un objeto: lo borras",
 			"Toca un objeto: lo eliges (salen sus botones)",
@@ -1797,7 +2165,7 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 			"Con un objeto agarrado, gira dos dedos: lo giras",
 			"Toca donde quieras con un objeto agarrado: lo pones ahi",
 			"Palanca: volar.  SUBIR / BAJAR: altura.  START: menu y guardar el mapa",
-			"+ OBJETOS: armas, vehiculos, escenario, spawns, banderas...",
+			"LISTA COMPLETA (en el inventario): IA, volumenes y lo demas de la Forja",
 		};
 		short x0 = (short)(window_x0 + w * 0.18f);
 		short x1 = (short)(window_x1 - w * 0.18f);
