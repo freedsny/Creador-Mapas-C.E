@@ -118,6 +118,7 @@ enum
 	_forge_touch_button_back,
 	_forge_touch_button_snap,
 	_forge_touch_button_export,
+	_forge_touch_button_clear,
 	NUMBER_OF_FORGE_TOUCH_BUTTONS
 };
 
@@ -149,13 +150,10 @@ static struct
 	/* the Forge's pick through this point of the screen this frame */
 	int pick;
 	float pick_x, pick_y;
-	/* what was under the finger as it went down (forge_touch_after_hover) */
-	int hover_wanted;
-	int hover_known;
-	int32_t hover_live;
-	long hover_object;
-	/* a tap to choose with, read after the pick's hover */
-	int tap_choose;
+	/* what was under the finger as it went down (forge_touch_pick_at): a
+	live instance, else a map object not yet the Forge's, else none */
+	int32_t down_live;
+	long down_object;
 	/* what is chosen (tapped): its bar shows; -1 none */
 	int32_t chosen;
 	/* what the Forge's click (or copy) acts on this frame, if it is not
@@ -189,6 +187,8 @@ static struct
 	int button_count;
 	/* the help shown */
 	int help;
+	/* VACIAR's first tap, when (its second, soon after, empties the map) */
+	uint32_t clear_armed_ms;
 	/* whether a finger has ever been handed over: the touch HUD shows from
 	then on (a desktop's never) */
 	int seen;
@@ -203,8 +203,8 @@ static void forge_touch_ready(void)
 	memset(&s_touch, 0, sizeof(s_touch));
 	s_touch.primary = -1;
 	s_touch.button = -1;
-	s_touch.hover_live = -1;
-	s_touch.hover_object = NONE;
+	s_touch.down_live = -1;
+	s_touch.down_object = NONE;
 	s_touch.chosen = -1;
 	s_touch.force_live = -1;
 	s_touch.force_object = NONE;
@@ -352,6 +352,11 @@ static void forge_touch_instance_refresh(int32_t live)
 	}
 }
 
+/* (below: what is under a point of the screen, and taking it up) */
+static void forge_touch_pick_at(float x, float y, int32_t *live, long *object);
+static int32_t forge_touch_resolve(int32_t live, long object);
+static void forge_touch_grab(int32_t live);
+
 /* ---------- the buttons */
 
 static void forge_touch_chosen_turn(float degrees)
@@ -427,6 +432,53 @@ static void forge_touch_export(void)
 	forge_set_status("No se encontro '%s.map': GUARDAR otra vez", name);
 }
 
+/* VACIAR: the map's objects taken away (its scenery, vehicles, weapons and
+equipment, the map's own and those placed), for a map started from its
+ground alone; its devices (doors, lifts, bridges) and the places where
+players and objectives appear stay. The map's own are taken away as the
+Forge takes them away one by one (taken over, then deleted), so that the map
+saved is without them */
+static void forge_touch_clear_map(void)
+{
+	unsigned long mask = _object_mask_scenery | _object_mask_vehicle | _object_mask_weapon | _object_mask_equipment;
+	long local_unit = player_control_get_unit_index(0);
+	int removed = 0;
+	int pass;
+
+	if (g_forge.grabbed_live_index >= 0)
+		forge_cancel_or_release_held_item();
+	s_touch.chosen = -1;
+	/* (twice: deleting can make others, a vehicle's dropped weapons) */
+	for (pass = 0; pass < 2; pass++)
+	{
+		long found[512];
+		int count = 0, k;
+		struct object_iterator iter;
+		struct object_datum *obj;
+
+		object_iterator_new(&iter, mask, 0);
+		while ((obj = object_iterator_next(&iter)) != NULL && count < (int)(sizeof(found) / sizeof(found[0])))
+		{
+			if (iter.index == local_unit || obj->object.parent_object_index != NONE)
+				continue;
+			found[count++] = iter.index;
+		}
+		for (k = 0; k < count; k++)
+		{
+			int32_t live;
+
+			if (!forge_valid_object_get(found[k]))
+				continue;
+			live = forge_touch_resolve(-1, found[k]);
+			if (forge_touch_live_valid(live) < 0)
+				continue;
+			forge_3d_delete_instance(live, 1);
+			removed++;
+		}
+	}
+	forge_set_status("Mapa vaciado: %d objetos quitados (DESHACER no lo devuelve)", removed);
+}
+
 static void forge_touch_press(int what)
 {
 	int vk;
@@ -467,10 +519,7 @@ static void forge_touch_press(int what)
 		break;
 	case _forge_touch_button_move:
 		if (forge_touch_live_valid(s_touch.chosen) >= 0)
-		{
-			forge_touch_force(s_touch.chosen, NONE);
-			forge_touch_pulse(VK_LBUTTON);
-		}
+			forge_touch_grab(s_touch.chosen);
 		s_touch.chosen = -1;
 		break;
 	case _forge_touch_button_turn_left:
@@ -534,7 +583,7 @@ static void forge_touch_press(int what)
 		break;
 	case _forge_touch_button_drop:
 		if (g_forge.grabbed_live_index >= 0)
-			forge_touch_pulse(VK_LBUTTON);
+			forge_place_held_item();
 		break;
 	case _forge_touch_button_cancel:
 		if (g_forge.grabbed_live_index >= 0)
@@ -556,6 +605,22 @@ static void forge_touch_press(int what)
 		s_touch.chosen = -1;
 		forge_touch_export();
 		break;
+	case _forge_touch_button_clear:
+	{
+		uint32_t now = (uint32_t)system_milliseconds();
+
+		if (s_touch.clear_armed_ms && now - s_touch.clear_armed_ms < 4000u)
+		{
+			s_touch.clear_armed_ms = 0;
+			forge_touch_clear_map();
+		}
+		else
+		{
+			s_touch.clear_armed_ms = now ? now : 1u;
+			forge_set_status("Toca VACIAR otra vez para quitar todos los objetos del mapa");
+		}
+		break;
+	}
 	}
 }
 
@@ -587,7 +652,7 @@ static void forge_touch_let_go_all(void)
 		forge_touch_release(s_touch.button);
 	/* (what was being carried is put down where it is) */
 	if (s_touch.gesture == _forge_touch_gesture_carry && g_forge.grabbed_live_index >= 0)
-		forge_touch_pulse(VK_LBUTTON);
+		forge_place_held_item();
 	memset(s_touch.key_held, 0, sizeof(s_touch.key_held));
 	s_touch.primary = -1;
 	s_touch.gesture = _forge_touch_gesture_none;
@@ -707,8 +772,7 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 			{
 				s_touch.gesture = _forge_touch_gesture_pending;
 				s_touch.button = -1;
-				s_touch.hover_wanted = 1;
-				s_touch.hover_known = 0;
+				forge_touch_pick_at(x, y, &s_touch.down_live, &s_touch.down_object);
 			}
 		}
 		else if (s_touch.gesture != _forge_touch_gesture_button)
@@ -785,30 +849,25 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 			{
 				if (g_forge.grabbed_live_index >= 0)
 				{
-					/* (what is held goes down where the finger tapped: it has
-					followed the finger since it went down) */
-					forge_touch_pulse(VK_LBUTTON);
+					forge_place_held_item();
 				}
 				else
 				{
-					/* (chosen once the Forge has looked under the finger:
-					forge_touch_after_hover, this frame) */
-					s_touch.pick = 1;
-					s_touch.pick_x = x;
-					s_touch.pick_y = y;
-					s_touch.tap_choose = 1;
+					/* (what was under the finger is chosen; nothing lets go) */
+					s_touch.chosen = forge_touch_live_valid(forge_touch_resolve(s_touch.down_live, s_touch.down_object));
+					if (s_touch.chosen >= 0)
+					{
+						char const *slash = strrchr(g_forge.live_instances[s_touch.chosen].tag_path, '\\');
+
+						forge_set_status("Elegido: %s", slash ? slash + 1 : g_forge.live_instances[s_touch.chosen].tag_path);
+					}
 				}
 			}
 			break;
 		case _forge_touch_gesture_carry:
+			/* (put down where it is: under the finger, which it has followed) */
 			if (g_forge.grabbed_live_index >= 0)
-			{
-				/* (put down where it is, under the finger) */
-				s_touch.pick = 1;
-				s_touch.pick_x = x;
-				s_touch.pick_y = y;
-				forge_touch_pulse(VK_LBUTTON);
-			}
+				forge_place_held_item();
 			break;
 		default:
 			break;
@@ -898,16 +957,20 @@ static void forge_touch_update(void)
 		{
 			s_touch.gesture = _forge_touch_gesture_carry;
 		}
-		else if (s_touch.hover_known && (s_touch.hover_live >= 0 || s_touch.hover_object != NONE))
+		else
 		{
-			s_touch.gesture = _forge_touch_gesture_carry;
+			int32_t live = forge_touch_live_valid(forge_touch_resolve(s_touch.down_live, s_touch.down_object));
+
 			s_touch.chosen = -1;
-			forge_touch_force(s_touch.hover_live, s_touch.hover_object);
-			forge_touch_pulse(VK_LBUTTON);
-		}
-		else if (s_touch.hover_known)
-		{
-			s_touch.gesture = _forge_touch_gesture_look;
+			if (live >= 0)
+			{
+				forge_touch_grab(live);
+				s_touch.gesture = g_forge.grabbed_live_index >= 0 ? _forge_touch_gesture_carry : _forge_touch_gesture_look;
+			}
+			else
+			{
+				s_touch.gesture = _forge_touch_gesture_look;
+			}
 		}
 	}
 	/* (the pick through the finger while it is on the map, but not while
@@ -950,50 +1013,291 @@ static int forge_touch_menu_pointer(int wanted, struct halo_ui_pointer *pointer)
 
 /* ---------- the pick through the finger */
 
+/* where a point of the world is on the screen (shares of the frame last
+drawn's viewport, which is the whole screen in a game alone); FALSE when it
+is behind the camera or off the screen */
+static boolean forge_touch_on_screen(real_point3d const *point, float *x, float *y)
+{
+	struct render_camera const *camera = &render.camera;
+	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
+	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
+	real_point2d screen;
+
+	if (view_w <= 0.0f || view_h <= 0.0f || !render.frustum.projection_valid ||
+		!render_camera_world_to_screen(camera, &render.frustum, point, &screen))
+	{
+		return FALSE;
+	}
+	*x = (screen.x - (float)camera->viewport_bounds.x0) / view_w;
+	*y = (screen.y - (float)camera->viewport_bounds.y0) / view_h;
+	return TRUE;
+}
+
+static boolean forge_touch_normalize(real_vector3d *v)
+{
+	float length = (float)sqrt((double)(v->i * v->i + v->j * v->j + v->k * v->k));
+
+	if (length < 0.000001f)
+		return FALSE;
+	v->i /= length;
+	v->j /= length;
+	v->k /= length;
+	return TRUE;
+}
+
+/* how far from (x, y) a line from the camera along direction comes back on the
+screen, in shares of its height (large when it cannot be told) */
+static float forge_touch_ray_error(real_vector3d const *direction, float x, float y)
+{
+	struct render_camera const *camera = &render.camera;
+	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
+	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
+	real_point3d point;
+	float sx, sy, dx, dy;
+
+	point.x = camera->position.x + direction->i * 10.0f;
+	point.y = camera->position.y + direction->j * 10.0f;
+	point.z = camera->position.z + direction->k * 10.0f;
+	if (view_h <= 0.0f || !forge_touch_on_screen(&point, &sx, &sy))
+		return 1000.0f;
+	dx = (sx - x) * view_w / view_h;
+	dy = sy - y;
+	return (float)sqrt((double)(dx * dx + dy * dy));
+}
+
 /* the line from the camera through a point of the screen (shares), from the
-frame last drawn; FALSE if it cannot be told */
+frame last drawn; FALSE if it cannot be told. Three ways (the projection
+undone, and the camera's axes with its field of view taken as vertical or as
+horizontal), and the one that comes back on the screen nearest the point */
 static boolean forge_touch_screen_ray(float x, float y, real_vector3d *direction)
 {
 	struct render_camera const *camera = &render.camera;
 	struct render_frustum const *frustum = &render.frustum;
-	float window_w = (float)(camera->window_bounds.x1 - camera->window_bounds.x0);
-	float window_h = (float)(camera->window_bounds.y1 - camera->window_bounds.y0);
 	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
 	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
-	float px, py, ndc_x, ndc_y, length;
-	real_vector3d view, world;
+	float ndc_x = 2.0f * x - 1.0f;
+	float ndc_y = 2.0f * y - 1.0f;
+	float best_error = 1000.0f;
+	real_vector3d candidates[3];
+	int valid[3];
+	int i;
 
-	if (!frustum->projection_valid || view_w <= 0.0f || view_h <= 0.0f ||
-		frustum->projection_matrix[0][0] == 0.0f || frustum->projection_matrix[1][1] == 0.0f)
-	{
+	if (view_w <= 0.0f || view_h <= 0.0f)
 		return FALSE;
-	}
-	if (window_w <= 0.0f || window_h <= 0.0f)
-	{
-		window_w = view_w;
-		window_h = view_h;
-		px = (float)camera->viewport_bounds.x0 + x * window_w;
-		py = (float)camera->viewport_bounds.y0 + y * window_h;
-	}
-	else
-	{
-		px = (float)camera->window_bounds.x0 + x * window_w;
-		py = (float)camera->window_bounds.y0 + y * window_h;
-	}
+	memset(valid, 0, sizeof(valid));
 	/* (render_camera_view_to_screen, the other way: the view's -z is ahead) */
-	ndc_x = 2.0f * (px - (float)camera->viewport_bounds.x0) / view_w - 1.0f;
-	ndc_y = 2.0f * (py - (float)camera->viewport_bounds.y0) / view_h - 1.0f;
-	view.i = (ndc_x + frustum->projection_matrix[2][0]) / frustum->projection_matrix[0][0];
-	view.j = (frustum->projection_matrix[2][1] - ndc_y) / frustum->projection_matrix[1][1];
-	view.k = -1.0f;
-	matrix4x3_transform_vector(&frustum->view_to_world, &view, &world);
-	length = (float)sqrt((double)(world.i * world.i + world.j * world.j + world.k * world.k));
-	if (length < 0.000001f)
-		return FALSE;
-	direction->i = world.i / length;
-	direction->j = world.j / length;
-	direction->k = world.k / length;
-	return TRUE;
+	if (frustum->projection_valid && frustum->projection_matrix[0][0] != 0.0f && frustum->projection_matrix[1][1] != 0.0f)
+	{
+		real_vector3d view;
+
+		view.i = (ndc_x + frustum->projection_matrix[2][0]) / frustum->projection_matrix[0][0];
+		view.j = (frustum->projection_matrix[2][1] - ndc_y) / frustum->projection_matrix[1][1];
+		view.k = -1.0f;
+		matrix4x3_transform_vector(&frustum->view_to_world, &view, &candidates[0]);
+		valid[0] = forge_touch_normalize(&candidates[0]);
+	}
+	/* (the camera's forward, its right, its up) */
+	{
+		real_vector3d forward = camera->forward, up = camera->up, right;
+		float half = camera->vertical_field_of_view * 0.5f;
+		float aspect = view_w / view_h;
+		float t = (float)tan((double)half);
+		int k;
+
+		right.i = forward.j * up.k - forward.k * up.j;
+		right.j = forward.k * up.i - forward.i * up.k;
+		right.k = forward.i * up.j - forward.j * up.i;
+		if (half > 0.01f && half < 1.5f && forge_touch_normalize(&forward) && forge_touch_normalize(&up) &&
+			forge_touch_normalize(&right))
+		{
+			for (k = 0; k < 2; k++)
+			{
+				float sx = k == 0 ? t * aspect : t;
+				float sy = k == 0 ? t : t / aspect;
+
+				candidates[1 + k].i = forward.i + right.i * ndc_x * sx - up.i * ndc_y * sy;
+				candidates[1 + k].j = forward.j + right.j * ndc_x * sx - up.j * ndc_y * sy;
+				candidates[1 + k].k = forward.k + right.k * ndc_x * sx - up.k * ndc_y * sy;
+				valid[1 + k] = forge_touch_normalize(&candidates[1 + k]);
+			}
+		}
+	}
+	for (i = 0; i < 3; i++)
+	{
+		float error;
+
+		if (!valid[i])
+			continue;
+		error = forge_touch_ray_error(&candidates[i], x, y);
+		if (error < best_error)
+		{
+			best_error = error;
+			*direction = candidates[i];
+		}
+	}
+	/* (none comes back near the finger: the frame is not this camera's) */
+	return best_error < 0.08f;
+}
+
+/* ---------- what is under the finger
+
+What is nearest the finger on the screen, of what the Forge edits that can be
+seen from the camera: the Forge's own (placed, and the map's objects it has
+taken over, spawns, flags, teleporters, AI spawns) and the map's objects it has
+not yet. Not the Forge's reticle's way (a straight line, 10 world units at
+most): anything seen, as far as FORGE_TOUCH_PICK_RANGE, by how near the
+finger it shows, a little more for what shows big. */
+#define FORGE_TOUCH_PICK_RANGE 80.0f
+/* how far from the finger (a share of the screen's height) a point may show */
+#define FORGE_TOUCH_PICK_REACH 0.07f
+
+static float forge_touch_screen_distance(real_point3d const *point, float radius, float x, float y)
+{
+	struct render_camera const *camera = &render.camera;
+	float view_w = (float)(camera->viewport_bounds.x1 - camera->viewport_bounds.x0);
+	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
+	float sx, sy, dx, dy, depth, size;
+
+	if (view_h <= 0.0f || !forge_touch_on_screen(point, &sx, &sy))
+		return 1000.0f;
+	dx = (sx - x) * view_w / view_h;
+	dy = sy - y;
+	/* (how big it shows: its radius over its depth, the field of view about 70 degrees) */
+	depth = (point->x - camera->position.x) * camera->forward.i + (point->y - camera->position.y) * camera->forward.j +
+		(point->z - camera->position.z) * camera->forward.k;
+	size = depth > 0.5f ? radius / (depth * 1.4f) : 0.0f;
+	if (size > 0.2f)
+		size = 0.2f;
+	return (float)sqrt((double)(dx * dx + dy * dy)) - size;
+}
+
+static void forge_touch_pick_at(float x, float y, int32_t *live, long *object)
+{
+	float best = FORGE_TOUCH_PICK_REACH;
+	long local_unit = player_control_get_unit_index(0);
+	int32_t i;
+
+	*live = -1;
+	*object = NONE;
+	/* (the Forge's own: markers by where they stand, objects by their middle) */
+	for (i = 0; i < g_forge.live_instance_count; i++)
+	{
+		struct forge_live_instance const *inst = &g_forge.live_instances[i];
+		struct object_datum *obj;
+		real_point3d point;
+		float radius = 0.3f, distance, dx, dy, dz;
+
+		if (!inst->active)
+			continue;
+		obj = inst->object_index != NONE ? forge_valid_object_get(inst->object_index) : NULL;
+		if (obj)
+		{
+			point.x = obj->object.bounding_sphere_center.x;
+			point.y = obj->object.bounding_sphere_center.y;
+			point.z = obj->object.bounding_sphere_center.z;
+			radius = obj->object.bounding_sphere_radius;
+		}
+		else
+		{
+			point.x = inst->x;
+			point.y = inst->y;
+			point.z = inst->z + 0.15f;
+		}
+		dx = point.x - g_forge.cam_x;
+		dy = point.y - g_forge.cam_y;
+		dz = point.z - g_forge.cam_z;
+		if (dx * dx + dy * dy + dz * dz > FORGE_TOUCH_PICK_RANGE * FORGE_TOUCH_PICK_RANGE)
+			continue;
+		distance = forge_touch_screen_distance(&point, radius, x, y);
+		if (distance < best && forge_point_in_sight(point.x, point.y, point.z))
+		{
+			best = distance;
+			*live = i;
+			*object = NONE;
+		}
+	}
+	/* (the map's objects the Forge has not taken over yet) */
+	{
+		struct object_iterator iter;
+		struct object_datum *obj;
+		unsigned long edit_mask = _object_mask_scenery | _object_mask_vehicle | _object_mask_weapon | _object_mask_equipment |
+			_object_mask_biped | _object_mask_device;
+
+		object_iterator_new(&iter, edit_mask, 0);
+		while ((obj = object_iterator_next(&iter)) != NULL)
+		{
+			long index = iter.index;
+			struct unit_datum *unit;
+			real_point3d point;
+			float distance, dx, dy, dz;
+			int32_t k, owned = 0;
+
+			if (index == local_unit || obj->object.parent_object_index != NONE)
+				continue;
+			unit = (struct unit_datum *)object_try_and_get_and_verify_type(index, _object_mask_biped);
+			if (unit && unit->unit.player_index != NONE)
+				continue;
+			point.x = obj->object.bounding_sphere_center.x;
+			point.y = obj->object.bounding_sphere_center.y;
+			point.z = obj->object.bounding_sphere_center.z;
+			dx = point.x - g_forge.cam_x;
+			dy = point.y - g_forge.cam_y;
+			dz = point.z - g_forge.cam_z;
+			if (dx * dx + dy * dy + dz * dz > FORGE_TOUCH_PICK_RANGE * FORGE_TOUCH_PICK_RANGE)
+				continue;
+			distance = forge_touch_screen_distance(&point, obj->object.bounding_sphere_radius, x, y);
+			if (distance >= best || !forge_point_in_sight(point.x, point.y, point.z))
+				continue;
+			/* (one the Forge has is its live instance, found above) */
+			for (k = 0; k < g_forge.live_instance_count && !owned; k++)
+				owned = g_forge.live_instances[k].active && g_forge.live_instances[k].object_index == index;
+			if (owned)
+				continue;
+			best = distance;
+			*live = -1;
+			*object = index;
+		}
+	}
+}
+
+/* the Forge's live instance of what forge_touch_pick_at found (a map object
+taken over now, as the Forge's click takes it), -1 for none */
+static int32_t forge_touch_resolve(int32_t live, long object)
+{
+	if (forge_touch_live_valid(live) >= 0)
+		return live;
+	if (object != NONE && forge_valid_object_get(object))
+		return adopt_default_scenario_object(object);
+	return -1;
+}
+
+/* what is held from now on, as the Forge's click picks it up */
+static void forge_touch_grab(int32_t live)
+{
+	struct forge_live_instance *inst;
+	struct object_datum *obj;
+
+	if (forge_touch_live_valid(live) < 0)
+		return;
+	if (g_forge.grabbed_live_index >= 0)
+		forge_place_held_item();
+	inst = &g_forge.live_instances[live];
+	obj = forge_valid_object_get(inst->object_index);
+	forge_select_instance(live);
+	if (obj && obj->object.type == _object_type_vehicle)
+	{
+		forge_eject_all_passengers_from_vehicle(inst->object_index);
+		if (forge_is_multiplayer_session())
+		{
+			forge_network_send_transform_ext(live, inst->object_index, inst->x, inst->y, inst->z, inst->yaw, inst->pitch,
+				inst->roll, 1, 1);
+		}
+	}
+	{
+		char const *slash = strrchr(inst->tag_path, '\\');
+
+		forge_set_status("Llevando: %s", slash ? slash + 1 : inst->tag_path);
+	}
 }
 
 /* (forge_3d_update, before the Forge looks along fwd for what it points at)
@@ -1016,28 +1320,6 @@ static void forge_touch_pick(real_vector3d *fwd)
 the finger went down on, what a tap chooses, and what a click or copy acts on */
 static void forge_touch_after_hover(void)
 {
-	if (s_touch.hover_wanted)
-	{
-		s_touch.hover_wanted = 0;
-		s_touch.hover_known = 1;
-		s_touch.hover_live = forge_touch_live_valid(g_forge.hovered_live_index);
-		s_touch.hover_object = g_forge.hovered_object_index;
-	}
-	if (s_touch.tap_choose)
-	{
-		int32_t live = forge_touch_live_valid(g_forge.hovered_live_index);
-
-		s_touch.tap_choose = 0;
-		if (live < 0 && g_forge.hovered_object_index != NONE)
-			live = adopt_default_scenario_object(g_forge.hovered_object_index);
-		s_touch.chosen = forge_touch_live_valid(live);
-		if (s_touch.chosen >= 0)
-		{
-			char const *slash = strrchr(g_forge.live_instances[s_touch.chosen].tag_path, '\\');
-
-			forge_set_status("Elegido: %s", slash ? slash + 1 : g_forge.live_instances[s_touch.chosen].tag_path);
-		}
-	}
 	if (s_touch.force_frames > 0)
 	{
 		if (forge_touch_live_valid(s_touch.force_live) >= 0)
@@ -1195,12 +1477,14 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 		forge_touch_row(font, (short)(window_x0 + w * 0.015f), y0, (short)(y0 + bh), (short)(w * 0.082f), gap, texts, whats, 5);
 	}
 	{
-		static char const *const texts[] = { "MAPA", "PROBAR", "?" };
-		static int const whats[] = { _forge_touch_button_map, _forge_touch_button_test, _forge_touch_button_help };
+		static char const *const texts[] = { "MAPA", "VACIAR", "PROBAR", "?" };
+		static int const whats[] = {
+			_forge_touch_button_map, _forge_touch_button_clear, _forge_touch_button_test, _forge_touch_button_help };
 		short y0 = (short)(window_y0 + h * 0.02f);
-		short widths = (short)(w * 0.08f);
+		short widths = (short)(w * 0.07f);
 
-		forge_touch_row(font, (short)(window_x0 + w * 0.64f), y0, (short)(y0 + bh), widths, gap, texts, whats, 3);
+		/* (right of the overlay's Pause, which is at about 0.6 of the screen) */
+		forge_touch_row(font, (short)(window_x0 + w * 0.65f), y0, (short)(y0 + bh), widths, gap, texts, whats, 4);
 	}
 	/* the right: up and down */
 	{
