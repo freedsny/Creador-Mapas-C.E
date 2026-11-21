@@ -5866,7 +5866,14 @@ int forge_ui_save_copy_as(char const *new_map_name)
 	{
 		extern int g_forge_export_fail_line;
 
+		extern int g_forge_open_fail_line;
+		extern long g_forge_open_size;
+		extern int g_forge_open_version;
+
 		g_forge_export_fail_line = 0;
+		g_forge_open_fail_line = 0;
+		g_forge_open_size = 0;
+		g_forge_open_version = 0;
 	}
 	ok = forge_export_scenario_map(
 		base_map_path,
@@ -5904,10 +5911,16 @@ int forge_ui_save_copy_as(char const *new_map_name)
 	screenshot to tell why) */
 	{
 		extern int g_forge_export_fail_line;
+		extern int g_forge_open_fail_line;
+		extern long g_forge_open_size;
+		extern int g_forge_open_version;
 
-		platform_log("Forge: saving %s from '%s' failed at forge_cache_builder.c:%d", clean_name, base_map_path,
-			g_forge_export_fail_line);
-		forge_set_status("ERROR al guardar %s (paso %d, base %s)", clean_name, g_forge_export_fail_line, base_map_path);
+		platform_log("Forge: saving %s from '%s' failed at forge_cache_builder.c:%d (open %d, %ld bytes, version %d)",
+			clean_name, base_map_path, g_forge_export_fail_line, g_forge_open_fail_line, g_forge_open_size,
+			g_forge_open_version);
+		forge_set_status("ERROR al guardar %s (paso %d, abrir %d, %ld MB, v%d, base %s)", clean_name,
+			g_forge_export_fail_line, g_forge_open_fail_line, g_forge_open_size / (1024L * 1024L), g_forge_open_version,
+			base_map_path);
 	}
 	return 0;
 }
@@ -8821,6 +8834,14 @@ static void render_world_objective_and_spawn_markers(void)
 /* how long RANDOM's preview shows each rank */
 #define FORGE_RANDOM_PREVIEW_MILLISECONDS 1200u
 
+/* Halo Forge Evolved's inventory (forge_touch.inl): the catalog row whose
+model it shows (-1 none), and where on the screen, as shares of the distance
+to the right and up of the camera's look */
+int g_forge_touch_preview_catalog = -1;
+float g_forge_touch_preview_right = 0.42f / 1.55f;
+float g_forge_touch_preview_up = -0.14f / 1.55f;
+#define FORGE_TOUCH_PREVIEW_DISTANCE 2.4f
+
 static void render_spawn_palette_3d_preview(long object_index, void const *lighting_ptr)
 {
 	int i, match_count = 0, chosen_idx = -1;
@@ -8834,9 +8855,15 @@ static void render_spawn_palette_3d_preview(long object_index, void const *light
 	long obj_def_idx;
 	int generator;
 
-	if (g_forge.active_modal != _forge_modal_spawn_palette || g_forge.h3_menu_stage != 1)
+	if (g_forge_touch_preview_catalog >= 0 && g_forge_touch_preview_catalog < g_forge.catalog_count)
+	{
+		chosen_idx = g_forge_touch_preview_catalog;
+	}
+	else if (g_forge.active_modal != _forge_modal_spawn_palette || g_forge.h3_menu_stage != 1)
+	{
 		return;
-
+	}
+	else
 	{
 		extern int forge_palette_filtered_indices(int *out_indices, int max_out);
 		int filtered[512];
@@ -8903,6 +8930,16 @@ static void render_spawn_palette_3d_preview(long object_index, void const *light
 			preview_pos.x = render.camera.position.x + render.camera.forward.i * dist + cam_right.i * 0.42f - render.camera.up.i * 0.18f;
 			preview_pos.y = render.camera.position.y + render.camera.forward.j * dist + cam_right.j * 0.42f - render.camera.up.j * 0.18f;
 			preview_pos.z = render.camera.position.z + render.camera.forward.k * dist + cam_right.k * 0.42f - render.camera.up.k * 0.18f;
+			if (chosen_idx == g_forge_touch_preview_catalog)
+			{
+				/* (in the inventory's box) */
+				preview_pos.x = render.camera.position.x + render.camera.forward.i * dist +
+					cam_right.i * dist * g_forge_touch_preview_right + render.camera.up.i * dist * g_forge_touch_preview_up;
+				preview_pos.y = render.camera.position.y + render.camera.forward.j * dist +
+					cam_right.j * dist * g_forge_touch_preview_right + render.camera.up.j * dist * g_forge_touch_preview_up;
+				preview_pos.z = render.camera.position.z + render.camera.forward.k * dist +
+					cam_right.k * dist * g_forge_touch_preview_right + render.camera.up.k * dist * g_forge_touch_preview_up;
+			}
 
 			angle = (float)(system_milliseconds() % 6000u) * (6.2831853f / 6000.0f);
 			preview_fwd.i = (float)cosine(angle);
@@ -8971,9 +9008,24 @@ static void render_spawn_palette_3d_preview(long object_index, void const *light
 
 	dist = 1.55f;
 	cross_product3d(&render.camera.forward, &render.camera.up, &cam_right);
-	preview_pos.x = render.camera.position.x + render.camera.forward.i * dist + cam_right.i * 0.42f - render.camera.up.i * 0.14f;
-	preview_pos.y = render.camera.position.y + render.camera.forward.j * dist + cam_right.j * 0.42f - render.camera.up.j * 0.14f;
-	preview_pos.z = render.camera.position.z + render.camera.forward.k * dist + cam_right.k * 0.42f - render.camera.up.k * 0.14f;
+	if (chosen_idx == g_forge_touch_preview_catalog)
+	{
+		/* (in the inventory's box) */
+		float side, lift;
+
+		dist = FORGE_TOUCH_PREVIEW_DISTANCE;
+		side = dist * g_forge_touch_preview_right;
+		lift = dist * g_forge_touch_preview_up;
+		preview_pos.x = render.camera.position.x + render.camera.forward.i * dist + cam_right.i * side + render.camera.up.i * lift;
+		preview_pos.y = render.camera.position.y + render.camera.forward.j * dist + cam_right.j * side + render.camera.up.j * lift;
+		preview_pos.z = render.camera.position.z + render.camera.forward.k * dist + cam_right.k * side + render.camera.up.k * lift;
+	}
+	else
+	{
+		preview_pos.x = render.camera.position.x + render.camera.forward.i * dist + cam_right.i * 0.42f - render.camera.up.i * 0.14f;
+		preview_pos.y = render.camera.position.y + render.camera.forward.j * dist + cam_right.j * 0.42f - render.camera.up.j * 0.14f;
+		preview_pos.z = render.camera.position.z + render.camera.forward.k * dist + cam_right.k * 0.42f - render.camera.up.k * 0.14f;
+	}
 
 	angle = (float)(system_milliseconds() % 6000u) * (6.2831853f / 6000.0f);
 	preview_fwd.i = (float)cosine(angle);
@@ -9023,7 +9075,8 @@ void forge_render_world_3d_overlays(void const *lighting_ptr)
 	the depth range, so nothing of the level is nearer, its own parts still in
 	order. The first-person flag does not do it: the weapon is drawn before the
 	level, which a stencil keeps off it, and this after) */
-	if (g_forge.active_modal == _forge_modal_spawn_palette)
+	if (g_forge.active_modal == _forge_modal_spawn_palette ||
+		(g_forge_touch_preview_catalog >= 0 && g_forge.active_modal == _forge_modal_none))
 	{
 		D3DVIEWPORT8 viewport, front;
 

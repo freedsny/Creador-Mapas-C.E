@@ -290,6 +290,14 @@ static void forge_extract_basename(char const *path, char *out_name, size_t max_
 	snprintf(out_name, max_len, "%s", base);
 }
 
+/* Halo Forge Evolved: why a map could not be opened (the line of
+forge_source_map_open that gave up), its size and its cache version, for the
+save error's message */
+int g_forge_open_fail_line;
+long g_forge_open_size;
+int g_forge_open_version;
+#define FORGE_OPEN_FAIL (g_forge_open_fail_line = __LINE__, 0)
+
 static int forge_source_map_open(char const *path, struct forge_source_map *map)
 {
 	FILE *f;
@@ -300,37 +308,39 @@ static int forge_source_map_open(char const *path, struct forge_source_map *map)
 
 	memset(map, 0, sizeof(*map));
 	if (!path || !path[0])
-		return 0;
+		return FORGE_OPEN_FAIL;
 	snprintf(map->path, sizeof(map->path), "%s", path);
 	forge_extract_basename(path, map->filename, sizeof(map->filename));
 
 	f = fopen(path, "rb");
 	if (!f)
-		return 0;
+		return FORGE_OPEN_FAIL;
 	if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0x800)
 	{
 		fclose(f);
-		return 0;
+		return FORGE_OPEN_FAIL;
 	}
 	fseek(f, 0, SEEK_SET);
 	if (fread(hdr_peek, 1, 0x800, f) != 0x800)
 	{
 		fclose(f);
-		return 0;
+		return FORGE_OPEN_FAIL;
 	}
 	if (read_u32(hdr_peek) != CACHE_HEADER_SIGNATURE ||
 		read_u32(hdr_peek + 0x7FC) != CACHE_FOOTER_SIGNATURE)
 	{
 		fclose(f);
-		return 0;
+		return FORGE_OPEN_FAIL;
 	}
 	map->version = read_s32(hdr_peek + 0x04);
+	g_forge_open_version = map->version;
+	g_forge_open_size = (long)sz;
 	if (map->version != CACHE_VERSION_XBOX &&
 		map->version != CACHE_VERSION_PC &&
 		map->version != CACHE_VERSION_CE)
 	{
 		fclose(f);
-		return 0;
+		return FORGE_OPEN_FAIL;
 	}
 	map->tag_data_offset = read_u32(hdr_peek + 0x10);
 	map->tag_data_size = read_u32(hdr_peek + 0x14);
@@ -351,7 +361,7 @@ static int forge_source_map_open(char const *path, struct forge_source_map *map)
 		if (decomp_len < 0x800u || decomp_len > 512u * 1024u * 1024u)
 		{
 			fclose(f);
-			return 0;
+			return FORGE_OPEN_FAIL;
 		}
 
 		if (map->version == CACHE_VERSION_XBOX)
@@ -412,14 +422,14 @@ static int forge_source_map_open(char const *path, struct forge_source_map *map)
 			if (!comp_buf)
 			{
 				fclose(f);
-				return 0;
+				return FORGE_OPEN_FAIL;
 			}
 			fseek(f, 0x800, SEEK_SET);
 			if (fread(comp_buf, 1, comp_len, f) != comp_len)
 			{
 				free(comp_buf);
 				fclose(f);
-				return 0;
+				return FORGE_OPEN_FAIL;
 			}
 			fclose(f);
 			f = NULL;
@@ -429,7 +439,7 @@ static int forge_source_map_open(char const *path, struct forge_source_map *map)
 			if (!map->data)
 			{
 				free(comp_buf);
-				return 0;
+				return FORGE_OPEN_FAIL;
 			}
 			memcpy(map->data, hdr_peek, 0x800u);
 			if (uncompress(map->data + 0x800u, &dst_len, comp_buf, (uLong)comp_len) != Z_OK ||
@@ -438,7 +448,7 @@ static int forge_source_map_open(char const *path, struct forge_source_map *map)
 				free(comp_buf);
 				free(map->data);
 				map->data = NULL;
-				return 0;
+				return FORGE_OPEN_FAIL;
 			}
 			free(comp_buf);
 			map->file_size = 0x800u + (uint32_t)dst_len;
@@ -451,7 +461,7 @@ static int forge_source_map_open(char const *path, struct forge_source_map *map)
 		if (!map->data)
 		{
 			fclose(f);
-			return 0;
+			return FORGE_OPEN_FAIL;
 		}
 		fseek(f, 0, SEEK_SET);
 		if (fread(map->data, 1, map->file_size, f) != map->file_size)
@@ -459,7 +469,7 @@ static int forge_source_map_open(char const *path, struct forge_source_map *map)
 			free(map->data);
 			map->data = NULL;
 			fclose(f);
-			return 0;
+			return FORGE_OPEN_FAIL;
 		}
 		fclose(f);
 	}
@@ -471,7 +481,7 @@ parse_tag_header:
 	{
 		free(map->data);
 		map->data = NULL;
-		return 0;
+		return FORGE_OPEN_FAIL;
 	}
 	tag_hdr_off = map->tag_data_offset;
 	if (map->version == CACHE_VERSION_XBOX)
@@ -480,14 +490,14 @@ parse_tag_header:
 		{
 			free(map->data);
 			map->data = NULL;
-			return 0;
+			return FORGE_OPEN_FAIL;
 		}
 	}
 	else if (read_u32(map->data + tag_hdr_off + 0x24) != TAG_INDEX_SIGNATURE)
 	{
 		free(map->data);
 		map->data = NULL;
-		return 0;
+		return FORGE_OPEN_FAIL;
 	}
 	inst_addr = read_u32(map->data + tag_hdr_off + 0x00);
 	map->scenario_tag_index = read_s32(map->data + tag_hdr_off + 0x04) & 0xFFFF;
@@ -506,7 +516,7 @@ parse_tag_header:
 	{
 		free(map->data);
 		map->data = NULL;
-		return 0;
+		return FORGE_OPEN_FAIL;
 	}
 	map->instances_offset = inst_addr - map->tag_base_addr;
 	return 1;

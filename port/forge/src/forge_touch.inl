@@ -89,7 +89,7 @@ Minecraft's breaks a block) */
 #define FORGE_TOUCH_MENU_GROWTH 1.47f
 
 /* the inventory (+ OBJETOS): its columns and rows of objects, and the most it lists of a tab */
-#define FORGE_TOUCH_INVENTORY_COLUMNS 4
+#define FORGE_TOUCH_INVENTORY_COLUMNS 3
 #define FORGE_TOUCH_INVENTORY_ROWS 5
 #define FORGE_TOUCH_INVENTORY_MAX 512
 
@@ -135,6 +135,18 @@ enum
 	_forge_touch_button_clear,
 	_forge_touch_button_inventory_close,
 	_forge_touch_button_inventory_full,
+	/* the fine pad of what is chosen: a step along the map's lines, up,
+	down, a turn, and the step's size */
+	_forge_touch_button_nudge_forward,
+	_forge_touch_button_nudge_back,
+	_forge_touch_button_nudge_left,
+	_forge_touch_button_nudge_right,
+	_forge_touch_button_nudge_up,
+	_forge_touch_button_nudge_down,
+	_forge_touch_button_nudge_turn_left,
+	_forge_touch_button_nudge_turn_right,
+	_forge_touch_button_nudge_step,
+	_forge_touch_button_inventory_take,
 	NUMBER_OF_FORGE_TOUCH_BUTTONS,
 	/* the quick bar's slots: this plus the slot's index */
 	_forge_touch_button_hotbar = 100,
@@ -247,6 +259,13 @@ static struct
 	int inv_counts_catalog;
 	/* its grid as last drawn, in shares of the screen */
 	float inv_grid_x0, inv_grid_y0, inv_grid_x1, inv_grid_y1, inv_row_h;
+	/* the fine pad: its step (FINO, MEDIO, GRANDE), and when a held button of
+	it goes again */
+	int nudge_step;
+	uint32_t nudge_again_ms;
+	/* the inventory's square tapped once (its place in the list, -1 none):
+	its box shows it turning, with its name; a second tap or TOMAR takes it */
+	int inv_selected;
 } s_touch;
 /* (s_touch set up: forge_touch_ready) */
 static int s_touch_ready;
@@ -272,6 +291,8 @@ static void forge_touch_ready(void)
 	s_touch.inv_list_tab = -1;
 	s_touch.inv_list_catalog = -1;
 	s_touch.inv_counts_catalog = -1;
+	s_touch.nudge_step = 1;
+	s_touch.inv_selected = -1;
 	s_touch_ready = 1;
 }
 
@@ -549,6 +570,11 @@ hand */
 
 static void forge_touch_hotbar_note(struct forge_catalog_entry const *entry);
 
+/* (forge_runtime_tags.c: the model the inventory's box shows, and where) */
+extern int g_forge_touch_preview_catalog;
+extern float g_forge_touch_preview_right;
+extern float g_forge_touch_preview_up;
+
 /* its tabs, in order: the categories a tap can put (the rest, as the AI and
 the volumes, stay in the Forge's full list) */
 static struct
@@ -606,7 +632,8 @@ static void forge_touch_label(char *out, size_t size, char const *name)
 {
 	size_t n;
 
-	snprintf(out, size, "%s", name ? name : "");
+	if (out != name)
+		snprintf(out, size, "%s", name ? name : "");
 	for (n = 0; out[n]; n++)
 	{
 		if (out[n] >= 'a' && out[n] <= 'z')
@@ -614,6 +641,163 @@ static void forge_touch_label(char *out, size_t size, char const *name)
 		else if (out[n] == '_')
 			out[n] = ' ';
 	}
+}
+
+/* ---------- Spanish names: the catalog's are the tags' own, in English. Whole
+phrases first, then word by word; a word not known stays as it is (the game's
+fonts have no accents: none here) */
+
+static struct
+{
+	char const *english;
+	char const *spanish;
+} const s_forge_touch_words[] = {
+	/* (phrases: Spanish puts the words the other way round) */
+	{ "assault rifle", "rifle de asalto" },
+	{ "sniper rifle", "rifle de francotirador" },
+	{ "rocket launcher", "lanzacohetes" },
+	{ "plasma pistol", "pistola de plasma" },
+	{ "plasma rifle", "rifle de plasma" },
+	{ "plasma cannon", "canon de plasma" },
+	{ "plasma grenade", "granada de plasma" },
+	{ "frag grenade", "granada de fragmentacion" },
+	{ "fuel rod gun", "canon de combustible" },
+	{ "fuel rod", "canon de combustible" },
+	{ "energy sword", "espada de energia" },
+	{ "gravity hammer", "martillo gravitatorio" },
+	{ "flag stand", "base de bandera" },
+	{ "rocket warthog", "warthog lanzacohetes" },
+	{ "chain gun", "ametralladora" },
+	{ "gun turret", "torreta" },
+	{ "c gun turret", "torreta covenant" },
+	{ "active camouflage", "camuflaje activo" },
+	{ "over shield", "sobreescudo" },
+	{ "health pack", "botiquin" },
+	{ "health kit", "botiquin" },
+	{ "drop pod", "capsula de caida" },
+	{ "drop area", "zona de caida" },
+	{ "teleporter entrance", "entrada de teletransporte" },
+	{ "teleporter exit", "salida de teletransporte" },
+	{ "two way", "de ida y vuelta" },
+	{ "power core", "nucleo de energia" },
+	{ "light bridge", "puente de luz" },
+	{ "blast door", "puerta blindada" },
+	{ "sand bag", "sacos de arena" },
+	{ "sandbags", "sacos de arena" },
+	{ "sandbag", "sacos de arena" },
+	{ "ammo crate", "caja de municion" },
+	{ "weapon rack", "estante de armas" },
+	{ "spawn point", "punto de aparicion" },
+	{ "player spawn", "aparicion de jugador" },
+	{ "oddball", "calavera" },
+	/* (words) */
+	{ "pistol", "pistola" }, { "shotgun", "escopeta" }, { "rifle", "rifle" }, { "needler", "lanza agujas" },
+	{ "flamethrower", "lanzallamas" }, { "grenade", "granada" }, { "launcher", "lanzador" }, { "sword", "espada" },
+	{ "gun", "arma" }, { "turret", "torreta" }, { "cannon", "canon" }, { "ammo", "municion" },
+	{ "scorpion", "scorpion (tanque)" }, { "warthog", "warthog (jeep)" }, { "banshee", "banshee (avion)" },
+	{ "wraith", "wraith (tanque)" }, { "pelican", "pelican (nave)" }, { "dropship", "nave de desembarco" },
+	{ "shade", "shade (torreta)" }, { "mongoose", "mongoose (moto)" },
+	{ "camouflage", "camuflaje" }, { "overshield", "sobreescudo" }, { "shield", "escudo" }, { "health", "salud" },
+	{ "rock", "roca" }, { "rocks", "rocas" }, { "boulder", "roca grande" }, { "boulders", "rocas grandes" },
+	{ "stone", "piedra" }, { "cliff", "acantilado" }, { "tree", "arbol" }, { "trees", "arboles" }, { "bush", "arbusto" },
+	{ "shrub", "arbusto" }, { "grass", "pasto" }, { "plant", "planta" }, { "log", "tronco" }, { "stump", "tocon" },
+	{ "crate", "caja" }, { "crates", "cajas" }, { "box", "caja" }, { "barrel", "barril" }, { "barrels", "barriles" },
+	{ "container", "contenedor" }, { "wall", "pared" }, { "walls", "paredes" }, { "door", "puerta" },
+	{ "gate", "porton" }, { "window", "ventana" }, { "floor", "piso" }, { "ceiling", "techo" }, { "roof", "techo" },
+	{ "ramp", "rampa" }, { "stairs", "escaleras" }, { "bridge", "puente" }, { "platform", "plataforma" },
+	{ "pillar", "pilar" }, { "column", "columna" }, { "block", "bloque" }, { "brick", "ladrillo" },
+	{ "fence", "cerca" }, { "barrier", "barrera" }, { "barricade", "barricada" }, { "cover", "cobertura" },
+	{ "tower", "torre" }, { "base", "base" }, { "bunker", "bunker" }, { "building", "edificio" },
+	{ "light", "luz" }, { "lights", "luces" }, { "lamp", "lampara" }, { "flag", "bandera" }, { "hill", "colina" },
+	{ "spawn", "aparicion" }, { "teleporter", "teletransporte" }, { "teleport", "teletransporte" },
+	{ "generator", "generador" }, { "antenna", "antena" }, { "satellite", "satelite" }, { "dish", "plato" },
+	{ "computer", "computadora" }, { "terminal", "terminal" }, { "console", "consola" }, { "panel", "panel" },
+	{ "pipe", "tubo" }, { "pipes", "tubos" }, { "cable", "cable" }, { "wire", "cable" }, { "machine", "maquina" },
+	{ "elevator", "ascensor" }, { "lift", "elevador" }, { "switch", "interruptor" }, { "control", "control" },
+	{ "fire", "fuego" }, { "smoke", "humo" }, { "sparks", "chispas" }, { "steam", "vapor" }, { "water", "agua" },
+	{ "explosion", "explosion" }, { "blood", "sangre" }, { "dust", "polvo" }, { "beam", "rayo" },
+	{ "small", "pequeno" }, { "large", "grande" }, { "big", "grande" }, { "tall", "alto" }, { "short", "bajo" },
+	{ "long", "largo" }, { "wide", "ancho" }, { "broken", "roto" }, { "destroyed", "destruido" }, { "dead", "muerto" },
+	{ "red", "rojo" }, { "blue", "azul" }, { "green", "verde" }, { "yellow", "amarillo" }, { "white", "blanco" },
+	{ "black", "negro" }, { "covenant", "covenant" }, { "human", "humano" }, { "forerunner", "forerunner" },
+	{ "flood", "flood" }, { "marine", "marine" }, { "elite", "elite" }, { "grunt", "grunt" },
+	{ "corner", "esquina" }, { "curve", "curva" }, { "straight", "recto" }, { "half", "medio" }, { "double", "doble" },
+	{ "single", "sencillo" }, { "center", "centro" }, { "left", "izquierda" }, { "right", "derecha" },
+	{ "top", "arriba" }, { "bottom", "abajo" }, { "end", "final" }, { "piece", "pieza" }, { "section", "seccion" },
+	{ "support", "soporte" }, { "beam", "viga" }, { "post", "poste" }, { "sign", "letrero" }, { "skull", "calavera" },
+	{ "ball", "bola" }, { "hog", "warthog" }, { "tank", "tanque" }, { "vehicle", "vehiculo" }, { "weapon", "arma" },
+	{ "equipment", "equipo" }, { "scenery", "escenario" }, { "decoration", "decoracion" }, { "prop", "objeto" },
+};
+
+/* a name in Spanish, in capitals; *changed set when a word was turned */
+static void forge_touch_spanish(char const *name, char *out, size_t size, int *changed)
+{
+	char words[160];
+	char const *at;
+	size_t length = 0, n;
+
+	if (changed)
+		*changed = 0;
+	/* (in small letters, and _ \ - . as spaces, one space between words) */
+	for (n = 0; name && name[n] && n + 1 < sizeof(words); n++)
+	{
+		char c = name[n];
+
+		if (c >= 'A' && c <= 'Z')
+			c = (char)(c - 'A' + 'a');
+		else if (c == '_' || c == '\\' || c == '/' || c == '-' || c == '.')
+			c = ' ';
+		if (c == ' ' && (!length || words[length - 1] == ' '))
+			continue;
+		words[length++] = c;
+	}
+	while (length && words[length - 1] == ' ')
+		length--;
+	words[length] = 0;
+	out[0] = 0;
+	at = words;
+	while (*at)
+	{
+		int i, found = -1;
+		size_t found_length = 0;
+		char const *piece;
+
+		for (i = 0; i < (int)(sizeof(s_forge_touch_words) / sizeof(s_forge_touch_words[0])); i++)
+		{
+			size_t english = strlen(s_forge_touch_words[i].english);
+
+			/* (whole words only: the longest) */
+			if (english > found_length && !strncmp(at, s_forge_touch_words[i].english, english) &&
+				(at[english] == ' ' || at[english] == 0))
+			{
+				found = i;
+				found_length = english;
+			}
+		}
+		if (found >= 0)
+		{
+			piece = s_forge_touch_words[found].spanish;
+			if (changed)
+				*changed = 1;
+		}
+		else
+		{
+			piece = at;
+			for (found_length = 0; at[found_length] && at[found_length] != ' '; found_length++)
+				;
+		}
+		n = strlen(out);
+		if (n && n + 1 < size)
+			out[n++] = ' ';
+		if (found >= 0)
+			snprintf(out + n, size - n, "%s", piece);
+		else
+			snprintf(out + n, size - n, "%.*s", (int)found_length, piece);
+		at += found_length;
+		while (*at == ' ')
+			at++;
+	}
+	forge_touch_label(out, size, out);
 }
 
 /* how many each tab has (again when the catalog changes) */
@@ -708,10 +892,22 @@ static void forge_touch_inventory_open(void)
 		}
 	}
 	s_touch.inv_open = 1;
+	s_touch.inv_selected = -1;
 	s_touch.chosen = -1;
 }
 
-/* a square of the inventory tapped: that object in hand, the inventory shut */
+/* an entry's own name: its display name, else its tag's last part */
+static char const *forge_touch_entry_name(struct forge_catalog_entry const *entry)
+{
+	char const *slash;
+
+	if (entry->display_name[0])
+		return entry->display_name;
+	slash = strrchr(entry->tag_path, '\\');
+	return slash ? slash + 1 : entry->tag_path;
+}
+
+/* TOMAR, or a square tapped twice: that object in hand, the inventory shut */
 static void forge_touch_inventory_choose(int place)
 {
 	struct forge_catalog_entry const *entry;
@@ -724,8 +920,104 @@ static void forge_touch_inventory_choose(int place)
 		return;
 	forge_touch_hotbar_note(entry);
 	s_touch.inv_open = 0;
-	forge_set_status("En la mano: %s. Toca el suelo para ponerlo",
-		entry->display_name[0] ? entry->display_name : entry->tag_path);
+	s_touch.inv_selected = -1;
+	{
+		char name[64];
+
+		forge_touch_spanish(forge_touch_entry_name(entry), name, sizeof(name), NULL);
+		forge_set_status("En la mano: %s. Toca el suelo para ponerlo", name);
+	}
+}
+
+/* ---------- the fine pad (AJUSTE FINO): what is chosen moved a step at a
+time, along the map's own lines (the one nearest where the camera looks), up,
+down, or turned; a held button goes on */
+
+#define FORGE_TOUCH_NUDGE_STEPS 3
+/* (Halo's world unit is 10 feet: 3.048 meters) */
+static float const s_forge_touch_nudge_meters[FORGE_TOUCH_NUDGE_STEPS] = { 0.03f, 0.25f, 1.0f };
+static float const s_forge_touch_nudge_degrees[FORGE_TOUCH_NUDGE_STEPS] = { 5.0f, 15.0f, 45.0f };
+static char const *const s_forge_touch_nudge_names[FORGE_TOUCH_NUDGE_STEPS] = { "PASO FINO", "PASO MEDIO", "PASO GRANDE" };
+#define FORGE_TOUCH_NUDGE_FIRST_MS 400
+#define FORGE_TOUCH_NUDGE_AGAIN_MS 110
+
+static int forge_touch_is_nudge(int what)
+{
+	return what >= _forge_touch_button_nudge_forward && what <= _forge_touch_button_nudge_turn_right;
+}
+
+static void forge_touch_nudge(int what)
+{
+	int32_t live = forge_touch_live_valid(s_touch.chosen);
+	struct forge_live_instance *inst;
+	int step = s_touch.nudge_step;
+	float distance, ax, ay, x, y, z, yaw;
+	float cx = (float)cos((double)g_forge.cam_yaw);
+	float cy = (float)sin((double)g_forge.cam_yaw);
+
+	if (live < 0)
+		return;
+	if (step < 0 || step >= FORGE_TOUCH_NUDGE_STEPS)
+		step = s_touch.nudge_step = 1;
+	distance = s_forge_touch_nudge_meters[step] / 3.048f;
+	/* (ahead: the map's line nearest the camera's look) */
+	if (forge_touch_abs(cx) >= forge_touch_abs(cy))
+	{
+		ax = cx >= 0.0f ? 1.0f : -1.0f;
+		ay = 0.0f;
+	}
+	else
+	{
+		ax = 0.0f;
+		ay = cy >= 0.0f ? 1.0f : -1.0f;
+	}
+	inst = &g_forge.live_instances[live];
+	forge_touch_instance_refresh(live);
+	x = inst->x;
+	y = inst->y;
+	z = inst->z;
+	yaw = inst->yaw;
+	switch (what)
+	{
+	case _forge_touch_button_nudge_forward:
+		x += ax * distance;
+		y += ay * distance;
+		break;
+	case _forge_touch_button_nudge_back:
+		x -= ax * distance;
+		y -= ay * distance;
+		break;
+	/* (right of ahead (a, b) is (b, -a), seen from above) */
+	case _forge_touch_button_nudge_right:
+		x += ay * distance;
+		y -= ax * distance;
+		break;
+	case _forge_touch_button_nudge_left:
+		x -= ay * distance;
+		y += ax * distance;
+		break;
+	case _forge_touch_button_nudge_up:
+		z += distance;
+		break;
+	case _forge_touch_button_nudge_down:
+		z -= distance;
+		break;
+	case _forge_touch_button_nudge_turn_left:
+	case _forge_touch_button_nudge_turn_right:
+		yaw += s_forge_touch_nudge_degrees[step] * 0.0174532925f *
+			(what == _forge_touch_button_nudge_turn_left ? 1.0f : -1.0f);
+		while (yaw > 3.14159265f)
+			yaw -= 6.283185307f;
+		while (yaw < -3.14159265f)
+			yaw += 6.283185307f;
+		break;
+	default:
+		return;
+	}
+	forge_history_begin(live);
+	forge_3d_move_instance_ext(live, x, y, z, yaw, inst->pitch, inst->roll, 0, 1);
+	forge_history_end(live);
+	forge_touch_instance_refresh(live);
 }
 
 static void forge_touch_press(int what)
@@ -755,15 +1047,37 @@ static void forge_touch_press(int what)
 	{
 		s_touch.inv_tab = what - _forge_touch_button_tab;
 		s_touch.inv_scroll = 0.0f;
+		s_touch.inv_selected = -1;
 		return;
 	}
 	if (what >= _forge_touch_button_cell && what < _forge_touch_button_cell + FORGE_TOUCH_INVENTORY_MAX)
 	{
-		forge_touch_inventory_choose(what - _forge_touch_button_cell);
+		/* (the first tap shows it, the second takes it) */
+		if (s_touch.inv_selected == what - _forge_touch_button_cell)
+			forge_touch_inventory_choose(s_touch.inv_selected);
+		else
+			s_touch.inv_selected = what - _forge_touch_button_cell;
+		return;
+	}
+	if (what == _forge_touch_button_inventory_take)
+	{
+		forge_touch_inventory_choose(s_touch.inv_selected);
+		return;
+	}
+	if (forge_touch_is_nudge(what))
+	{
+		forge_touch_nudge(what);
+		s_touch.nudge_again_ms = (uint32_t)system_milliseconds() + FORGE_TOUCH_NUDGE_FIRST_MS;
 		return;
 	}
 	switch (what)
 	{
+	case _forge_touch_button_nudge_step:
+		s_touch.nudge_step = (s_touch.nudge_step + 1) % FORGE_TOUCH_NUDGE_STEPS;
+		forge_set_status("%s: %d cm, %d grados", s_forge_touch_nudge_names[s_touch.nudge_step],
+			(int)(s_forge_touch_nudge_meters[s_touch.nudge_step] * 100.0f + 0.5f),
+			(int)s_forge_touch_nudge_degrees[s_touch.nudge_step]);
+		break;
 	case _forge_touch_button_palette:
 		forge_touch_inventory_open();
 		break;
@@ -1215,6 +1529,8 @@ static void forge_touch_update(void)
 	int i;
 
 	forge_touch_ready();
+	if (!s_touch.inv_open || g_forge.active_modal != _forge_modal_none)
+		g_forge_touch_preview_catalog = -1;
 	for (i = 0; i < 256; i++)
 	{
 		if (s_touch.key_pulse[i])
@@ -1271,6 +1587,13 @@ static void forge_touch_update(void)
 	/* (what is chosen is let go once gone, picked up, or out of reach) */
 	if (forge_touch_live_valid(s_touch.chosen) < 0 || g_forge.grabbed_live_index >= 0)
 		s_touch.chosen = -1;
+	/* (a button of the fine pad held: it goes again, and again) */
+	if (s_touch.primary >= 0 && s_touch.gesture == _forge_touch_gesture_button && forge_touch_is_nudge(s_touch.button) &&
+		(int32_t)((uint32_t)system_milliseconds() - s_touch.nudge_again_ms) >= 0)
+	{
+		forge_touch_nudge(s_touch.button);
+		s_touch.nudge_again_ms = (uint32_t)system_milliseconds() + FORGE_TOUCH_NUDGE_AGAIN_MS;
+	}
 	/* (the finger on the map: a drag becomes carrying or looking, as what
 	was under it when it went down says) */
 	if (s_touch.primary >= 0 && s_touch.gesture == _forge_touch_gesture_pending &&
@@ -1829,6 +2152,70 @@ static short forge_touch_row(
 	return x;
 }
 
+/* the box of the square tapped: the object itself turning (drawn by
+forge_runtime_tags.c's palette preview, through this box, which is left clear),
+its name in Spanish and its own, where it comes from, and TOMAR */
+static void forge_touch_inventory_detail(
+	long font,
+	short x0, short y0, short x1, short y1,
+	short bh, short gap,
+	float screen_w, float screen_h)
+{
+	struct forge_catalog_entry const *entry;
+	short view_y1 = (short)(y0 + (y1 - y0) * 0.5f);
+	short line = (short)(bh * 0.55f);
+	char text[96];
+	int changed;
+	int tab;
+	char const *kind = "";
+
+	draw_box_border(x0, y0, x1, y1, 1, 0xFF2896FFu);
+	if (s_touch.inv_selected < 0 || s_touch.inv_selected >= s_touch.inv_count)
+	{
+		g_forge_touch_preview_catalog = -1;
+		draw_ce_menu_str_box(0, font, (short)(x0 + 6), (short)(y0 + (y1 - y0) / 2 - line), (short)(x1 - 6),
+			(short)(y0 + (y1 - y0) / 2 + line), 2, "Toca un objeto para verlo", 0xFF9FD8FFu);
+		return;
+	}
+	entry = &g_forge.catalog[s_touch.inv_list[s_touch.inv_selected]];
+	/* (the model: in the middle of the clear part, as shares of the distance;
+	the camera's tangents as forge_touch_on_screen has them) */
+	{
+		struct forge_touch_camera camera;
+		float cx = ((float)x0 + (float)x1) * 0.5f / (screen_w > 0.0f ? screen_w : 1.0f);
+		float cy = ((float)y0 + (float)view_y1) * 0.5f / (screen_h > 0.0f ? screen_h : 1.0f);
+
+		if (forge_touch_camera_get(&camera))
+		{
+			g_forge_touch_preview_right = (2.0f * cx - 1.0f) * camera.tangent_x;
+			g_forge_touch_preview_up = (1.0f - 2.0f * cy) * camera.tangent_y;
+			g_forge_touch_preview_catalog = s_touch.inv_list[s_touch.inv_selected];
+		}
+		else
+		{
+			g_forge_touch_preview_catalog = -1;
+		}
+	}
+	draw_box_border(x0, y0, x1, view_y1, 1, 0xFF1E5A8Cu);
+	/* (the names: Spanish big, its own small) */
+	forge_touch_spanish(forge_touch_entry_name(entry), text, 40, &changed);
+	draw_ce_menu_str_box(0, font, (short)(x0 + 6), (short)(view_y1 + gap), (short)(x1 - 6), (short)(view_y1 + gap + line), 2, text,
+		0xFFFFFFFFu);
+	forge_touch_label(text, 48, forge_touch_entry_name(entry));
+	draw_ce_menu_str_box(0, font, (short)(x0 + 6), (short)(view_y1 + gap + line), (short)(x1 - 6),
+		(short)(view_y1 + gap + line * 2), 2, text, 0xFF9FD8FFu);
+	for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
+	{
+		if (s_forge_touch_tabs[tab].category == entry->category)
+			kind = s_forge_touch_tabs[tab].name;
+	}
+	snprintf(text, sizeof(text), "%s%s", kind, entry->origin == _forge_origin_map ? "  -  NUEVO DE ESTE MAPA" : "");
+	draw_ce_menu_str_box(0, font, (short)(x0 + 6), (short)(view_y1 + gap + line * 2), (short)(x1 - 6),
+		(short)(view_y1 + gap + line * 3), 2, text, entry->origin == _forge_origin_map ? 0xFFFFE680u : 0xFF9FD8FFu);
+	forge_touch_button_draw(font, (short)(x0 + gap), (short)(y1 - gap - bh * 1.2f), (short)(x1 - gap), (short)(y1 - gap), "TOMAR",
+		_forge_touch_button_inventory_take, 0, 0xFFFFE680u);
+}
+
 /* the inventory: its tabs at the left, its objects in big squares (the map's
 own, new ones in yellow), CERRAR and LISTA COMPLETA at the top */
 static void forge_touch_inventory_draw(
@@ -1847,6 +2234,9 @@ static void forge_touch_inventory_draw(
 	short top1 = (short)(py0 + bh);
 	short tabs_x1 = (short)(px0 + w * 0.18f);
 	short gx0 = (short)(tabs_x1 + gap * 2);
+	/* (the box of the square tapped, at the right) */
+	short dx0 = (short)(window_x0 + w * 0.67f);
+	short dx1 = (short)(px1 - gap);
 	short gy0 = (short)(top1 + gap * 2);
 	short gy1 = py1;
 	short cell_w, cell_h;
@@ -1890,19 +2280,19 @@ static void forge_touch_inventory_draw(
 		}
 	}
 	/* (the squares) */
-	cell_w = (short)((px1 - gap - gx0 - (FORGE_TOUCH_INVENTORY_COLUMNS - 1) * gap) / FORGE_TOUCH_INVENTORY_COLUMNS);
+	cell_w = (short)((dx0 - gap * 3 - gx0 - (FORGE_TOUCH_INVENTORY_COLUMNS - 1) * gap) / FORGE_TOUCH_INVENTORY_COLUMNS);
 	cell_h = (short)((gy1 - gap - gy0 - (FORGE_TOUCH_INVENTORY_ROWS - 1) * gap) / FORGE_TOUCH_INVENTORY_ROWS);
 	if (screen_w > 0.0f && screen_h > 0.0f)
 	{
 		s_touch.inv_grid_x0 = (float)gx0 / screen_w;
-		s_touch.inv_grid_x1 = (float)(px1 - gap) / screen_w;
+		s_touch.inv_grid_x1 = (float)(dx0 - gap) / screen_w;
 		s_touch.inv_grid_y0 = (float)gy0 / screen_h;
 		s_touch.inv_grid_y1 = (float)(gy1 - gap) / screen_h;
 		s_touch.inv_row_h = (float)(cell_h + gap) / screen_h;
 	}
 	if (!s_touch.inv_count)
 	{
-		draw_ce_menu_str_box(0, font, gx0, (short)(gy0 + bh), (short)(px1 - gap), (short)(gy0 + bh * 2), 2,
+		draw_ce_menu_str_box(0, font, gx0, (short)(gy0 + bh), (short)(dx0 - gap), (short)(gy0 + bh * 2), 2,
 			"Este mapa no tiene objetos de este tipo", 0xFF9FD8FFu);
 		return;
 	}
@@ -1912,12 +2302,10 @@ static void forge_touch_inventory_draw(
 		struct forge_catalog_entry const *entry = &g_forge.catalog[s_touch.inv_list[first + i]];
 		short x = (short)(gx0 + (i % FORGE_TOUCH_INVENTORY_COLUMNS) * (cell_w + gap));
 		short y = (short)(gy0 + (i / FORGE_TOUCH_INVENTORY_COLUMNS) * (cell_h + gap));
-		char const *name = entry->display_name[0] ? entry->display_name : entry->tag_path;
-		char const *slash = entry->display_name[0] ? NULL : strrchr(entry->tag_path, '\\');
 
-		forge_touch_label(label, 20, slash ? slash + 1 : name);
+		forge_touch_spanish(forge_touch_entry_name(entry), label, 20, NULL);
 		forge_touch_button_draw(font, x, y, (short)(x + cell_w), (short)(y + cell_h), label, _forge_touch_button_cell + first + i,
-			0, entry->origin == _forge_origin_map ? 0xFFFFE680u : 0xFFFFFFFFu);
+			first + i == s_touch.inv_selected, entry->origin == _forge_origin_map ? 0xFFFFE680u : 0xFFFFFFFFu);
 	}
 	/* (where in the list: a bar at the right when there are more rows) */
 	rows = forge_touch_inventory_rows();
@@ -1927,12 +2315,13 @@ static void forge_touch_inventory_draw(
 		short bar = (short)(track * FORGE_TOUCH_INVENTORY_ROWS / rows);
 		short at = (short)(gy0 + (track - bar) * s_touch.inv_scroll / (float)(rows - FORGE_TOUCH_INVENTORY_ROWS));
 
-		r.x0 = (short)(px1 - gap + 1);
-		r.x1 = (short)(px1 - 1);
+		r.x0 = (short)(dx0 - gap * 2);
+		r.x1 = (short)(dx0 - gap);
 		r.y0 = at;
 		r.y1 = (short)(at + bar);
 		draw_quad(&r, 0xFF2896FFu);
 	}
+	forge_touch_inventory_detail(font, dx0, gy0, dx1, gy1, bh, gap, screen_w, screen_h);
 }
 
 static void forge_touch_draw(short window_x0, short window_y0, short window_x1, short window_y1, long font_index)
@@ -1999,8 +2388,38 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 		/* (right of the overlay's Pause, which is at about 0.6 of the screen) */
 		forge_touch_row(font, (short)(window_x0 + w * 0.65f), y0, (short)(y0 + bh), widths, gap, texts, whats, 4);
 	}
-	/* the right: up and down */
-	if (!s_touch.inv_open)
+	/* the right: the fine pad of what is chosen, else the camera's up and down */
+	if (!s_touch.inv_open && g_forge.grabbed_live_index < 0 && forge_touch_live_valid(s_touch.chosen) >= 0)
+	{
+		static int const whats[9] = {
+			_forge_touch_button_nudge_turn_left, _forge_touch_button_nudge_forward, _forge_touch_button_nudge_turn_right,
+			_forge_touch_button_nudge_left, _forge_touch_button_nudge_step, _forge_touch_button_nudge_right,
+			_forge_touch_button_nudge_up, _forge_touch_button_nudge_back, _forge_touch_button_nudge_down };
+		static char const *const texts[9] = {
+			"< GIRAR", "ADELANTE", "GIRAR >",
+			"IZQUIERDA", NULL, "DERECHA",
+			"SUBIR", "ATRAS", "BAJAR" };
+		short cell_w = (short)(w * 0.1f);
+		short cell_h = (short)(h * 0.105f);
+		short x0 = (short)(window_x1 - w * 0.015f - 3 * cell_w - 2 * gap);
+		short y0 = (short)(window_y0 + h * 0.30f);
+		char step_text[24];
+		int i;
+
+		snprintf(step_text, sizeof(step_text), "%s", s_forge_touch_nudge_names[s_touch.nudge_step % FORGE_TOUCH_NUDGE_STEPS]);
+		for (i = 0; i < 9; i++)
+		{
+			short x = (short)(x0 + (i % 3) * (cell_w + gap));
+			short y = (short)(y0 + (i / 3) * (cell_h + gap));
+			int lit = s_touch.primary >= 0 && s_touch.gesture == _forge_touch_gesture_button && s_touch.button == whats[i];
+
+			forge_touch_button_draw(font, x, y, (short)(x + cell_w), (short)(y + cell_h), texts[i] ? texts[i] : step_text,
+				whats[i], lit, whats[i] == _forge_touch_button_nudge_step ? 0xFFFFE680u : 0xFFFFFFFFu);
+		}
+		draw_ce_menu_str_box(0, font, x0, (short)(y0 - bh * 0.6f), (short)(x0 + 3 * cell_w + 2 * gap), y0, 2,
+			"AJUSTE FINO", 0xFF9FD8FFu);
+	}
+	else if (!s_touch.inv_open)
 	{
 		short x0 = (short)(window_x1 - w * 0.1f);
 		short x1 = (short)(window_x1 - w * 0.015f);
@@ -2104,13 +2523,15 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 		}
 		else if (forge_touch_live_valid(s_touch.chosen) >= 0)
 		{
-			static char const *const texts[] = { "MOVER", "< GIRAR", "GIRAR >", "COPIAR", "AJUSTES", "BORRAR", "LISTO" };
+			/* (simple: moving and turning are the finger's and the fine pad's) */
+			static char const *const texts[] = { "COPIAR", "AJUSTES", "BORRAR", "LISTO" };
 			static int const whats[] = {
-				_forge_touch_button_move, _forge_touch_button_turn_left, _forge_touch_button_turn_right,
 				_forge_touch_button_copy, _forge_touch_button_settings, _forge_touch_button_delete, _forge_touch_button_done };
-			short total = (short)(7 * width + 6 * gap);
+			short wide = (short)(w * 0.11f);
+			short total = (short)(4 * wide + 3 * gap);
 
-			forge_touch_row(font, (short)(window_x0 + (w - total) / 2), y0, y1, width, gap, texts, whats, 7);
+			/* (left of the fine pad) */
+			forge_touch_row(font, (short)(window_x0 + (w * 0.62f - total) / 2), y0, y1, wide, gap, texts, whats, 4);
 		}
 	}
 	/* what is chosen or held: its name and where it is (the Map Creation
@@ -2159,7 +2580,7 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 			"+ OBJETOS: el inventario. Toca un objeto y queda en tu mano (amarillo: del mapa)",
 			"Con algo en la mano (barra de abajo): toca el suelo y lo pones",
 			"Manten el dedo quieto sobre un objeto: lo borras",
-			"Toca un objeto: lo eliges (salen sus botones)",
+			"Toca un objeto: lo eliges. AJUSTE FINO (derecha) lo corre, sube o gira por pasos",
 			"Arrastra un objeto: lo llevas por el suelo y lo sueltas al levantar el dedo",
 			"Arrastra donde no hay nada: miras alrededor",
 			"Con un objeto agarrado, gira dos dedos: lo giras",
