@@ -189,6 +189,12 @@ static struct
 	int help;
 	/* VACIAR's first tap, when (its second, soon after, empties the map) */
 	uint32_t clear_armed_ms;
+	/* for the help's last line, which says how the touch went (to tell
+	what fails on a phone from a screenshot): the finger's line's error, and
+	what the last finger went down on */
+	float last_ray_error;
+	int32_t last_down_live;
+	long last_down_object;
 	/* whether a finger has ever been handed over: the touch HUD shows from
 	then on (a desktop's never) */
 	int seen;
@@ -209,6 +215,9 @@ static void forge_touch_ready(void)
 	s_touch.force_live = -1;
 	s_touch.force_object = NONE;
 	s_touch.menu_finger = -1;
+	s_touch.last_ray_error = -1.0f;
+	s_touch.last_down_live = -1;
+	s_touch.last_down_object = NONE;
 	s_touch_ready = 1;
 }
 
@@ -773,6 +782,8 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 				s_touch.gesture = _forge_touch_gesture_pending;
 				s_touch.button = -1;
 				forge_touch_pick_at(x, y, &s_touch.down_live, &s_touch.down_object);
+				s_touch.last_down_live = s_touch.down_live;
+				s_touch.last_down_object = s_touch.down_object;
 			}
 		}
 		else if (s_touch.gesture != _forge_touch_gesture_button)
@@ -1023,7 +1034,10 @@ static boolean forge_touch_on_screen(real_point3d const *point, float *x, float 
 	float view_h = (float)(camera->viewport_bounds.y1 - camera->viewport_bounds.y0);
 	real_point2d screen;
 
-	if (view_w <= 0.0f || view_h <= 0.0f || !render.frustum.projection_valid ||
+	/* (not render.frustum.projection_valid: the frame's projection is still
+	there once it is drawn, when the flag no longer says so; the Forge's own
+	labels project this way too) */
+	if (view_w <= 0.0f || view_h <= 0.0f || render.frustum.projection_matrix[0][0] == 0.0f ||
 		!render_camera_world_to_screen(camera, &render.frustum, point, &screen))
 	{
 		return FALSE;
@@ -1086,7 +1100,7 @@ static boolean forge_touch_screen_ray(float x, float y, real_vector3d *direction
 		return FALSE;
 	memset(valid, 0, sizeof(valid));
 	/* (render_camera_view_to_screen, the other way: the view's -z is ahead) */
-	if (frustum->projection_valid && frustum->projection_matrix[0][0] != 0.0f && frustum->projection_matrix[1][1] != 0.0f)
+	if (frustum->projection_matrix[0][0] != 0.0f && frustum->projection_matrix[1][1] != 0.0f)
 	{
 		real_vector3d view;
 
@@ -1136,6 +1150,7 @@ static boolean forge_touch_screen_ray(float x, float y, real_vector3d *direction
 		}
 	}
 	/* (none comes back near the finger: the frame is not this camera's) */
+	s_touch.last_ray_error = best_error;
 	return best_error < 0.08f;
 }
 
@@ -1586,7 +1601,7 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 		r.x0 = x0;
 		r.y0 = y0;
 		r.x1 = x1;
-		r.y1 = (short)(y0 + line * (short)(sizeof(lines) / sizeof(lines[0])) + line);
+		r.y1 = (short)(y0 + line * (short)(sizeof(lines) / sizeof(lines[0])) + line * 2);
 		draw_quad(&r, 0xE0040C1Cu);
 		draw_box_border(r.x0, r.y0, r.x1, r.y1, 1, 0xFF2896FFu);
 		for (i = 0; i < (int)(sizeof(lines) / sizeof(lines[0])); i++)
@@ -1594,5 +1609,13 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 			draw_ce_menu_str_box(0, font, (short)(x0 + 10), (short)(y0 + line / 2 + i * line), (short)(x1 - 10),
 				(short)(y0 + line / 2 + (i + 1) * line), 0, lines[i], 0xFFFFFFFFu);
 		}
+		/* (how the touch went: for a screenshot when something fails) */
+		snprintf(buf, sizeof(buf), "Prueba tactil: linea %.3f  dedo en %d/%ld  agarrado %d  pantalla %dx%d",
+			s_touch.last_ray_error, (int)s_touch.last_down_live, s_touch.last_down_object,
+			(int)g_forge.grabbed_live_index,
+			(int)(render.camera.viewport_bounds.x1 - render.camera.viewport_bounds.x0),
+			(int)(render.camera.viewport_bounds.y1 - render.camera.viewport_bounds.y0));
+		draw_ce_menu_str_box(0, font, (short)(x0 + 10), (short)(y0 + line / 2 + i * line), (short)(x1 - 10),
+			(short)(y0 + line / 2 + (i + 1) * line), 0, buf, 0xFF9FD8FFu);
 	}
 }

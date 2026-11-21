@@ -5736,6 +5736,11 @@ static int append_forge_map_metadata_and_preview_trailer(
 	return 1;
 }
 
+/* Halo Forge Evolved: the line of this file where saving a map last failed
+(forge_ui_save_copy_as says it with the error), 0 when it did not */
+int g_forge_export_fail_line;
+#define FORGE_EXPORT_FAIL (g_forge_export_fail_line = __LINE__, 0)
+
 static int forge_build_xbox_flg1_map(
 	char const *want_file,
 	char const *base_map_path,
@@ -5767,12 +5772,12 @@ static int forge_build_xbox_flg1_map(
 		in_f = fopen(xbox_path, "rb");
 	}
 	if (!in_f)
-		return 0;
+		return FORGE_EXPORT_FAIL;
 
 	if (fseek(in_f, 0, SEEK_END) != 0 || (raw_sz = ftell(in_f)) < 0x800L || fseek(in_f, 0, SEEK_SET) != 0)
 	{
 		fclose(in_f);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 
 	/* If in_f is an already-saved FLG1 Xbox map, strip its previous trailer at 0x1E4 and preserve its Base Map stem */
@@ -5822,7 +5827,7 @@ static int forge_build_xbox_flg1_map(
 	{
 		fclose(in_f);
 		buf_free(&out);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 	fclose(in_f);
 	out.size = (uint32_t)raw_sz;
@@ -5832,7 +5837,7 @@ static int forge_build_xbox_flg1_map(
 		read_s16(out.data + 0x60u) != 1)
 	{
 		buf_free(&out);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 
 	if (!append_forge_map_metadata_and_preview_trailer(
@@ -5847,7 +5852,7 @@ static int forge_build_xbox_flg1_map(
 			0u))
 	{
 		buf_free(&out);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 
 	snprintf(map_path, sizeof(map_path), "custom_maps/%s.map", output_map_name);
@@ -5855,13 +5860,13 @@ static int forge_build_xbox_flg1_map(
 	if (!out_f)
 	{
 		buf_free(&out);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 	if (fwrite(out.data, 1, out.size, out_f) != out.size)
 	{
 		fclose(out_f);
 		buf_free(&out);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 	fclose(out_f);
 	buf_free(&out);
@@ -6064,7 +6069,7 @@ int forge_export_scenario_map(
 	FILE *f;
 
 	if (!base_map_path || !output_map_name)
-		return 0;
+		return FORGE_EXPORT_FAIL;
 
 #undef _mkdir
 #undef mkdir
@@ -6111,19 +6116,19 @@ int forge_export_scenario_map(
 	if (!scnr_inst)
 	{
 		forge_source_map_close(&base_map);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 	scnr_addr = read_u32(scnr_inst + 0x14u);
 	if (scnr_addr < CE_TAG_BASE_ADDR)
 	{
 		forge_source_map_close(&base_map);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 	scnr_off = scnr_addr - CE_TAG_BASE_ADDR;
 	if (scnr_off + sizeof(struct scenario) > base_map.tag_data_size)
 	{
 		forge_source_map_close(&base_map);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 
 	orig_vtx_off = read_u32(base_map.data + base_map.tag_data_offset + 0x14u);
@@ -6389,7 +6394,7 @@ int forge_export_scenario_map(
 		free(prev_media_buf);
 		free(prev_state_text);
 		forge_source_map_close(&base_map);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 
 	if (pending_count > 0 && (extra_verts.size > 0 || extra_strips.size > 0))
@@ -6865,7 +6870,7 @@ int forge_export_scenario_map(
 		{
 			free(pending_objs);
 			forge_source_map_close(&base_map);
-			return 0;
+			return FORGE_EXPORT_FAIL;
 		}
 
 		write_s32(out.data + 0x04u, CACHE_VERSION_CE);
@@ -6894,7 +6899,7 @@ int forge_export_scenario_map(
 				free(pending_objs);
 				buf_free(&out);
 				forge_source_map_close(&base_map);
-				return 0;
+				return FORGE_EXPORT_FAIL;
 			}
 		}
 	}
@@ -6922,14 +6927,14 @@ int forge_export_scenario_map(
 	{
 		buf_free(&out);
 		forge_source_map_close(&base_map);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 	if (fwrite(out.data, 1, out.size, f) != out.size)
 	{
 		fclose(f);
 		buf_free(&out);
 		forge_source_map_close(&base_map);
-		return 0;
+		return FORGE_EXPORT_FAIL;
 	}
 	fclose(f);
 	buf_free(&out);

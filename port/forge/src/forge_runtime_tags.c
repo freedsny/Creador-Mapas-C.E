@@ -5863,6 +5863,11 @@ int forge_ui_save_copy_as(char const *new_map_name)
 	}
 
 	forge_ai_saved_tags_collect();
+	{
+		extern int g_forge_export_fail_line;
+
+		g_forge_export_fail_line = 0;
+	}
 	ok = forge_export_scenario_map(
 		base_map_path,
 		&g_forge.edit_state,
@@ -5895,6 +5900,15 @@ int forge_ui_save_copy_as(char const *new_map_name)
 		return 1;
 	}
 	forge_set_status("ERROR: Failed to export custom_maps/%s.map", clean_name);
+	/* (Halo Forge Evolved: where it failed, and from which map, for a
+	screenshot to tell why) */
+	{
+		extern int g_forge_export_fail_line;
+
+		platform_log("Forge: saving %s from '%s' failed at forge_cache_builder.c:%d", clean_name, base_map_path,
+			g_forge_export_fail_line);
+		forge_set_status("ERROR al guardar %s (paso %d, base %s)", clean_name, g_forge_export_fail_line, base_map_path);
+	}
 	return 0;
 }
 
