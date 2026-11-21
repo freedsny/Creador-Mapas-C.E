@@ -76,7 +76,14 @@ drag, not a tap; a tap is at most this long */
 Forge acts as a key goes down (one frame), and lets go the next */
 #define FORGE_TOUCH_PULSE_FRAMES 2
 #define FORGE_TOUCH_MAX_FINGERS 5
-#define FORGE_TOUCH_MAX_BUTTONS 24
+#define FORGE_TOUCH_MAX_BUTTONS 32
+/* the quick bar (Minecraft's hotbar): its slots */
+#define FORGE_TOUCH_HOTBAR_SLOTS 9
+/* held this long on one spot over an object, a finger deletes it (as
+Minecraft's breaks a block) */
+#define FORGE_TOUCH_DELETE_HOLD_MS 650
+/* (a finger held this long shows the deleting's ring) */
+#define FORGE_TOUCH_DELETE_SHOW_MS 150
 /* the Forge's menus on a touchscreen: this many times as large (0.75 becomes
 1.1: the palette then fills most of the screen's height) */
 #define FORGE_TOUCH_MENU_GROWTH 1.47f
@@ -119,7 +126,9 @@ enum
 	_forge_touch_button_snap,
 	_forge_touch_button_export,
 	_forge_touch_button_clear,
-	NUMBER_OF_FORGE_TOUCH_BUTTONS
+	NUMBER_OF_FORGE_TOUCH_BUTTONS,
+	/* the quick bar's slots: this plus the slot's index */
+	_forge_touch_button_hotbar = 100
 };
 
 struct forge_touch_finger
@@ -189,6 +198,17 @@ static struct
 	int help;
 	/* VACIAR's first tap, when (its second, soon after, empties the map) */
 	uint32_t clear_armed_ms;
+	/* the quick bar: the objects taken from the palette, the latest first,
+	and the one in hand (-1: none, and a tap chooses as before) */
+	struct
+	{
+		int used;
+		uint32_t group_tag;
+		uint8_t source_cache_id;
+		char tag_path[FORGE_TAG_PATH_MAX];
+		char name[64];
+	} hotbar[FORGE_TOUCH_HOTBAR_SLOTS];
+	int hand;
 	/* for the help's last line, which says how the touch went (to tell
 	what fails on a phone from a screenshot): the finger's line's error, and
 	what the last finger went down on */
@@ -215,6 +235,7 @@ static void forge_touch_ready(void)
 	s_touch.force_live = -1;
 	s_touch.force_object = NONE;
 	s_touch.menu_finger = -1;
+	s_touch.hand = -1;
 	s_touch.last_ray_error = -1.0f;
 	s_touch.last_down_live = -1;
 	s_touch.last_down_object = NONE;
@@ -365,6 +386,7 @@ static void forge_touch_instance_refresh(int32_t live)
 static void forge_touch_pick_at(float x, float y, int32_t *live, long *object);
 static int32_t forge_touch_resolve(int32_t live, long object);
 static void forge_touch_grab(int32_t live);
+static void forge_touch_place_hand(float x, float y);
 
 /* ---------- the buttons */
 
@@ -492,6 +514,24 @@ static void forge_touch_press(int what)
 {
 	int vk;
 
+	/* (a slot of the quick bar: in hand, or out of it if it was) */
+	if (what >= _forge_touch_button_hotbar && what < _forge_touch_button_hotbar + FORGE_TOUCH_HOTBAR_SLOTS)
+	{
+		int slot = what - _forge_touch_button_hotbar;
+
+		if (!s_touch.hotbar[slot].used || s_touch.hand == slot)
+		{
+			s_touch.hand = -1;
+			forge_set_status("Mano vacia: toca un objeto para elegirlo");
+		}
+		else
+		{
+			s_touch.hand = slot;
+			s_touch.chosen = -1;
+			forge_set_status("En la mano: %s. Toca el suelo para ponerlo", s_touch.hotbar[slot].name);
+		}
+		return;
+	}
 	switch (what)
 	{
 	case _forge_touch_button_palette:
@@ -862,6 +902,11 @@ static void forge_touch_map_event(int action, int id, float x, float y)
 				{
 					forge_place_held_item();
 				}
+				else if (s_touch.hand >= 0 && s_touch.hotbar[s_touch.hand].used)
+				{
+					/* (with something in hand, a tap puts one there, as a block) */
+					forge_touch_place_hand(x, y);
+				}
 				else
 				{
 					/* (what was under the finger is chosen; nothing lets go) */
@@ -983,6 +1028,29 @@ static void forge_touch_update(void)
 				s_touch.gesture = _forge_touch_gesture_look;
 			}
 		}
+	}
+	/* (a finger held still on an object deletes it, as Minecraft breaks a
+	block: then it does nothing more until it is lifted) */
+	if (s_touch.primary >= 0 && s_touch.gesture == _forge_touch_gesture_pending &&
+		!s_touch.fingers[s_touch.primary].moved && g_forge.grabbed_live_index < 0 &&
+		(s_touch.down_live >= 0 || s_touch.down_object != NONE) &&
+		(uint32_t)system_milliseconds() - s_touch.fingers[s_touch.primary].down_ms >= FORGE_TOUCH_DELETE_HOLD_MS)
+	{
+		int32_t live = forge_touch_live_valid(forge_touch_resolve(s_touch.down_live, s_touch.down_object));
+
+		if (live >= 0)
+		{
+			char name[64];
+			char const *slash = strrchr(g_forge.live_instances[live].tag_path, '\\');
+
+			snprintf(name, sizeof(name), "%s", slash ? slash + 1 : g_forge.live_instances[live].tag_path);
+			forge_3d_delete_instance(live, 1);
+			forge_set_status("Borrado: %s", name);
+		}
+		s_touch.chosen = -1;
+		s_touch.down_live = -1;
+		s_touch.down_object = NONE;
+		s_touch.gesture = _forge_touch_gesture_none;
 	}
 	/* (the pick through the finger while it is on the map, but not while
 	it looks) */
@@ -1315,6 +1383,99 @@ static void forge_touch_grab(int32_t live)
 	}
 }
 
+/* (forge_3d_update, as the palette puts an object in hand) the palette's
+object goes first in the quick bar, and in hand: Markers, volumes and the
+palette's folders are not for it (only what is placed as an object) */
+static void forge_touch_hotbar_note(struct forge_catalog_entry const *entry)
+{
+	int slot, found = FORGE_TOUCH_HOTBAR_SLOTS - 1;
+
+	forge_touch_ready();
+	if (!entry || !s_touch.seen)
+		return;
+	switch (entry->group_tag)
+	{
+	case 'scen':
+	case 'vehi':
+	case 'weap':
+	case 'eqip':
+	case 'mach':
+	case 'ctrl':
+	case 'lifi':
+		break;
+	default:
+		return;
+	}
+	for (slot = 0; slot < FORGE_TOUCH_HOTBAR_SLOTS; slot++)
+	{
+		if (s_touch.hotbar[slot].used && s_touch.hotbar[slot].group_tag == entry->group_tag &&
+			!_stricmp(s_touch.hotbar[slot].tag_path, entry->tag_path))
+		{
+			found = slot;
+			break;
+		}
+	}
+	for (slot = found; slot > 0; slot--)
+		s_touch.hotbar[slot] = s_touch.hotbar[slot - 1];
+	memset(&s_touch.hotbar[0], 0, sizeof(s_touch.hotbar[0]));
+	s_touch.hotbar[0].used = 1;
+	s_touch.hotbar[0].group_tag = entry->group_tag;
+	s_touch.hotbar[0].source_cache_id = entry->source_cache_id;
+	snprintf(s_touch.hotbar[0].tag_path, sizeof(s_touch.hotbar[0].tag_path), "%s", entry->tag_path);
+	snprintf(s_touch.hotbar[0].name, sizeof(s_touch.hotbar[0].name), "%s",
+		entry->display_name[0] ? entry->display_name : entry->tag_path);
+	s_touch.hand = 0;
+}
+
+/* a tap with something in hand: one of it where the finger shows, on what is
+there (the ground, a wall, another object), turned as the camera looks */
+static void forge_touch_place_hand(float x, float y)
+{
+	real_vector3d ray;
+	real_point3d origin;
+	real_vector3d vector;
+	struct collision_result collision;
+	long local_unit = player_control_get_unit_index(0);
+	int32_t live;
+	float px, py, pz;
+
+	if (s_touch.hand < 0 || !s_touch.hotbar[s_touch.hand].used)
+		return;
+	if (!forge_touch_screen_ray(x, y, &ray))
+	{
+		forge_set_status("No se pudo saber donde tocaste: prueba otra vez");
+		return;
+	}
+	origin.x = g_forge.cam_x;
+	origin.y = g_forge.cam_y;
+	origin.z = g_forge.cam_z;
+	vector.i = ray.i * FORGE_TOUCH_PICK_RANGE;
+	vector.j = ray.j * FORGE_TOUCH_PICK_RANGE;
+	vector.k = ray.k * FORGE_TOUCH_PICK_RANGE;
+	memset(&collision, 0, sizeof(collision));
+	if (!forge_collision_test_vector(
+			FLAG(_collision_test_structure_bit) | FLAG(_collision_test_objects_bit) |
+			FLAG(_collision_test_front_facing_surfaces_bit),
+			&origin, &vector, local_unit, &collision))
+	{
+		forge_set_status("Toca el suelo o una pared para poner el objeto");
+		return;
+	}
+	px = collision.point.x + collision.plane.n.i * 0.05f;
+	py = collision.point.y + collision.plane.n.j * 0.05f;
+	pz = collision.point.z + collision.plane.n.k * 0.05f;
+	live = forge_3d_spawn_object_at(s_touch.hotbar[s_touch.hand].group_tag, s_touch.hotbar[s_touch.hand].tag_path,
+		s_touch.hotbar[s_touch.hand].source_cache_id, px, py, pz, g_forge.cam_yaw, 0.0f, 0.0f, 0, 1);
+	if (forge_touch_live_valid(live) < 0)
+	{
+		forge_set_status("No se pudo poner %s aqui", s_touch.hotbar[s_touch.hand].name);
+		return;
+	}
+	/* (one step of DESHACER) */
+	forge_history_note_placed(live, 1);
+	forge_set_status("Puesto: %s", s_touch.hotbar[s_touch.hand].name);
+}
+
 /* (forge_3d_update, before the Forge looks along fwd for what it points at)
 fwd becomes the finger's line while a finger is on the map */
 static void forge_touch_pick(real_vector3d *fwd)
@@ -1513,9 +1674,77 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 		y = (short)(y + bh * 1.3f + gap * 2);
 		forge_touch_button_draw(font, x0, y, x1, (short)(y + bh * 1.3f), "BAJAR", _forge_touch_button_down, lit_down, 0xFFFFFFFFu);
 	}
+	/* the quick bar, at the bottom (Minecraft's): the objects taken from
+	the palette, the one in hand lit */
+	{
+		short slot_w = (short)(w * 0.078f);
+		short total = (short)(FORGE_TOUCH_HOTBAR_SLOTS * slot_w + (FORGE_TOUCH_HOTBAR_SLOTS - 1) * gap);
+		short x = (short)(window_x0 + (w - total) / 2);
+		short y0 = (short)(window_y0 + h * 0.83f);
+		short y1 = (short)(y0 + bh);
+		int slot;
+
+		for (slot = 0; slot < FORGE_TOUCH_HOTBAR_SLOTS; slot++)
+		{
+			char label[16];
+			int lit = slot == s_touch.hand;
+
+			if (s_touch.hotbar[slot].used)
+			{
+				/* (its name's start: the slot is small) */
+				size_t n;
+
+				snprintf(label, sizeof(label), "%s", s_touch.hotbar[slot].name);
+				for (n = 0; label[n]; n++)
+				{
+					if (label[n] >= 'a' && label[n] <= 'z')
+						label[n] = (char)(label[n] - 'a' + 'A');
+					else if (label[n] == '_')
+						label[n] = ' ';
+				}
+				if (strlen(label) > 9)
+					label[9] = 0;
+			}
+			else
+			{
+				label[0] = 0;
+			}
+			forge_touch_button_draw(font, x, y0, (short)(x + slot_w), y1, label, _forge_touch_button_hotbar + slot, lit,
+				lit ? 0xFFFFE680u : 0xFFFFFFFFu);
+			x = (short)(x + slot_w + gap);
+		}
+	}
+	/* (a finger held still on an object: how near it is to deleting it) */
+	if (s_touch.primary >= 0 && s_touch.gesture == _forge_touch_gesture_pending &&
+		!s_touch.fingers[s_touch.primary].moved && g_forge.grabbed_live_index < 0 &&
+		(s_touch.down_live >= 0 || s_touch.down_object != NONE))
+	{
+		uint32_t held = (uint32_t)system_milliseconds() - s_touch.fingers[s_touch.primary].down_ms;
+
+		if (held >= FORGE_TOUCH_DELETE_SHOW_MS)
+		{
+			short fx, fy;
+			float part = (float)held / (float)FORGE_TOUCH_DELETE_HOLD_MS;
+			short size = (short)(bh * 0.9f);
+			rectangle2d r;
+
+			forge_touch_to_window(s_touch.fingers[s_touch.primary].x, s_touch.fingers[s_touch.primary].y, &fx, &fy);
+			if (part > 1.0f)
+				part = 1.0f;
+			fy = (short)(fy - size * 2);
+			r.x0 = (short)(fx - size);
+			r.y0 = fy;
+			r.x1 = (short)(fx + size);
+			r.y1 = (short)(fy + size / 3);
+			draw_quad(&r, 0xB4081828u);
+			r.x1 = (short)(r.x0 + (short)(2 * size * part));
+			draw_quad(&r, 0xFFFF5050u);
+			draw_box_border((short)(fx - size), fy, (short)(fx + size), (short)(fy + size / 3), 1, 0xFFFFFFFFu);
+		}
+	}
 	/* the bar of what is held, or of what is chosen */
 	{
-		short y0 = (short)(window_y0 + h * 0.76f);
+		short y0 = (short)(window_y0 + h * 0.70f);
 		short y1 = (short)(y0 + bh);
 		short width = (short)(w * 0.088f);
 
@@ -1583,7 +1812,10 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 	if (s_touch.help)
 	{
 		static char const *const lines[] = {
-			"Toca un objeto: lo eliges (abajo salen sus botones)",
+			"+ OBJETOS: lo que eliges queda en la barra de abajo",
+			"Con algo en la mano (barra de abajo): toca el suelo y lo pones",
+			"Manten el dedo quieto sobre un objeto: lo borras",
+			"Toca un objeto: lo eliges (salen sus botones)",
 			"Arrastra un objeto: lo llevas por el suelo y lo sueltas al levantar el dedo",
 			"Arrastra donde no hay nada: miras alrededor",
 			"Con un objeto agarrado, gira dos dedos: lo giras",

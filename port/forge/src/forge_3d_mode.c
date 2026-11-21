@@ -8941,6 +8941,8 @@ void forge_3d_update(float dt)
 				g_forge.active_modal = _forge_modal_none;
 				if (spawned_idx >= 0 && g_forge.mode == _forge_mode_3d_monitor)
 				{
+					/* (Halo Forge Evolved: in the touchscreen's quick bar too) */
+					forge_touch_hotbar_note(ce);
 					g_forge.grabbed_live_index = spawned_idx;
 					g_forge.grabbed_object_index = g_forge.live_instances[spawned_idx].object_index;
 					g_forge.grabbed_is_new_spawn = 1;
