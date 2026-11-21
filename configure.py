@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+
+# root build script: writes build.ninja for the native ports (Linux, Windows,
+# Android, Switch, PS5) and the web port
+
+import argparse
+import io
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+from tools import campaign_score_values, ninja_syntax
+from tools.android_build import android_configure_inputs, generate_android_build
+from tools.linux_guest_build import generate_linux_guest_builds, linux_guest_configure_inputs, native_linux_guest
+from tools.linux_build import check_profile_options, generate_linux_build, linux_configure_inputs
+from tools.macos_build import generate_macos_build, macos_configure_inputs
+from tools.ps5_build import generate_ps5_build, ps5_configure_inputs
+from tools.switch_build import generate_switch_build, switch_configure_inputs
+from tools.web_build import generate_web_build, web_configure_inputs
+from tools.windows_build import generate_windows_build, windows_configure_inputs
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+# arguments
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--linux-cc",
+    metavar="BINARY",
+    help="compiler for the native Linux build, `ninja linux` (default: clang)",
+)
+parser.add_argument(
+    "--compiler-launcher",
+    metavar="BINARY",
+    help="a program that runs each compile, such as ccache "
+    "(links and the Android host's few units run the compiler directly)",
+)
+parser.add_argument(
+    "--release",
+    action="store_true",
+    help="release builds (Linux, Windows, Android, web): assertions are not checked",
+)
+parser.add_argument(
+    "--profile",
+    action="store_true",
+    help="profiling builds (Linux, Windows, Android): CPU scopes recorded on a "
+    "console command or launch setting (docs/building.md, \"Profiling builds\"); not with --pgo=train",
+)
+parser.add_argument(
+    "--lto",
+    choices=["full", "thin", "off"],
+    default="full",
+    help="link-time optimisation (Linux, Windows): full (the default: the whole game "
+    "optimised as one module, the fastest code and the slowest links), thin (parallel and incremental) or off",
+)
+parser.add_argument(
+    "--portable",
+    action="store_true",
+    help="x86 builds (Linux, Windows): code for any x86-64 processor (SSE2) rather than for this "
+    "machine's (-march=native, the default); use it for builds that run on other computers. On Linux it also "
+    "builds against Debian 11's glibc 2.31 rather than this machine's, and brings its own SDL 3 (libSDL3.so.0, "
+    "beside the executable), so that it starts on SteamOS and older distributions: the first build downloads "
+    "the Debian packages and SDL's source (build/linux/third_party, tools/linux_sysroot.py), and needs CMake, "
+    "pkgconf and wayland-scanner, not the 32-bit SDL 3",
+)
+parser.add_argument(
+    "--pgo",
+    nargs="?",
+    const="train",
+    default="use",
+    choices=["use", "train", "off"],
+    help="profile-guided optimisation: use (the default) optimises with the profiles in pgo/, "
+    "train (or plain --pgo) first records this platform's profile if it is missing, by letting an instrumented "
+    "build play every campaign level (needs the game data in assets/ and a display; Linux and Windows), off does "
+    "without",
+)
+parser.add_argument(
+    "--pgo-profile",
+    metavar="PROFDATA",
+    type=Path,
+    help="profile-guided optimisation from this profile instead",
+)
+parser.add_argument(
+    "--android-ndk",
+    type=str,
+    help="Android NDK for `ninja android` (default: ANDROID_NDK_HOME, or the newest under the Android SDK)",
+)
+parser.add_argument(
+    "--android-guest-cc",
+    type=str,
+    help="clang with the arm64_32 target for the Android guest (default: clang; on macOS Homebrew LLVM's)",
+)
+parser.add_argument(
+    "--android-vulkan-validation",
+    action="store_true",
+    help="put the Vulkan validation layer in the Android APK (debug.vk_validation; adds about 30 MB)",
+)
+parser.add_argument(
+    "--devkitpro",
+    type=str,
+    help="devkitPro for `ninja switch` (default: DEVKITPRO, or /opt/devkitpro)",
+)
+parser.add_argument(
+    "--linux-arm64-cc",
+    type=str,
+    help="clang (with the arm64_32 target) for `ninja linux_arm64`, the 64-bit ARM Linux build (default: clang)",
+)
+parser.add_argument(
+    "--linux-arm64-gl",
+    choices=["gles", "desktop"],
+    default="gles",
+    help="the renderer of `ninja linux_arm64`: OpenGL ES 3 (the default, as on Android) or desktop OpenGL 4.5",
+)
+parser.add_argument(
+    "--linux-x86-64",
+    action="store_true",
+    help="generate `ninja linux_x86_64`, the 64-bit x86 Linux build, on a 64-bit x86 Linux computer, whose default "
+    "build is the x86 one: configure.py then downloads its musl and SDL3 (once, to build/linux_x86_64/third_party). "
+    "--linux-x86-64-cc asks for it too",
+)
+parser.add_argument(
+    "--linux-x86-64-cc",
+    type=str,
+    help="clang (with the x32 target) for `ninja linux_x86_64`, the 64-bit x86 Linux build (default: clang)",
+)
+parser.add_argument(
+    "--linux-x86-64-movable-window",
+    action="store_true",
+    help="build `ninja linux_x86_64`'s guest image to take the Xbox window wherever its host puts it "
+    "(HALO_MOVABLE_WINDOW), as the PS5 needs: its console loads a system module at 0x80000000",
+)
+parser.add_argument(
+    "--ps5",
+    action="store_true",
+    help="generate `ninja ps5`, the PS5 title (port/ps5/README.md): configure.py then downloads its musl, SDL3 "
+    "and glslang (once, to build/ps5/third_party) and resolves pacbrew's SDL2 through PS5_Vulkan. "
+    "--ps5-vulkan asks for it too",
+)
+parser.add_argument(
+    "--ps5-vulkan",
+    metavar="PATH",
+    help="the PS5_Vulkan checkout `ninja ps5` builds with, set up by its tools/setup-native-dependencies.sh "
+    "(default: PS5_VULKAN, then ~/projects/ps5-deps/PS5_Vulkan)",
+)
+parser.add_argument(
+    "--ps5-mesa",
+    metavar="PATH",
+    help="the PS5_Mesa checkout, for Vulkan's headers (default: PS5_Mesa beside PS5_Vulkan)",
+)
+parser.add_argument(
+    "--ps5-llvm-config",
+    metavar="PATH",
+    help="the llvm-config of the clang that compiles the PS5 host, clang 22 (default: /usr/bin/llvm-config-22)",
+)
+parser.add_argument(
+    "--ps5-hostdeps",
+    metavar="ENV",
+    help="a script that puts meson's and LLVM's tools on the path for the PS5 build "
+    "(default: ~/projects/ps5-deps/hostdeps/env.sh)",
+)
+parser.add_argument(
+    "--ps5-guest-cc",
+    type=str,
+    help="clang (with the x32 target) for the PS5 build's guest image (default: --ps5-llvm-config's clang, clang 22)",
+)
+parser.add_argument(
+    "--web-emcc",
+    type=str,
+    help="Emscripten's emcc for `ninja web` (default: emcc on the PATH, then EMSDK's or ~/emsdk's)",
+)
+
+# no need to spam those extra flags when running on Windows
+if not is_windows():
+    parser.add_argument(
+        "--windows-cross",
+        action="store_true",
+        help="generate the Windows build (`ninja windows`) on Linux, cross-compiling "
+        "with clang against an MSVC toolchain (--windows-vctools-dir and --windows-sdk-dir), "
+        "and make it the default target",
+    )
+    parser.add_argument(
+        "--windows-cc",
+        metavar="BINARY",
+        help="compiler for the Windows cross build, `ninja windows` (default: clang). "
+             "Only clang is supported for now.",
+    )
+    parser.add_argument(
+        "--windows-vctools-dir",
+        metavar="DIR",
+        type=Path,
+        help="the Visual C++ tools of the MSVC toolchain a --windows-cross build compiles "
+        "and links against: the versioned folder under VC/Tools/MSVC, the one with `include` "
+        "and `lib` (default: VCToolsInstallDir)",
+    )
+    parser.add_argument(
+        "--windows-sdk-dir",
+        metavar="DIR",
+        type=Path,
+        help="the Windows SDK a --windows-cross build compiles and links against: the "
+        "folder with `Include` and `Lib`, each with a versioned folder (default: WindowsSdkDir)",
+    )
+
+args = parser.parse_args()
+try:
+    check_profile_options(args.profile, args.pgo)
+except ValueError as error:
+    parser.error(str(error))
+
+# the settings the builds read
+sln = SimpleNamespace(
+    build_dir=Path("build"),
+    linux_cc=args.linux_cc,
+    compiler_launcher=args.compiler_launcher,
+    port_release=args.release,
+    port_profile=args.profile,
+    port_lto=args.lto,
+    port_portable=args.portable,
+    port_pgo=args.pgo,
+    port_pgo_profile=args.pgo_profile,
+    android_ndk=args.android_ndk,
+    android_guest_cc=args.android_guest_cc,
+    android_vulkan_validation=args.android_vulkan_validation,
+    devkitpro=args.devkitpro,
+    linux_arm64_cc=args.linux_arm64_cc,
+    linux_arm64_gl=args.linux_arm64_gl,
+    linux_x86_64=args.linux_x86_64,
+    linux_x86_64_cc=args.linux_x86_64_cc,
+    linux_x86_64_movable_window=args.linux_x86_64_movable_window,
+    ps5=args.ps5,
+    ps5_vulkan=args.ps5_vulkan,
+    ps5_mesa=args.ps5_mesa,
+    ps5_llvm_config=args.ps5_llvm_config,
+    ps5_hostdeps=args.ps5_hostdeps,
+    ps5_guest_cc=args.ps5_guest_cc,
+    web_emcc=args.web_emcc,
+)
+if not is_windows():
+    sln.windows_cc = args.windows_cc
+    sln.windows_cross = args.windows_cross
+    sln.windows_vctools_dir = args.windows_vctools_dir
+    sln.windows_sdk_dir = args.windows_sdk_dir
+
+
+# the campaign's scoring values (port/linux/game/campaign_score_values.c),
+# written from their JSON before the builds compile it: ninja reruns this
+# script when the JSON changes (the inputs below)
+try:
+    campaign_score_values.write()
+except campaign_score_values.ValuesError as error:
+    sys.exit(f"campaign score values: {error}")
+
+# build.ninja
+out = io.StringIO()
+n = ninja_syntax.Writer(out)
+n.variable("ninja_required_version", "1.3")
+n.newline()
+
+configure_script = Path(os.path.relpath(os.path.abspath(sys.argv[0])))
+n.comment("The arguments passed to configure.py, for rerunning it.")
+n.variable(
+    "configure_args",
+    [f'"{arg}"' if any(ch.isspace() for ch in arg) else arg for arg in sys.argv[1:]],
+)
+n.variable("python", f'"{sys.executable}"')
+n.newline()
+
+generate_linux_build(n, sln)
+generate_android_build(n, sln)
+generate_linux_guest_builds(n, sln)
+generate_windows_build(n, sln)
+generate_switch_build(n, sln)
+generate_ps5_build(n, sln)
+generate_web_build(n, sln)
+generate_macos_build(n, sln)
+
+# every build generated for this computer, in one target (`ninja all`): the
+# x86 Linux build is generated everywhere but only builds on Linux, or on
+# macOS as the portable build (its own system root and SDL3) once there is a
+# wayland-scanner for SDL (tools/macos_toolchain.py), and the PS5 target is a
+# stub that fails when its dependencies are missing
+from tools.macos_toolchain import wayland_scanner
+
+linux_builds_here = sys.platform.startswith("linux") or (
+    sys.platform == "darwin" and sln.port_portable and wayland_scanner() is not None)
+all_builds = [
+    name
+    for name in ("linux", "linux_arm64", "linux_x86_64", "windows", "android_apk", "switch", "ps5", "web", "macos")
+    if f"\nbuild {name}: phony" in out.getvalue() and (name != "linux" or linux_builds_here)
+]
+n.comment("Every build generated for this computer")
+n.build(outputs="all", rule="phony", inputs=all_builds)
+n.newline()
+
+n.comment("Reconfigure on change")
+# (with the build number it was given, which the updaters compare: ninja's
+# shell usually has none, and a release rebuilt after a change to a tool would
+# otherwise never look for updates)
+build_number = os.environ.get("HALO_BUILD_NUMBER", "")
+build_number_environment = f"HALO_BUILD_NUMBER={build_number} " if build_number.isdigit() else ""
+n.rule(
+    name="configure",
+    command=f"{build_number_environment}$python {configure_script} $configure_args",
+    generator=True,
+    description=f"RUN {configure_script}",
+)
+n.build(
+    outputs="build.ninja",
+    rule="configure",
+    implicit=[
+        configure_script,
+        Path("tools/ninja_syntax.py"),
+        Path("tools/forge_build.py"),
+        Path("tools/campaign_score_values.py"),
+        campaign_score_values.JSON_PATH.relative_to(campaign_score_values.ROOT),
+        campaign_score_values.ACTOR_TYPES.relative_to(campaign_score_values.ROOT),
+        campaign_score_values.SKULLS_C.relative_to(campaign_score_values.ROOT),
+        campaign_score_values.MEDALS_C.relative_to(campaign_score_values.ROOT),
+        *linux_configure_inputs(),
+        *android_configure_inputs(),
+        *linux_guest_configure_inputs(),
+        *windows_configure_inputs(),
+        *switch_configure_inputs(),
+        *ps5_configure_inputs(),
+        *web_configure_inputs(),
+        *macos_configure_inputs(),
+    ],
+)
+n.newline()
+
+# the build for this computer, where it could be generated (the Windows
+# build is left out when SDL cannot be fetched, for instance): on 64-bit x86
+# Linux the x86 build, not the guest build (linux_x86_64)
+native_guest = native_linux_guest()
+default = "windows" if is_windows() or sln.windows_cross else native_guest.name if native_guest and native_guest.default else "linux"
+if f"\nbuild {default}: " in out.getvalue():
+    n.comment("Default rule: the build for this computer")
+    n.default(default)
+
+with open("build.ninja", "w", encoding="utf-8") as f:
+    f.write(out.getvalue())
+out.close()

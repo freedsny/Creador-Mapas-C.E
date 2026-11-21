@@ -1,0 +1,526 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The port's Mods screen, in the PC version's style (tools/port_settings.py) -->
+<menus>
+	<widget name="main_menu/main_menu_item_mods" type="text" width="256" height="33" bitmap="main_menu/menu_mods">
+		<on event="a" open="main_menu/mods/hub_screen"/>
+		<on event="start" open="main_menu/mods/hub_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/mods_screen" width="640" height="480" flags="pass_unhandled_to_focused_child pause_game" bitmap="bitmaps/gradient">
+		<on event="b" back="true"/>
+		<on event="back" back="true"/>
+		<child widget="main_menu/new_select/sel_list_desc_bkd"/>
+		<child widget="main_menu/mods/mods_list"/>
+		<child widget="main_menu/mods/header_mods"/>
+		<child widget="main_menu/mods/mod_hint_save" x="8" y="415" platform="switch ps5"/>
+		<child widget="main_menu/mods/mod_hint_toggle" x="80" y="415" platform="switch ps5"/>
+		<child widget="main_menu/mods/mod_hint_l_switch" x="184" y="418" platform="switch"/>
+		<child widget="main_menu/mods/mod_hint_r_switch" x="200" y="418" platform="switch"/>
+		<child widget="main_menu/mods/mod_hint_l_ps5" x="184" y="418" platform="ps5"/>
+		<child widget="main_menu/mods/mod_hint_r_ps5" x="200" y="418" platform="ps5"/>
+		<child widget="main_menu/mods/mod_hint_move" x="218" y="415" platform="switch ps5"/>
+		<child widget="main_menu/mods/mod_hint_cancel" x="510" y="415" platform="switch ps5"/>
+	</widget>
+	<widget name="main_menu/mods/header_mods" controller="1" left="35" top="11" width="363" height="59" bitmap="main_menu/mods/header_mods">
+	</widget>
+	<widget name="main_menu/mods/mods_list" type="column_list" width="640" height="480" flags="pass_unhandled_to_focused_child up_down_tabs_children" description="main_menu/mods/mod_details">
+		<data input="port mods update"/>
+		<on event="created" run="port mods init"/>
+		<on event="deleted" run="port mods close"/>
+		<on event="y" run="port mods toggle"/>
+		<on event="white" run="port mods move up"/>
+		<on event="black" run="port mods move down"/>
+		<child widget="main_menu/mods/op_mod_1" x="20" y="73"/>
+		<child widget="main_menu/mods/op_mod_2" x="20" y="103"/>
+		<child widget="main_menu/mods/op_mod_3" x="20" y="133"/>
+		<child widget="main_menu/mods/op_mod_4" x="20" y="163"/>
+		<child widget="main_menu/mods/op_mod_5" x="20" y="193"/>
+		<child widget="main_menu/mods/op_mod_6" x="20" y="223"/>
+		<child widget="main_menu/mods/op_mod_7" x="20" y="253"/>
+		<child widget="main_menu/mods/op_mod_8" x="20" y="283"/>
+		<child widget="main_menu/mods/op_mod_9" x="20" y="313"/>
+		<child widget="main_menu/mods/op_mod_10" x="20" y="343"/>
+		<child widget="main_menu/mods/op_mod_11" x="20" y="373" platform="desktop switch ps5 web"/>
+		<child widget="main_menu/mods/button_bar_files" y="384" platform="android"/>
+		<child widget="main_menu/mods/button_bar" y="414"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_1" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd_top" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_2" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_3" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_4" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_5" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_6" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_7" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_8" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_9" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_10" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/op_mod_11" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port mods accept"/>
+		<on event="start" run="port mods accept"/>
+		<on event="left" run="port mods move up"/>
+		<on event="right" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mod_status" x="8" y="2"/>
+		<child widget="main_menu/mods/mod_name" x="34"/>
+		<child widget="main_menu/mods/mod_state" x="318"/>
+	</widget>
+	<widget name="main_menu/mods/mod_status" controller="1" width="24" height="24" bitmap="mods/status">
+	</widget>
+	<widget name="main_menu/mods/mod_name" type="text" controller="1" width="284" height="22" font="ui\large_ui" color="#FF2896FF" text_y="4">
+	</widget>
+	<widget name="main_menu/mods/mod_state" type="text" controller="1" width="66" height="22" font="ui\large_ui" color="#FF2896FF" align="center" text_y="4" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/mod_details" width="640" height="480">
+		<child widget="main_menu/mods/mod_details_name"/>
+		<child widget="main_menu/mods/mod_details_status"/>
+		<child widget="main_menu/mods/mod_details_text"/>
+	</widget>
+	<widget name="main_menu/mods/mod_details_name" type="text" controller="1" left="422" top="84" width="194" height="44" font="ui\large_ui" color="#FFFFFFFF">
+	</widget>
+	<widget name="main_menu/mods/mod_details_status" controller="1" left="422" top="132" width="16" height="16" bitmap="mods/status_small">
+	</widget>
+	<widget name="main_menu/mods/mod_details_text" type="text" controller="1" left="422" top="130" width="194" height="272" font="ui\small_ui" color="#FF2896FF">
+	</widget>
+	<widget name="main_menu/mods/button_bar" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">
+		<child widget="main_menu/mods/button_up" y="1" platform="desktop android web"/>
+		<child widget="main_menu/mods/button_down" x="140" y="1" platform="desktop android web"/>
+		<child widget="main_menu/mods/button_ok" x="370" y="1" platform="desktop android web"/>
+		<child widget="common_button_cancel" x="510" y="1" platform="desktop android web"/>
+	</widget>
+	<widget name="main_menu/mods/button_bar_files" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">
+		<child widget="main_menu/mods/button_import" y="1"/>
+		<child widget="main_menu/mods/button_delete" x="130" y="1"/>
+	</widget>
+	<widget name="main_menu/mods/button_import" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="IMPORT" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port mods import"/>
+		<on event="start" run="port mods import"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/button_delete" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="DELETE" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port mods delete"/>
+		<on event="start" run="port mods delete"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/button_up" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="MOVE UP" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port mods move up"/>
+		<on event="start" run="port mods move up"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/button_down" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="MOVE DOWN" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port mods move down"/>
+		<on event="start" run="port mods move down"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/button_ok" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" string_list="strings/common_button_captions" string_index="1" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port mods save" back="true"/>
+		<on event="start" run="port mods save" back="true"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/mod_hint_save" type="text" controller="1" width="160" height="24" text="%a-button SAVE" font="ui\small_ui" color="#FFFFFFFF" text_y="2" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/mod_hint_toggle" type="text" controller="1" width="160" height="24" text="%y-button ON / OFF" font="ui\small_ui" color="#FFFFFFFF" text_y="2" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/mod_hint_move" type="text" controller="1" width="160" height="24" text="MOVE" font="ui\small_ui" color="#FFFFFFFF" text_y="2" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/mod_hint_cancel" type="text" controller="1" width="160" height="24" text="%b-button CANCEL" font="ui\small_ui" color="#FFFFFFFF" text_y="2" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/mod_hint_l_switch" width="14" height="14" bitmap="hints/switch_l">
+	</widget>
+	<widget name="main_menu/mods/mod_hint_r_switch" width="14" height="14" bitmap="hints/switch_r">
+	</widget>
+	<widget name="main_menu/mods/mod_hint_l_ps5" width="14" height="14" bitmap="hints/ps5_l1">
+	</widget>
+	<widget name="main_menu/mods/mod_hint_r_ps5" width="14" height="14" bitmap="hints/ps5_r1">
+	</widget>
+	<widget name="main_menu/mods/hub_screen" width="640" height="480" flags="pass_unhandled_to_focused_child pause_game" bitmap="bitmaps/gradient">
+		<on event="b" back="true"/>
+		<on event="back" back="true"/>
+		<child widget="main_menu/new_select/sel_list_desc_bkd"/>
+		<child widget="main_menu/mods/hub/hub_list"/>
+		<child widget="main_menu/mods/hub/header_hub"/>
+		<child widget="main_menu/mods/hub/community_content"/>
+	</widget>
+	<widget name="main_menu/mods/hub/hub_list" type="column_list" width="640" height="480" flags="pass_unhandled_to_focused_child up_down_tabs_children" description="main_menu/mods/hub/details">
+		<data input="port hub update"/>
+		<on event="created" run="port hub init"/>
+		<on event="deleted" run="port hub close"/>
+		<child widget="main_menu/mods/hub/op_map_1" x="20" y="73"/>
+		<child widget="main_menu/mods/hub/op_map_2" x="20" y="103"/>
+		<child widget="main_menu/mods/hub/op_map_3" x="20" y="133"/>
+		<child widget="main_menu/mods/hub/button_bar" y="414"/>
+	</widget>
+	<widget name="main_menu/mods/hub/op_map_1" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd_top" color="#FF2896FF">
+		<on event="a" run="port hub choose"/>
+		<on event="start" run="port hub choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/hub/map_name" x="12"/>
+		<child widget="main_menu/mods/hub/map_state" x="282"/>
+	</widget>
+	<widget name="main_menu/mods/hub/op_map_2" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port hub choose"/>
+		<on event="start" run="port hub choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/hub/map_name" x="12"/>
+		<child widget="main_menu/mods/hub/map_state" x="282"/>
+	</widget>
+	<widget name="main_menu/mods/hub/op_map_3" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port hub choose"/>
+		<on event="start" run="port hub choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/hub/map_name" x="12"/>
+		<child widget="main_menu/mods/hub/map_state" x="282"/>
+	</widget>
+	<widget name="main_menu/mods/hub/map_name" type="text" controller="1" width="372" height="22" font="ui\large_ui" color="#FF2896FF" text_y="4">
+	</widget>
+	<widget name="main_menu/mods/hub/map_state" type="text" controller="1" width="100" height="22" font="ui\small_ui" color="#FF2896FF" align="right" text_y="6" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/hub/details" width="640" height="480">
+		<child widget="main_menu/mods/hub/map_details_name"/>
+		<child widget="main_menu/mods/hub/map_details_text"/>
+	</widget>
+	<widget name="main_menu/mods/hub/map_details_name" type="text" controller="1" left="412" top="84" width="200" height="44" font="ui\large_ui" color="#FFFFFFFF">
+	</widget>
+	<widget name="main_menu/mods/hub/map_details_text" type="text" controller="1" left="412" top="130" width="200" height="272" font="ui\small_ui" color="#FF2896FF">
+	</widget>
+	<widget name="main_menu/mods/hub/button_bar" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">
+		<child widget="main_menu/mods/hub/button_back" x="510" y="1"/>
+	</widget>
+	<widget name="main_menu/mods/hub/button_back" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="BACK" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" back="true"/>
+		<on event="start" back="true"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/hub/header_hub" type="text" controller="1" left="35" top="11" width="363" height="59" text="MAPS &amp; MODS" font="ui\large_ui" color="#FFFFFFFF" text_x="13" text_y="16">
+	</widget>
+	<widget name="main_menu/mods/hub/community_content" type="text" controller="1" left="32" top="163" width="372" height="22" text="COMMUNITY CONTENT (COMING SOON)" font="ui\large_ui" color="#FF4C5866" text_y="4" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/mcc_maps_screen" width="640" height="480" flags="pass_unhandled_to_focused_child pause_game" bitmap="bitmaps/gradient">
+		<on event="b" back="true"/>
+		<on event="back" back="true"/>
+		<child widget="main_menu/new_select/sel_list_desc_bkd"/>
+		<child widget="main_menu/mods/mcc_maps/mcc_list"/>
+		<child widget="main_menu/mods/mcc_maps/header_mcc"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/mcc_list" type="column_list" width="640" height="480" flags="pass_unhandled_to_focused_child up_down_tabs_children" description="main_menu/mods/mcc_maps/details">
+		<data input="port hub update"/>
+		<on event="created" run="port hub init"/>
+		<on event="deleted" run="port hub close"/>
+		<child widget="main_menu/mods/mcc_maps/op_map_1" x="20" y="73"/>
+		<child widget="main_menu/mods/mcc_maps/op_map_2" x="20" y="103"/>
+		<child widget="main_menu/mods/mcc_maps/op_map_3" x="20" y="133"/>
+		<child widget="main_menu/mods/mcc_maps/op_map_4" x="20" y="163"/>
+		<child widget="main_menu/mods/mcc_maps/button_bar" y="414"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/op_map_1" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd_top" color="#FF2896FF">
+		<on event="a" run="port hub choose"/>
+		<on event="start" run="port hub choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mcc_maps/map_name" x="12"/>
+		<child widget="main_menu/mods/mcc_maps/map_state" x="282"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/op_map_2" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port hub choose"/>
+		<on event="start" run="port hub choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mcc_maps/map_name" x="12"/>
+		<child widget="main_menu/mods/mcc_maps/map_state" x="282"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/op_map_3" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port hub choose"/>
+		<on event="start" run="port hub choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mcc_maps/map_name" x="12"/>
+		<child widget="main_menu/mods/mcc_maps/map_state" x="282"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/op_map_4" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port hub choose"/>
+		<on event="start" run="port hub choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/mcc_maps/map_name" x="12"/>
+		<child widget="main_menu/mods/mcc_maps/map_state" x="282"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/map_name" type="text" controller="1" width="372" height="22" font="ui\large_ui" color="#FF2896FF" text_y="4">
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/map_state" type="text" controller="1" width="100" height="22" font="ui\small_ui" color="#FF2896FF" align="right" text_y="6" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/details" width="640" height="480">
+		<child widget="main_menu/mods/mcc_maps/map_details_name"/>
+		<child widget="main_menu/mods/mcc_maps/map_details_text"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/map_details_name" type="text" controller="1" left="412" top="84" width="200" height="44" font="ui\large_ui" color="#FFFFFFFF">
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/map_details_text" type="text" controller="1" left="412" top="130" width="200" height="272" font="ui\small_ui" color="#FF2896FF">
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/button_bar" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">
+		<child widget="main_menu/mods/mcc_maps/button_folder" x="470" y="-382" platform="desktop"/>
+		<child widget="main_menu/mods/mcc_maps/button_back" x="510" y="1"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/button_back" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="BACK" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" back="true"/>
+		<on event="start" back="true"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/button_folder" type="text" width="150" height="24" bitmap="bitmaps/text_button_background" text="OPEN FOLDER" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port mcc maps folder"/>
+		<on event="start" run="port mcc maps folder"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/mcc_maps/header_mcc" type="text" controller="1" left="35" top="11" width="363" height="59" text="MASTER CHIEF COLLECTION MAPS" font="ui\large_ui" color="#FFFFFFFF" text_x="13" text_y="16">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/ce_maps_screen" width="640" height="480" flags="pass_unhandled_to_focused_child pause_game" bitmap="bitmaps/gradient">
+		<on event="b" run="port maps back"/>
+		<on event="back" run="port maps back"/>
+		<child widget="main_menu/new_select/sel_list_desc_bkd"/>
+		<child widget="main_menu/mods/ce_maps/maps_list"/>
+		<child widget="main_menu/mods/ce_maps/header_ce"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/header_ce" type="text" controller="1" left="35" top="11" width="363" height="59" text="CUSTOM EDITION MAPS" font="ui\large_ui" color="#FFFFFFFF" text_x="13" text_y="16">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/maps_list" type="column_list" width="640" height="480" flags="pass_unhandled_to_focused_child up_down_tabs_children" description="main_menu/map_manager/map_details">
+		<data input="port maps update"/>
+		<on event="created" run="port ce maps init"/>
+		<on event="deleted" run="port maps close"/>
+		<child widget="main_menu/map_manager/op_map_1" x="20" y="73"/>
+		<child widget="main_menu/map_manager/op_map_2" x="20" y="103"/>
+		<child widget="main_menu/map_manager/op_map_3" x="20" y="133"/>
+		<child widget="main_menu/map_manager/op_map_4" x="20" y="163"/>
+		<child widget="main_menu/map_manager/op_map_5" x="20" y="193"/>
+		<child widget="main_menu/map_manager/op_map_6" x="20" y="223"/>
+		<child widget="main_menu/map_manager/op_map_7" x="20" y="253"/>
+		<child widget="main_menu/map_manager/op_map_8" x="20" y="283"/>
+		<child widget="main_menu/map_manager/op_map_9" x="20" y="313"/>
+		<child widget="main_menu/map_manager/op_map_10" x="20" y="343"/>
+		<child widget="main_menu/map_manager/op_map_11" x="20" y="373"/>
+		<child widget="main_menu/mods/ce_maps/button_bar" y="414"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/button_bar" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">
+		<child widget="main_menu/mods/ce_maps/button_folder" x="470" y="-382" platform="desktop"/>
+		<child widget="main_menu/mods/ce_maps/button_back" x="510" y="1"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/button_back" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="BACK" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port maps back"/>
+		<on event="start" run="port maps back"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/button_folder" type="text" width="150" height="24" bitmap="bitmaps/text_button_background" text="OPEN FOLDER" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port ce maps folder"/>
+		<on event="start" run="port ce maps folder"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse_screen" width="640" height="480" flags="pass_unhandled_to_focused_child pause_game" bitmap="bitmaps/gradient">
+		<on event="b" run="port archive back"/>
+		<on event="back" run="port archive back"/>
+		<child widget="main_menu/new_select/sel_list_desc_bkd"/>
+		<child widget="main_menu/mods/ce_maps/browse/archive_list"/>
+		<child widget="main_menu/mods/ce_maps/browse/header_archive"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/header_archive" type="text" controller="1" left="35" top="11" width="363" height="59" text="BROWSE MAPS" font="ui\large_ui" color="#FFFFFFFF" text_x="13" text_y="16">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/archive_list" type="column_list" width="640" height="480" flags="pass_unhandled_to_focused_child up_down_tabs_children" description="main_menu/mods/ce_maps/browse/archive_details">
+		<data input="port archive update"/>
+		<on event="created" run="port archive init"/>
+		<on event="deleted" run="port archive close"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_1" x="20" y="73"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_2" x="20" y="103"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_3" x="20" y="133"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_4" x="20" y="163"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_5" x="20" y="193"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_6" x="20" y="223"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_7" x="20" y="253"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_8" x="20" y="283"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_9" x="20" y="313"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_10" x="20" y="343"/>
+		<child widget="main_menu/mods/ce_maps/browse/op_map_11" x="20" y="373"/>
+		<child widget="main_menu/mods/ce_maps/browse/button_bar" y="414"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_1" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd_top" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_2" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_3" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_4" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_5" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_6" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_7" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_8" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_9" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_10" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/op_map_11" width="390" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/sel_list_item_bkd" color="#FF2896FF">
+		<on event="a" run="port archive choose"/>
+		<on event="start" run="port archive choose"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_name" x="12"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_state" x="230"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/map_name" type="text" controller="1" width="214" height="22" font="ui\large_ui" color="#FF2896FF" text_y="4">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/map_state" type="text" controller="1" width="118" height="22" font="ui\small_ui" color="#FF2896FF" align="right" text_y="6" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/archive_details" width="640" height="480">
+		<child widget="main_menu/mods/ce_maps/browse/map_details_name"/>
+		<child widget="main_menu/mods/ce_maps/browse/map_details_text"/>
+		<child widget="main_menu/mods/ce_maps/browse/archive_picture"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/map_details_name" type="text" controller="1" left="412" top="84" width="200" height="44" font="ui\large_ui" color="#FFFFFFFF">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/map_details_text" type="text" controller="1" left="412" top="130" width="200" height="146" font="ui\small_ui" color="#FF2896FF">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/archive_picture" controller="1" left="432" top="280" width="160" height="120" bitmap="blank">
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/button_bar" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">
+		<child widget="main_menu/mods/ce_maps/browse/button_back" x="510" y="1"/>
+	</widget>
+	<widget name="main_menu/mods/ce_maps/browse/button_back" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" text="BACK" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port archive back"/>
+		<on event="start" run="port archive back"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+</menus>

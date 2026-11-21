@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The bridge (build.gradle): the old app's last update, which installs the game under its new id and hands it the
+     old app's files -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- downloading the game from GitHub, and installing it -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- the game under its new id: whether it is installed, and opening it -->
+    <queries>
+        <package android:name="${newPackage}" />
+    </queries>
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
+
+        <!-- opens the game when it is installed, else installs it; the old app's invite links go on to it -->
+        <activity
+            android:name=".BridgeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="halo" android:host="join" />
+            </intent-filter>
+        </activity>
+
+        <!-- the old app's files, read-only, for an app signed with this app's key only (it checks each caller) -->
+        <provider
+            android:name=".MigrationProvider"
+            android:authorities="${applicationId}.migrate"
+            android:exported="true" />
+
+        <!-- the downloaded game, for the package installer -->
+        <provider
+            android:name=".InstallProvider"
+            android:authorities="${applicationId}.install"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- installed over the old app by its updater: on at once to the game's install -->
+        <receiver
+            android:name=".BridgeReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

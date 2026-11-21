@@ -1,0 +1,1084 @@
+"""Ninja rules for the Android build (``ninja android``).
+
+The Android port (port/android/README.md) runs the game as ILP32 AArch64
+code - 32-bit pointers, as the game's data formats require - inside an
+ordinary 64-bit Android app. This graph builds
+
+- the guest image, build/android/halo_guest.elf: the game sources, the
+  platform layer shared with the Linux port (port/linux/src) and the guest
+  runtime (port/android/guest) with a subset of musl as its C library, all
+  compiled by clang for arm64_32-apple-watchos (ARM64_32 in
+  tools/guest_arch.py), converted to ELF assembly
+  (tools/android_asm_convert.py), assembled for AArch64 and linked at a fixed
+  address below 4 GB;
+- the host library, build/android/jniLibs/arm64-v8a/libmain.so, with the
+  Android NDK: the loader and the services the guest calls, over SDL3;
+- SDL3 itself, with the NDK's CMake toolchain file;
+
+and stages both, with the SDL3 Java sources, for the Gradle project in
+port/android/app, which ``ninja android_apk`` then assembles.
+"""
+
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from .guest_arch import ARM64_32, GuestArch
+from .linux_build import (DYNAMIC_LIGHTING_GAME_SOURCES, DYNAMIC_LIGHTING_PLATFORM_SOURCES, GAME_DATA_FILES, LINUX_PROFILE, MINIUPNPC_DEFINES, MINIUPNPC_DIR, MUSL_MATH_DIR, STB_VORBIS_SOURCE, XDK_INCLUDE,
+                          compile_launcher, configuration_defines, game_defines_and_includes, game_sources,
+                          miniupnpc_sources, musl_math_sources, opus_cflags, opus_sources, pgo_mode, pgo_profile,
+                          profile_use_flags, updater_defines, xdk_headers)
+from . import check_host_imports
+from .embed_assets import hud_assets_build, hud_configure_inputs
+from .forge_build import forge_cflags, forge_source_flags, forge_sources
+from .linux_sysroot import download
+from .macos_toolchain import android_sdk, default_clang, java_home
+from .ninja_syntax import Writer
+
+PORT_DIR = Path("port/android")
+GUEST_ARCH_SCRIPT = Path("tools/guest_arch.py")
+LINUX_DIR = Path("port/linux")
+BUILD = Path("build/android")
+THIRD_PARTY = BUILD / "third_party"
+# the TOML parser config.toml is read with (port/linux/src/port_config.c)
+TOML_DIR = Path("port/third_party/tomlc17")
+EXPAT_DIR = Path("port/third_party/expat")
+EXPAT_SOURCES = ("xmlparse.c", "xmlrole.c", "xmltok.c")
+KCP_DIR = Path("port/third_party/kcp")
+# internet play's DTLS with browsers (port/linux/src/posix_dtls.c, in the host)
+MBEDTLS_DIR = Path("port/third_party/mbedtls")
+MONOCYPHER_DIR = Path("port/third_party/monocypher")
+# the port's zlib (port/third_party/zlib/zlib_prefixed.h): what inflates the
+# maps, the menus' and the HUD's PNGs and the updates, data from anywhere,
+# instead of the game's own 1.1.3 (its inflate only, its names prefixed z_)
+ZLIB_DIR = Path("port/third_party/zlib")
+ZLIB_SOURCES = ("adler32.c", "crc32.c", "inffast.c", "inflate.c", "inftrees.c", "uncompr.c", "zutil.c")
+# (its names prefixed, and the one Z_PREFIX leaves, its error messages, which
+# the game's zlib names the same)
+ZLIB_DEFINES = ("-DZ_PREFIX", "-Dz_errmsg=z_port_errmsg")
+MUSL_VERSION = "1.2.5"
+MUSL_DIR = THIRD_PARTY / f"musl-{MUSL_VERSION}"
+MUSL_URL = f"https://musl.libc.org/releases/musl-{MUSL_VERSION}.tar.gz"
+MUSL_SHA256 = "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"
+# (the same archive, byte for byte, where musl.libc.org does not answer: it was
+# down on 2026-11-03 and failed a branch's Switch build, whose cache is only the
+# tags'; download checks each against MUSL_SHA256)
+MUSL_MIRRORS = [
+    f"https://deb.debian.org/debian/pool/main/m/musl/musl_{MUSL_VERSION}.orig.tar.gz",
+    f"https://sources.buildroot.net/musl/musl-{MUSL_VERSION}.tar.gz",
+]
+# (as tools/windows_build.py's and tools/linux_sysroot.py's SDL_VERSION)
+# (the download's SHA-256, and the tag's commit, when they were pinned)
+MUSL_SHA256 = "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"
+SDL_TAG = "release-3.4.16"
+SDL_COMMIT = "fa2c02bb6e21974a89ea9824bc53c9932abe5f9c"
+SDL_DIR = THIRD_PARTY / "SDL3"
+SDL_URL = "https://github.com/libsdl-org/SDL.git"
+SDL_ANDROID_MOUSE_PATCH = Path("port/android/patches/sdl-relative-mouse.patch")
+SDL_ANDROID_MOUSE_LISTENER = "android-project/app/src/main/java/org/libsdl/app/SDLControllerManager.java"
+ANDROID_API = 28
+# the Vulkan probe's shader compiler (port/android/VULKAN.md, phase 0, step 4)
+GLSLANG_TAG = "16.6.0"
+GLSLANG_DIR = THIRD_PARTY / "glslang"
+GLSLANG_URL = "https://github.com/KhronosGroup/glslang.git"
+# the Android release of the validation layer, only with --android-vulkan-validation
+VALIDATION_VERSION = "1.4.363.0"
+VALIDATION_URL = ("https://github.com/KhronosGroup/Vulkan-ValidationLayers/releases/download/"
+                  f"vulkan-sdk-{VALIDATION_VERSION}/android-binaries-{VALIDATION_VERSION}.tar.gz")
+VALIDATION_DIR = THIRD_PARTY / f"vulkan-validation-{VALIDATION_VERSION}"
+PROBE_DIR = PORT_DIR / "probe"
+# loads a Vulkan driver of the app's own (port/android/VULKAN.md, phase 0, part B): Eden's fork of
+# libadrenotools (BSD-2-Clause) at a pinned commit, with its submodule lib/linkernsbypass (the
+# commit the superproject records) and port/android/probe/adrenotools.patch applied
+ADRENOTOOLS_COMMIT = "8ba23b42d742545b709064d6e2523cdb86de68f5"
+ADRENOTOOLS_DIR = THIRD_PARTY / "libadrenotools"
+ADRENOTOOLS_URL = "https://github.com/eden-emulator/libadrenotools"
+# the library and the hooks it loads by name from the native library directory
+ADRENOTOOLS_HOOKS = ("libhook_impl.so", "libmain_hook.so", "libfile_redirect_hook.so", "libgsl_alloc_hook.so")
+
+# The guest's code generation on every architecture (tools/guest_arch.py has
+# each one's target): no C library but the guest's (musl), no unwinding
+# tables, and thread-local variables through the guest runtime
+GUEST_FLAGS = [
+    "-nostdinc",
+    "-fshort-wchar",
+    "-fno-stack-protector",
+    "-fno-unwind-tables",
+    "-fno-asynchronous-unwind-tables",
+    "-femulated-tls",
+    # no fused multiply-add: the game was written for x87/SSE arithmetic,
+    # and its debug assertions (colours within 0..1, unit vectors) trip on
+    # the different rounding of fused operations
+    "-ffp-contract=off",
+    "-O2",
+]
+# the Android app's code paths, and the OpenGL ES renderer's, which the
+# desktop guest builds share (tools/linux_guest_build.py)
+ANDROID_DEFINES = ["-DHALO_GLES=1", "-DHALO_ANDROID=1"]
+
+# as the Linux build (tools/linux_build.py), minus what only x86 needs
+GUEST_CODE_FLAGS = [
+    "-fms-extensions",
+    "-fcommon",
+    "-fno-strict-aliasing",
+    "-fwrapv",
+    "-fno-delete-null-pointer-checks",
+    "-fno-omit-frame-pointer",
+    *(f"-fno-builtin-{name}" for name in (
+        "wcslen", "wcsnlen", "wcschr", "wcsrchr", "wcscmp", "wcsncmp", "wcscpy",
+        "wcsncpy", "wcscat", "wcsncat", "wmemchr", "wmemcmp", "wmemcpy",
+        "wmemmove", "wmemset",
+    )),
+]
+
+MUSL_DIRECTORIES = [
+    "conf", "ctype", "dirent", "env", "errno", "exit", "fcntl", "internal",
+    "locale", "malloc", "malloc/mallocng", "math", "mman", "multibyte",
+    "prng", "sched", "select", "signal", "stat", "stdio", "stdlib", "string",
+    "time", "unistd",
+]
+MUSL_FILES = [
+    "thread/__lock.c", "thread/__wait.c", "thread/__timedwait.c",
+    "thread/__syscall_cp.c", "thread/vmlock.c", "thread/pthread_self.c",
+    "thread/pthread_equal.c", "thread/pthread_once.c",
+    "thread/pthread_setcancelstate.c", "thread/pthread_testcancel.c",
+    "thread/default_attr.c", "thread/lock_ptc.c", "misc/getauxval.c",
+    "linux/sysinfo.c", "misc/basename.c", "misc/dirname.c",
+    "misc/realpath.c", "misc/uname.c", "misc/ioctl.c", "misc/getrlimit.c",
+    "misc/syscall.c", "network/htonl.c", "network/htons.c", "network/ntohl.c",
+    "network/ntohs.c", "network/inet_addr.c", "network/inet_aton.c",
+    "network/inet_ntoa.c", "network/inet_pton.c", "network/inet_ntop.c",
+]
+MUSL_THREAD_PREFIXES = (
+    "pthread_attr_", "pthread_cond", "pthread_mutex", "pthread_rwlock",
+    "pthread_spin", "sem_",
+)
+# replaced by the guest runtime (port/android/guest/runtime)
+MUSL_EXCLUDE = {
+    "env/__stack_chk.c", "env/__init_tls.c", "env/__libc_start_main.c",
+    "env/__reset_tls.c", "malloc/oldmalloc", "thread/pthread_create.c",
+    # unused, and its compiler barrier is an inline assembly statement
+    "string/explicit_bzero.c",
+    # eight bytes at a time (guest_string.c)
+    "string/memcmp.c",
+}
+# game files that call variadic functions without a prototype in scope, which
+# only works under x86's calling convention (tools/android_abi_check.py)
+VARIADIC_PROTOTYPE_FILES = {
+    "source/ai/action_uncover.c", "source/ai/ai.c", "source/ai/ai_debug.c",
+    "source/bungie_net/common/public_key_crypt.c", "source/camera/editor_flying_camera.c",
+    "source/game/cheats.c", "source/game/game_engine.c", "source/game/players.c",
+    "source/hs/hs.c", "source/interface/hud_nav_points.c",
+    "source/networking/telnet_console.c", "source/rasterizer/xbox/rasterizer_xbox_errors.c",
+    "source/render/render.c",
+}
+
+HOST_LIBRARIES = ["SDL3", "GLESv3", "EGL", "log", "android", "m", "dl", "z"]
+
+
+def _quote(path: Any) -> str:
+    text = str(path).replace(os.sep, "/")
+    return f'"{text}"' if " " in text else text
+
+
+def _find_ndk() -> Optional[Path]:
+    for variable in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK"):
+        if os.environ.get(variable) and Path(os.environ[variable]).is_dir():
+            return Path(os.environ[variable])
+    # (ANDROID_HOME's, or on macOS Android Studio's: tools/macos_toolchain.py)
+    sdk_found = android_sdk()
+    for sdk in (*([sdk_found] if sdk_found else []), Path.home() / "Android/Sdk", Path("/opt/android-sdk")):
+        if (sdk / "ndk").is_dir():
+            versions = sorted((sdk / "ndk").iterdir())
+            if versions:
+                return versions[-1]
+    return None
+
+
+def check_sdl_commit(directory: Path) -> None:
+    """SDL3's clone refused unless its tag is still the pinned commit."""
+    commit = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True,
+                            check=True).stdout.strip()
+    if commit != SDL_COMMIT:
+        shutil.rmtree(directory)
+        raise SystemExit(f"SDL3 {SDL_TAG} is {commit}, not the pinned {SDL_COMMIT}")
+
+
+def compiler_include(cc: str) -> str:
+    """the folder of the compiler's own headers (clang's resource
+    directory's), asked of it at configure time"""
+    try:
+        resource = subprocess.run([cc, "-print-resource-dir"], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(f"{cc} -print-resource-dir failed ({error})") from error
+    return _quote(Path(resource) / "include")
+
+
+def guest_abi_flags(arch: GuestArch, platform_defines: List[str]) -> List[str]:
+    """the guest's code generation and defines: the architecture's, every
+    guest's (HALO_GUEST, and HALO_GUEST_MACHO where clang writes Mach-O,
+    port/linux/include/halo_linux_prefix.h), and the platform's
+    (ANDROID_DEFINES, or a desktop's)"""
+    guest_defines = ["-DHALO_GUEST=1", *(["-DHALO_GUEST_MACHO=1"] if arch.darwin_assembly else [])]
+    return [*arch.target_flags, *GUEST_FLAGS, *guest_defines, *arch.defines, *platform_defines]
+
+
+def fetch_third_party(third_party: Path = THIRD_PARTY) -> None:
+    """Download musl and SDL3 (configure time, once). musl's archive is
+    checked against MUSL_SHA256 before it is unpacked; a failed download
+    raises RuntimeError, and a failed clone CalledProcessError."""
+    musl_dir = third_party / f"musl-{MUSL_VERSION}"
+    sdl_dir = third_party / "SDL3"
+    third_party.mkdir(parents=True, exist_ok=True)
+    if not musl_dir.is_dir():
+        print(f"Downloading {MUSL_URL}")
+        archive = third_party / f"musl-{MUSL_VERSION}.tar.gz"
+        archive.write_bytes(download([MUSL_URL] + MUSL_MIRRORS, MUSL_SHA256))
+        # (unpacked beside it and then moved, so that an interrupted unpacking
+        # leaves no folder that a later configure would take as complete)
+        unpacked = third_party / f"musl-{MUSL_VERSION}.unpacked"
+        shutil.rmtree(unpacked, ignore_errors=True)
+        unpacked.mkdir()
+        subprocess.run(["tar", "xzf", str(archive.resolve())], cwd=unpacked, check=True)
+        (unpacked / musl_dir.name).rename(musl_dir)
+        unpacked.rmdir()
+        archive.unlink()
+    if not sdl_dir.is_dir():
+        print(f"Cloning SDL3 {SDL_TAG}")
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", SDL_TAG, SDL_URL, str(sdl_dir)],
+                       check=True)
+        check_sdl_commit(sdl_dir)
+    # SDL 3.4.16's generic mouse listener drops captured relative motion and
+    # button transitions unless they are forwarded from captured pointer events.
+    # A tree patched by another version of the patch (an older checkout, or
+    # CI's cached one) is put back as SDL has it before this one is applied.
+    reverse = subprocess.run(
+        ["git", "-C", str(sdl_dir), "apply", "--reverse", "--check", str(SDL_ANDROID_MOUSE_PATCH.resolve())],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if reverse.returncode != 0:
+        subprocess.run(["git", "-C", str(sdl_dir), "checkout", "--", SDL_ANDROID_MOUSE_LISTENER], check=True)
+        subprocess.run(["git", "-C", str(sdl_dir), "apply", str(SDL_ANDROID_MOUSE_PATCH.resolve())], check=True)
+
+
+def fetch_android_third_party(validation: bool = False) -> None:
+    """Download what only the Android app builds (configure time, once):
+    glslang, libadrenotools and, if asked, the validation layer."""
+    THIRD_PARTY.mkdir(parents=True, exist_ok=True)
+    if not GLSLANG_DIR.is_dir():
+        print(f"Cloning glslang {GLSLANG_TAG}")
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", GLSLANG_TAG, GLSLANG_URL,
+                        str(GLSLANG_DIR)], check=True)
+    if not ADRENOTOOLS_DIR.is_dir():
+        print(f"Cloning libadrenotools {ADRENOTOOLS_COMMIT[:8]}")
+        try:
+            subprocess.run(["git", "clone", "-q", ADRENOTOOLS_URL, str(ADRENOTOOLS_DIR)], check=True)
+            subprocess.run(["git", "-C", str(ADRENOTOOLS_DIR), "checkout", "-q", ADRENOTOOLS_COMMIT], check=True)
+            subprocess.run(["git", "-C", str(ADRENOTOOLS_DIR), "submodule", "update", "--init", "-q"], check=True)
+        except (subprocess.CalledProcessError, OSError):
+            # a half-made folder would be taken for a finished one at the next configure
+            shutil.rmtree(ADRENOTOOLS_DIR, ignore_errors=True)
+            raise
+    _patch_adrenotools()
+    if validation and not VALIDATION_DIR.is_dir():
+        print(f"Downloading {VALIDATION_URL}")
+        archive = THIRD_PARTY / "vulkan-validation.tar.gz"
+        VALIDATION_DIR.mkdir(parents=True)
+        subprocess.run(["curl", "-sSfL", "-o", str(archive), VALIDATION_URL], check=True)
+        subprocess.run(["tar", "xzf", str(archive.resolve()), "-C", str(VALIDATION_DIR)], check=True)
+        archive.unlink()
+
+
+def _patch_adrenotools() -> None:
+    """Applies port/android/probe/adrenotools.patch to the fetched libadrenotools, again whenever the patch
+    changes: the sources are put back to the pinned commit first. The applied patch's text is kept beside
+    them to compare with."""
+    patch = PROBE_DIR / "adrenotools.patch"
+    applied = ADRENOTOOLS_DIR / ".halo_applied.patch"
+    wanted = patch.read_text()
+    if applied.is_file() and applied.read_text() == wanted:
+        return
+    print("Applying adrenotools.patch to libadrenotools")
+    subprocess.run(["git", "-C", str(ADRENOTOOLS_DIR), "checkout", "-q", "--", "."], check=True)
+    subprocess.run(["git", "-C", str(ADRENOTOOLS_DIR), "apply", str(patch.resolve())], check=True)
+    applied.write_text(wanted)
+
+
+def _musl_sources(musl_dir: Path = MUSL_DIR) -> List[Path]:
+    src = musl_dir / "src"
+    result = set()
+    for directory in MUSL_DIRECTORIES:
+        for path in (src / directory).glob("*.c"):
+            result.add(path)
+    for name in MUSL_FILES:
+        result.add(src / name)
+    for path in (src / "thread").glob("*.c"):
+        if path.name.startswith(MUSL_THREAD_PREFIXES):
+            result.add(path)
+    sources = []
+    for path in sorted(result):
+        relative = path.relative_to(src).as_posix()
+        if relative in MUSL_EXCLUDE or any(relative.startswith(e + "/") for e in MUSL_EXCLUDE):
+            continue
+        sources.append(path)
+    return sources
+
+
+def android_configure_inputs() -> List[Path]:
+    return [Path(__file__), Path(__file__).with_name("macos_toolchain.py"), GUEST_ARCH_SCRIPT, SDL_ANDROID_MOUSE_PATCH, PORT_DIR / "guest", PORT_DIR / "guest" / "runtime",
+            PORT_DIR / "host", PORT_DIR / "probe", PORT_DIR / "probe" / "adrenotools.patch", LINUX_DIR / "src",
+            *hud_configure_inputs()]
+
+
+def generate_guest_image(n: Writer, sln: Any, config: Dict[str, Any], *, arch: GuestArch, prefix: str, label: str,
+                         build: Path, third_party: Path, guest_cc: str, gl_headers: Path, ar: str, ld: str,
+                         objdump: str, builtins_cc: str, environment: str, platform_defines: List[str],
+                         extra_runtime: Optional[List[Path]] = None, extra_imports: Optional[List[Path]] = None,
+                         updater_cflags: str = "", desktop_gl: bool = False, relocatable: bool = False,
+                         vulkan: bool = False, extra_sources: Optional[List[Path]] = None,
+                         base_register: bool = False) -> Dict[str, Path]:
+    """The guest image (build/halo_guest.elf) and the host's import table, for
+    the builds that run the game as ILP32 code of the architecture arch
+    (tools/guest_arch.py): Android, and the desktop guest builds
+    (tools/linux_guest_build.py). The caller sets ${prefix}_guest_cc to
+    guest_cc; gl_headers holds the OpenGL ES headers (GLES2, GLES3, KHR), and
+    ar, ld and objdump are the archiver, the linker and the disassembler (with
+    which tools/guest_image_check.py checks the image). builtins_cc is the compiler
+    that names the runtime library the image links with, and environment the
+    toolchain's (android, gnu), which the assembler's target ends with;
+    platform_defines are the platform's code paths (ANDROID_DEFINES, or a
+    desktop's). extra_runtime are more guest runtime sources, and
+    extra_imports more lists of the host functions they import; extra_sources
+    are more of the platform layer's sources, with its flags (the PS5's QR
+    code encoder, port/third_party/qrcodegen);
+    updater_cflags are the desktop self-updater's defines
+    (port/linux/src/updater.c), for a guest that has it. desktop_gl gives the
+    guest desktop OpenGL's entry points (from gl_headers' GL/glcorearb.h) in
+    place of OpenGL ES's, for a guest without HALO_GLES (the desktop guest
+    builds' desktop renderer). relocatable also writes the table of the
+    image's 32-bit pointers (halo_guest.relocs, tools/guest_relocations.py),
+    with which the Android host loads the image elsewhere when its address is
+    taken; vulkan also links the image with the Vulkan renderer
+    (halo_guest_vk.elf, port/android/VULKAN.md), from the same objects but
+    the OpenGL renderer's. base_register builds a guest whose memory lies at
+    any base the host chooses (tools/guest_base_register.py: the macOS build,
+    whose processes have no low 4 GB) rather than in the low 4 GB."""
+    if base_register and arch.base_register_flags is None:
+        raise RuntimeError(f"the {arch.name} guest has no base register (tools/guest_base_register.py)")
+    base_flag = " --base-register" if base_register else ""
+    extra_runtime = extra_runtime or []
+    extra_imports = extra_imports or []
+    extra_sources = extra_sources or []
+    asm_target = arch.assembler_target(environment)
+    musl_dir = third_party / f"musl-{MUSL_VERSION}"
+    sdl_dir = third_party / "SDL3"
+    guest_dir = build / "guest"
+    obj_dir = guest_dir / "obj"
+    gen_dir = guest_dir / "gen"
+    libc_include = guest_dir / "libc_include"
+    libc_internal = guest_dir / "libc_internal"
+    gl_include = guest_dir / "gl_include"
+    libc_arch = PORT_DIR / "guest" / "libc" / "arch" / arch.name
+    # what every guest architecture shares: the system call interface the
+    # host translates (port/android/include/halo_guest_syscall.h)
+    arch_generic = PORT_DIR / "guest" / "libc" / "arch" / "generic"
+    semantics_header = Path("build/linux/halo_msvc_semantics.h")
+    platform_semantics_header = Path("build/linux/platform_msvc_semantics.h")
+    prefix_header = LINUX_DIR / "include" / "halo_linux_prefix.h"
+    image = build / "halo_guest.elf"
+    python = "$python"
+
+    # ---------- generated headers and sources
+
+    alltypes = libc_include / "bits" / "alltypes.h"
+    syscall_h = libc_include / "bits" / "syscall.h"
+    version_h = libc_internal / "version.h"
+    n.rule(
+        name=f"{prefix}_alltypes",
+        command=f"sed -f {musl_dir}/tools/mkalltypes.sed $in > $out",
+        description=f"{label} MUSL $out",
+    )
+    n.build(outputs=alltypes, rule=f"{prefix}_alltypes",
+            inputs=[libc_arch / "bits" / "alltypes.h.in", musl_dir / "include" / "alltypes.h.in"])
+    n.rule(
+        name=f"{prefix}_syscall_h",
+        command="cp $in $out && sed -n -e s/__NR_/SYS_/p < $in >> $out",
+        description=f"{label} MUSL $out",
+    )
+    n.build(outputs=syscall_h, rule=f"{prefix}_syscall_h", inputs=arch_generic / "bits" / "syscall.h.in")
+    n.rule(
+        name=f"{prefix}_version_h",
+        command=f"echo '#define VERSION \"{MUSL_VERSION}\"' > $out",
+        description=f"{label} MUSL $out",
+    )
+    n.build(outputs=version_h, rule=f"{prefix}_version_h")
+
+    # the NDK's OpenGL ES headers (C declarations only) for the guest
+    gl_stamp = gl_include / "stamp"
+    n.rule(
+        name=f"{prefix}_gl_include",
+        command=(f"mkdir -p {gl_include} && ln -sfn {gl_headers}/GLES2 {gl_include}/GLES2 && "
+                 f"ln -sfn {gl_headers}/GLES3 {gl_include}/GLES3 && "
+                 f"ln -sfn {gl_headers}/KHR {gl_include}/KHR && "
+                 f"ln -sfn {gl_headers}/GL {gl_include}/GL && touch $out"),
+        description=f"{label} GL HEADERS",
+    )
+    n.build(outputs=gl_stamp, rule=f"{prefix}_gl_include")
+
+    guest_gl_c = gen_dir / "guest_gl.c"
+    gl_imports = gen_dir / "gl_imports.list"
+    if desktop_gl:
+        gl_stubs_command = (f"{python} tools/android_gl_stubs.py --arch {arch.name} --desktop {LINUX_DIR}/src/gl.h "
+                            f"{gl_headers}/GL/glcorearb.h {guest_gl_c} {gl_imports}")
+    else:
+        gl_stubs_command = (f"{python} tools/android_gl_stubs.py --arch {arch.name} {LINUX_DIR}/src/gl.h "
+                            f"{gl_headers}/GLES3/gl32.h {gl_headers}/GLES2/gl2ext.h {guest_gl_c} {gl_imports}")
+    n.rule(
+        name=f"{prefix}_gl_stubs",
+        command=gl_stubs_command,
+        description=f"{label} GL STUBS",
+    )
+    n.build(outputs=[guest_gl_c, gl_imports], rule=f"{prefix}_gl_stubs",
+            implicit=[Path("tools/android_gl_stubs.py"), GUEST_ARCH_SCRIPT, LINUX_DIR / "src" / "gl.h"])
+
+    guest_posix_c = gen_dir / "guest_posix.c"
+    posix_imports = gen_dir / "posix_imports.list"
+    n.rule(
+        name=f"{prefix}_posix_stubs",
+        command=f"{python} tools/android_posix_stubs.py{base_flag} {LINUX_DIR}/src/posix.h {guest_posix_c} {posix_imports}",
+        description=f"{label} POSIX STUBS",
+    )
+    n.build(outputs=[guest_posix_c, posix_imports], rule=f"{prefix}_posix_stubs",
+            implicit=[Path("tools/android_posix_stubs.py"), LINUX_DIR / "src" / "posix.h"])
+
+    imports_s = gen_dir / "imports.s"
+    host_table_c = build / "host" / "host_import_table.c"
+    host_imports_list = PORT_DIR / "host_imports.list"
+    n.rule(
+        name=f"{prefix}_imports",
+        command=f"{python} tools/android_imports.py --arch {arch.name}{base_flag} --host-table {host_table_c} {imports_s} $in",
+        description=f"{label} IMPORTS",
+    )
+    # every import's arguments must cross to the host as the guest left them
+    # (tools/check_host_imports.py)
+    imports_checked = gen_dir / "host_imports.checked"
+    n.rule(
+        name=f"{prefix}_import_check",
+        command=f"{python} tools/check_host_imports.py --stamp $out",
+        description=f"{label} CHECK IMPORTS",
+    )
+    n.build(outputs=imports_checked, rule=f"{prefix}_import_check",
+            implicit=[Path("tools/check_host_imports.py"), *check_host_imports.inputs()])
+    n.build(outputs=[imports_s, host_table_c], rule=f"{prefix}_imports",
+            inputs=[host_imports_list, *extra_imports, posix_imports, gl_imports],
+            implicit=[Path("tools/android_imports.py"), GUEST_ARCH_SCRIPT, imports_checked])
+
+    generated_headers = [*xdk_headers(), alltypes, syscall_h, version_h, gl_stamp,
+                         semantics_header, platform_semantics_header]
+
+    # ---------- guest compilation: C -> object, or for a Darwin target
+    # C -> Darwin assembly -> ELF assembly -> object
+
+    if arch.darwin_assembly:
+        guest_cc_command = (f"{compile_launcher(sln)}${prefix}_guest_cc -MMD -MF $out.d $cflags -S $in "
+                            f"-o $out.darwin.s && {python} tools/android_asm_convert.py{base_flag} $out.darwin.s $out.s && "
+                            f"${prefix}_guest_cc --target={asm_target} -c $out.s -o $out")
+    else:
+        guest_cc_command = f"{compile_launcher(sln)}${prefix}_guest_cc -MMD -MF $out.d $cflags -c $in -o $out"
+    n.rule(
+        name=f"{prefix}_guest_cc",
+        command=guest_cc_command,
+        description=f"{label} CC $out",
+        depfile="$out.d",
+        deps="gcc",
+    )
+    n.rule(
+        name=f"{prefix}_guest_as",
+        command=f"${prefix}_guest_cc --target={asm_target} -c $in -o $out",
+        description=f"{label} AS $out",
+    )
+
+    libc_includes = [
+        f"-isystem {libc_include}", f"-isystem {libc_arch}", f"-isystem {arch_generic}",
+        f"-isystem {musl_dir}/arch/generic",
+        f"-isystem {musl_dir}/include",
+        *([f"-idirafter {compiler_include(guest_cc)}"] if arch.compiler_headers else []),
+    ]
+    # (a base register's code generation, GuestArch.base_register_flags)
+    base_register_flags = [*(arch.base_register_flags or ()), "-DHALO_GUEST_BASE=1"] if base_register else []
+    guest_abi = " ".join(guest_abi_flags(arch, platform_defines) + base_register_flags + configuration_defines(sln))
+    guest_code = " ".join(GUEST_CODE_FLAGS)
+    tool_implicit = [*([Path("tools/android_asm_convert.py")] if arch.darwin_assembly else []), *generated_headers]
+    if base_register:
+        tool_implicit += [Path("tools/guest_base_register.py"), Path("tools/guest_branch_relax.py")]
+    # profile-guided optimisation with the Linux build's profile (committed,
+    # or trained by the Linux build with --pgo=train): the game and platform
+    # code are the same, and functions that differ simply go without
+    profile = pgo_profile(sln, LINUX_PROFILE if pgo_mode(sln) == "train" else None, [LINUX_PROFILE], guest_cc)
+    profile_flags = " ".join(profile_use_flags(profile))
+    if profile:
+        tool_implicit.append(profile)
+
+    def guest_object(source: Path, cflags: str, subdir: str = "") -> Path:
+        obj = obj_dir / subdir / Path(str(source).lstrip("/")).with_suffix(".o")
+        if str(source).startswith(str(build)):
+            obj = obj_dir / subdir / source.relative_to(build).with_suffix(".o")
+        n.build(outputs=obj, rule=f"{prefix}_guest_cc", inputs=source, implicit=tool_implicit,
+                variables={"cflags": cflags})
+        return obj
+
+    # musl
+    musl_cflags = " ".join([
+        guest_abi, "-std=c99", "-ffreestanding", "-fno-common", "-D_XOPEN_SOURCE=700", "-w",
+        f"-I{libc_arch}", f"-I{arch_generic}", f"-I{musl_dir}/arch/generic", f"-I{libc_internal}",
+        f"-I{PORT_DIR}/guest/libc/src_include", f"-I{musl_dir}/src/include",
+        f"-I{musl_dir}/src/internal", f"-I{libc_include}", f"-I{musl_dir}/include",
+    ])
+    musl_objects = [guest_object(source, musl_cflags, "musl") for source in _musl_sources(musl_dir)]
+    libguestc = guest_dir / "libguestc.a"
+    n.rule(
+        name=f"{prefix}_ar",
+        command=f"rm -f $out && {ar} rcs $out @$out.rsp",
+        description=f"{label} AR $out",
+        rspfile="$out.rsp",
+        rspfile_content="$in_newline",
+    )
+    n.build(outputs=libguestc, rule=f"{prefix}_ar", inputs=musl_objects)
+
+    # the game
+    objects: List[Path] = []
+    game_flags = [
+        "-std=gnu89", "-D__STRICT_ANSI__", "-w",
+        "-Wno-error=incompatible-pointer-types",
+        "-Wno-error=incompatible-function-pointer-types",
+        "-Wno-error=int-conversion",
+        "-Wno-error=implicit-function-declaration",
+        "-Wno-error=implicit-int",
+        "-Wno-error=return-type",
+    ]
+    game_cflags = " ".join([
+        guest_abi, guest_code, " ".join(game_flags), profile_flags,
+        f"-include {prefix_header}", f"-include {semantics_header}",
+        f"-I{LINUX_DIR}/include",
+        # the headers of the port's own game units (port/linux/game), for the
+        # game sources that call them
+        f"-iquote {Path(config['game_sources'])}",
+        game_defines_and_includes(config), *libc_includes, f"-idirafter {XDK_INCLUDE}",
+    ])
+    for source in game_sources(config):
+        cflags = game_cflags
+        if source.as_posix() == "source/main/main.c":
+            cflags += " " + updater_defines(getattr(sln, "port_release", False))
+        if source.as_posix() in VARIADIC_PROTOTYPE_FILES:
+            cflags += f" -include {PORT_DIR}/include/halo_android_variadic_prototypes.h"
+        objects.append(guest_object(source, f"{cflags} {forge_source_flags(source)}"))
+    dynamic_lighting_objects = []
+    for source in sorted(Path(config["game_sources"]).glob("*.c")):
+        if source.name in DYNAMIC_LIGHTING_GAME_SOURCES:
+            dynamic_lighting_objects.append(guest_object(source, f"{game_cflags} {forge_source_flags(source)}"))
+        else:
+            objects.append(guest_object(source, f"{game_cflags} {forge_source_flags(source)}"))
+    # (Content Extended's Forge: tools/forge_build.py)
+    for source in forge_sources():
+        objects.append(guest_object(source, forge_cflags(game_cflags, ZLIB_DIR)))
+    objects.append(guest_object(STB_VORBIS_SOURCE, game_cflags))
+
+    # the platform layer shared with Linux, and the guest runtime
+    platform_cflags = " ".join([
+        guest_abi, guest_code, "-std=gnu11", "-D_GNU_SOURCE", "-DHALO_LINUX_PLATFORM_LAYER", "-w", profile_flags,
+        f"-include {prefix_header}", f"-include {platform_semantics_header}",
+        f"-I{LINUX_DIR}/src", f"-I{LINUX_DIR}/include", f"-I{PORT_DIR}/guest/runtime",
+        f"-I{PORT_DIR}/include", f"-I{TOML_DIR}", f"-I{EXPAT_DIR}", f"-I{KCP_DIR}", f"-I{MONOCYPHER_DIR}",
+        f"-I{ZLIB_DIR}", "-Isource -Isource/cseries",
+        f"-I{sdl_dir}/include", f"-I{gl_include}", *libc_includes, f"-idirafter {XDK_INCLUDE}",
+    ])
+    guest_host_only = {"memory_watch.c"}  # replaced by guest_memory_watch.c
+    gl_renderer_object = None
+    gl_textures_object = None
+    gl_post_object = None
+    for source in sorted((LINUX_DIR / "src").glob("*.c")):
+        # (posix_server.c is the guest's: the clock and files of hosting from the
+        # menus, over the guest's own C library; the other posix_ files are the host's)
+        if (source.name.startswith("posix_") and source.name != "posix_server.c") or source.name in guest_host_only:
+            continue
+        if source.name in DYNAMIC_LIGHTING_PLATFORM_SOURCES:
+            dynamic_lighting_objects.append(guest_object(source, platform_cflags))
+        elif source.name == "updater.c" and updater_cflags:
+            objects.append(guest_object(source, f"{platform_cflags} {updater_cflags}"))
+        else:
+            objects.append(guest_object(source, f"{platform_cflags} {forge_source_flags(source)}"))
+        if source.name == "d3d8_gl.c":
+            gl_renderer_object = objects[-1]
+        # (display.anti_aliasing's passes: the OpenGL renderer's)
+        if source.name == "xgpu_post.c":
+            gl_post_object = objects[-1]
+        if source.name == "xbox_textures.c":
+            gl_textures_object = objects[-1]
+    # the high-res HUD's textures (port/assets/hud; port/linux/src/hud_hires.c)
+    for source in hud_assets_build(n, prefix, gen_dir / "hud_hires_assets.c"):
+        objects.append(guest_object(source, platform_cflags))
+    # the settings file's parser (port/third_party/tomlc17)
+    objects.append(guest_object(TOML_DIR / "tomlc17.c", platform_cflags))
+    # the menus' XML parser (port/third_party/expat; menu_files.c)
+    for name in EXPAT_SOURCES:
+        objects.append(guest_object(EXPAT_DIR / name, platform_cflags))
+    # internet play's reliable streams (port/third_party/kcp; p2p.c)
+    objects.append(guest_object(KCP_DIR / "ikcp.c", platform_cflags))
+    # voice chat's codec (port/third_party/opus), with the guest's ABI and C
+    # library
+    for source in opus_sources():
+        objects.append(guest_object(source, " ".join([opus_cflags(guest_abi), *libc_includes])))
+    # internet play's signatures, for public games' listings
+    # (port/third_party/monocypher; p2p_crypto.c)
+    for name in ("monocypher.c", "monocypher-ed25519.c"):
+        objects.append(guest_object(MONOCYPHER_DIR / name, platform_cflags))
+    for source in extra_sources:
+        objects.append(guest_object(source, platform_cflags))
+    # the port's zlib
+    for name in ZLIB_SOURCES:
+        # (not the processor's features that the guest's assembly step is
+        # not told it may use: AArch64's CRC32 instructions)
+        objects.append(guest_object(ZLIB_DIR / name, " ".join([platform_cflags, *ZLIB_DEFINES, *arch.zlib_flags])))
+    # the game's sin, pow and the rest, the same on every port
+    # (port/include/halo_math.h)
+    musl_math_cflags = " ".join([
+        guest_abi, "-std=gnu11", "-w", profile_flags, *libc_includes, f"-I{MUSL_MATH_DIR}/include",
+        f"-include {MUSL_MATH_DIR}/include/libm.h",
+    ])
+    for source in musl_math_sources():
+        objects.append(guest_object(source, musl_math_cflags))
+    runtime_internal_cflags = " ".join([
+        guest_abi, "-std=c99", "-ffreestanding", "-fno-common", "-D_XOPEN_SOURCE=700", "-D_GNU_SOURCE",
+        f"-I{PORT_DIR}/guest/runtime", f"-I{PORT_DIR}/include",
+        f"-I{libc_arch}", f"-I{arch_generic}", f"-I{musl_dir}/arch/generic", f"-I{libc_internal}",
+        f"-I{PORT_DIR}/guest/libc/src_include", f"-I{musl_dir}/src/include",
+        f"-I{musl_dir}/src/internal", f"-I{libc_include}", f"-I{musl_dir}/include",
+    ])
+    runtime_cflags = " ".join([
+        guest_abi, guest_code, "-std=gnu11", "-D_GNU_SOURCE",
+        f"-I{PORT_DIR}/guest/runtime", f"-I{PORT_DIR}/include", f"-I{LINUX_DIR}/src",
+        f"-I{sdl_dir}/include", f"-I{gl_include}", *libc_includes,
+    ])
+    runtime_dir = PORT_DIR / "guest" / "runtime"
+    for source in sorted(runtime_dir.glob("*.c")):
+        if source.name in ("guest_thread.c", "guest_start.c"):
+            objects.append(guest_object(source, runtime_internal_cflags))
+        elif source.name == "guest_memory_watch.c":
+            objects.append(guest_object(source, platform_cflags))
+        else:
+            objects.append(guest_object(source, runtime_cflags))
+    for source in extra_runtime:
+        objects.append(guest_object(source, runtime_cflags))
+    objects.append(guest_object(guest_gl_c, runtime_cflags))
+    objects.append(guest_object(guest_posix_c, runtime_cflags))
+    imports_o = obj_dir / "gen" / "imports.o"
+    n.build(outputs=imports_o, rule=f"{prefix}_guest_as", inputs=imports_s)
+    objects.append(imports_o)
+
+    # ---------- the guest image
+
+    linker_script = PORT_DIR / "guest" / "guest.ld"
+    # (the folder of the script's guest_init_array.ld: which constructors the
+    # image takes, guest.ld)
+    linker_fragments = PORT_DIR / "guest" / "ld" / ("macho" if arch.darwin_assembly else "elf")
+    builtins = f" {arch.builtins(builtins_cc)}" if arch.builtins(builtins_cc) else ""
+    link = (f"{ld} -m {arch.ld_emulation} -static -nostdlib -T {linker_script} -L {linker_fragments} "
+            f"--defsym=__guest_image_base={arch.image_base:#x} ")
+    if relocatable:
+        # where the image's 32-bit pointers are, so the host can load it
+        # elsewhere when its address is taken (tools/guest_relocations.py):
+        # linked with its relocations, which the table is made from and the
+        # image then drops (one table per image: $relocations names it)
+        objcopy = str(Path(ld).parent / "llvm-objcopy") if "/" in ld else "llvm-objcopy"
+        command = (link + f"--emit-relocs -Map $out.map -o $out.full @$out.rsp {libguestc}{builtins} && "
+                   f"{python} tools/guest_relocations.py $out.full $relocations && "
+                   f"{objcopy} --remove-section='.rela*' $out.full $out && rm -f $out.full")
+    else:
+        command = link + f"-Map $out.map -o $out @$out.rsp {libguestc}{builtins}"
+    n.rule(
+        name=f"{prefix}_guest_link",
+        command=command,
+        description=f"{label} LINK $out",
+        rspfile="$out.rsp",
+        rspfile_content="$in_newline",
+    )
+    link_implicit = [libguestc, linker_script, linker_fragments / "guest_init_array.ld"]
+    if relocatable:
+        link_implicit.append(Path("tools/guest_relocations.py"))
+    relocations = build / "halo_guest.relocs"
+    # (the OpenGL renderer's image: the dynamic lighting's hooks do nothing)
+    gl_objects = objects + [guest_object(PORT_DIR / "guest" / "dynamic_lighting_disabled.c", game_cflags)]
+    n.build(outputs=image, rule=f"{prefix}_guest_link", inputs=gl_objects,
+            implicit_outputs=[relocations] if relocatable else None, implicit=link_implicit,
+            variables={"relocations": str(relocations)} if relocatable else None)
+    # what the host cannot give the image: thread-local storage, the thread
+    # pointer, an address outside its range (tools/guest_image_check.py);
+    # what uses the image waits for this
+    checked = guest_dir / "halo_guest.checked"
+    n.rule(
+        name=f"{prefix}_guest_check",
+        command=f"{python} tools/guest_image_check.py --arch {arch.name} --objdump {objdump} --map $in.map $in $out",
+        description=f"{label} CHECK $in",
+    )
+    n.build(outputs=checked, rule=f"{prefix}_guest_check", inputs=image,
+            implicit=[Path("tools/guest_image_check.py"), GUEST_ARCH_SCRIPT])
+    result = {"image": image, "checked": checked, "host_table_c": host_table_c}
+    if relocatable:
+        result["relocations"] = relocations
+
+    if vulkan:
+        # The same game with the Vulkan renderer (port/android/VULKAN.md): its device,
+        # port/android/guest/d3d8_vk.c, takes the place of d3d8_gl.c and every other
+        # object is shared. The host runs one image or the other, as config.toml's
+        # display.renderer says (port/android/host/host_main.c).
+        # (its texture cache, xbox_textures_vk.c, takes the place of xbox_textures.c the same way)
+        vk_image = build / "halo_guest_vk.elf"
+        vk_objects = [obj for obj in objects if obj not in (gl_renderer_object, gl_textures_object, gl_post_object)]
+        vk_objects.extend(dynamic_lighting_objects)
+        vk_objects.append(guest_object(PORT_DIR / "guest" / "xbox_textures_vk.c", platform_cflags))
+        vk_objects.append(guest_object(PORT_DIR / "guest" / "d3d8_vk.c", platform_cflags))
+        # the generators for glslang (port/android/VULKAN.md, phase 4): the originals stay in both images
+        vk_objects.append(guest_object(PORT_DIR / "guest" / "nv2a_vsh_vk.c", platform_cflags))
+        vk_objects.append(guest_object(PORT_DIR / "guest" / "nv2a_psh_vk.c", platform_cflags))
+        vk_relocations = build / "halo_guest_vk.relocs"
+        n.build(outputs=vk_image, rule=f"{prefix}_guest_link", inputs=vk_objects,
+                implicit_outputs=[vk_relocations] if relocatable else None, implicit=link_implicit,
+                variables={"relocations": str(vk_relocations)} if relocatable else None)
+        vk_checked = guest_dir / "halo_guest_vk.checked"
+        n.build(outputs=vk_checked, rule=f"{prefix}_guest_check", inputs=vk_image,
+                implicit=[Path("tools/guest_image_check.py"), GUEST_ARCH_SCRIPT])
+        result["vk_image"] = vk_image
+        result["vk_checked"] = vk_checked
+        if relocatable:
+            result["vk_relocations"] = vk_relocations
+
+    return result
+
+
+def generate_android_build(n: Writer, sln: Any) -> None:
+    config_path = LINUX_DIR / "port.json"
+    if not config_path.is_file() or not (PORT_DIR / "host").is_dir():
+        return
+    validation = bool(getattr(sln, "android_vulkan_validation", False))
+    ndk = Path(sln.android_ndk) if getattr(sln, "android_ndk", None) else _find_ndk()
+    if not ndk or not ndk.is_dir():
+        n.comment("Android build: no NDK found (set ANDROID_NDK_HOME or pass --android-ndk)")
+        return
+    try:
+        fetch_third_party()
+        fetch_android_third_party(validation)
+    except (subprocess.CalledProcessError, OSError, RuntimeError) as error:
+        print(f"Android build disabled: cannot fetch musl/SDL3/glslang ({error})", file=sys.stderr)
+        return
+    import json
+    config: Dict[str, Any] = json.loads(config_path.read_text(encoding="utf-8"))
+
+    prebuilt = ndk / "toolchains" / "llvm" / "prebuilt"
+    _host_tag = os.environ.get("ANDROID_NDK_HOST_TAG", "")
+    if not _host_tag:
+        if sys.platform == "darwin":
+            _host_tag = "darwin-x86_64"
+        elif os.name == "nt":
+            _host_tag = "windows-x86_64"
+        else:
+            _host_tag = "linux-x86_64"
+    if not (prebuilt / _host_tag).is_dir():
+        # an NDK that names its host folder differently: take the one there is
+        _tags = sorted(entry.name for entry in prebuilt.iterdir() if entry.is_dir()) if prebuilt.is_dir() else []
+        if not _tags:
+            n.comment("Android build: the NDK has no LLVM toolchain")
+            return
+        _host_tag = _tags[0]
+    toolchain = prebuilt / _host_tag
+    sysroot_include = toolchain / "sysroot" / "usr" / "include"
+    host_cc = toolchain / "bin" / f"aarch64-linux-android{ANDROID_API}-clang"
+    ndk_bin = toolchain / "bin"
+    guest_cc = getattr(sln, "android_guest_cc", None) or default_clang()
+
+    python = "$python"
+    n.comment("Android build (ninja android); see port/android/README.md")
+    n.variable("android_guest_cc", guest_cc)
+    n.variable("android_host_cc", str(host_cc))
+    n.variable("android_ndk_bin", str(ndk_bin))
+
+    guest = generate_guest_image(
+        n, sln, config, arch=ARM64_32, prefix="android", label="ANDROID", build=BUILD, third_party=THIRD_PARTY,
+        guest_cc=guest_cc, gl_headers=sysroot_include, ar="$android_ndk_bin/llvm-ar", ld="$android_ndk_bin/ld.lld",
+        objdump="$android_ndk_bin/llvm-objdump", builtins_cc="$android_host_cc", environment="android", platform_defines=ANDROID_DEFINES,
+        # (the Vulkan renderer's imports, which the Switch's host does not have)
+        extra_imports=[PORT_DIR / "android_imports.list", PORT_DIR / "host_imports_vk.list"],
+        relocatable=True, vulkan=True)
+    image = guest["image"]
+    vk_image = guest["vk_image"]
+    relocations = guest["relocations"]
+    vk_relocations = guest["vk_relocations"]
+    host_table_c = guest["host_table_c"]
+    sdl_build = BUILD / "sdl3-build"
+    libsdl = sdl_build / "libSDL3.so"
+    jni_dir = BUILD / "jniLibs" / "arm64-v8a"
+    libmain = jni_dir / "libmain.so"
+    assets_dir = BUILD / "assets"
+
+    # ---------- SDL3
+
+    n.rule(
+        name="android_sdl3",
+        command=(f"cmake -S {SDL_DIR} -B {sdl_build} -G Ninja "
+                 f"-DCMAKE_TOOLCHAIN_FILE={ndk}/build/cmake/android.toolchain.cmake "
+                 f"-DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-{ANDROID_API} -DCMAKE_BUILD_TYPE=Release "
+                 f"-DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF "
+                 # 16 KB pages (Android 15 and later), as the host library
+                 f"-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384 "
+                 f"> {BUILD}/sdl3-configure.log && ninja -C {sdl_build} > {BUILD}/sdl3-build.log"),
+        description="ANDROID SDL3",
+        pool="console",
+    )
+    n.build(outputs=libsdl, rule="android_sdl3", implicit=[SDL_DIR / "CMakeLists.txt"])
+
+    # ---------- glslang, for the Vulkan probe: loaded with dlopen, never linked
+
+    glslang_build = BUILD / "glslang-build"
+    libglslang = glslang_build / "libhalo_glslang.so"
+    n.rule(
+        name="android_glslang",
+        command=(f"cmake -S {PROBE_DIR}/glslang -B {glslang_build} -G Ninja "
+                 f"-DGLSLANG_SOURCE={GLSLANG_DIR.resolve()} "
+                 f"-DCMAKE_TOOLCHAIN_FILE={ndk}/build/cmake/android.toolchain.cmake "
+                 f"-DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-{ANDROID_API} -DCMAKE_BUILD_TYPE=Release "
+                 f"-DANDROID_STL=c++_static "
+                 f"> {BUILD}/glslang-configure.log && ninja -C {glslang_build} halo_glslang "
+                 f"> {BUILD}/glslang-build.log"),
+        description="ANDROID GLSLANG",
+        pool="console",
+    )
+    n.build(outputs=libglslang, rule="android_glslang",
+            implicit=[GLSLANG_DIR / "CMakeLists.txt", PROBE_DIR / "glslang" / "CMakeLists.txt"])
+
+    # ---------- libadrenotools and its hooks, for host_vk_driver.c: dlopen-ed by name, never linked
+
+    adrenotools_build = BUILD / "adrenotools-build"
+    adrenotools_built = [adrenotools_build / "libadrenotools.so"] + [
+        adrenotools_build / "src" / "hook" / name for name in ADRENOTOOLS_HOOKS]
+    n.rule(
+        name="android_adrenotools",
+        command=(f"cmake -S {ADRENOTOOLS_DIR} -B {adrenotools_build} -G Ninja "
+                 f"-DCMAKE_TOOLCHAIN_FILE={ndk}/build/cmake/android.toolchain.cmake "
+                 f"-DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-{ANDROID_API} -DCMAKE_BUILD_TYPE=Release "
+                 f"-DBUILD_SHARED_LIBS=ON -DCMAKE_SHARED_LINKER_FLAGS=-Wl,-z,max-page-size=16384 "
+                 f"> {BUILD}/adrenotools-configure.log && ninja -C {adrenotools_build} "
+                 # CMake leaves its outputs alone when nothing in them changed, so they are touched: otherwise a
+                 # touched input (the patch applied again) would leave them older than it at every build
+                 f"> {BUILD}/adrenotools-build.log && touch $out"),
+        description="ANDROID ADRENOTOOLS",
+        pool="console",
+    )
+    # one rule makes all five files
+    n.build(outputs=adrenotools_built, rule="android_adrenotools",
+            implicit=[ADRENOTOOLS_DIR / "CMakeLists.txt", PROBE_DIR / "adrenotools.patch"])
+
+    # ---------- the host library
+
+    host_objects: List[Path] = []
+    host_obj_dir = BUILD / "host" / "obj"
+    n.rule(
+        name="android_host_cc",
+        command="$android_host_cc -MMD -MF $out.d $cflags -c $in -o $out",
+        description="ANDROID HOST CC $out",
+        depfile="$out.d",
+        deps="gcc",
+    )
+    host_cflags = " ".join([
+        "-O2", "-g", "-fPIC", "-Wall", "-Wno-unused-function", "-D_GNU_SOURCE",
+        f"-I{PORT_DIR}/include", f"-I{PORT_DIR}/host", f"-I{SDL_DIR}/include", f"-I{LINUX_DIR}/src",
+        f"-I{TOML_DIR}", f"-I{GLSLANG_DIR}", f"-I{BUILD / 'host'}", f"-I{ZLIB_DIR}",
+        # the folder of the SPIR-V cache is named for the compiler (host_vk_shaders.c)
+        f"-DHOST_VK_GLSLANG_TAG='\"{GLSLANG_TAG}\"'",
+    ])
+    # the probe's report names the build it is from (host_vk_probe.c includes probe_build.h): written at every
+    # build, not at configure time, and restat so that an unchanged name recompiles nothing
+    build_stamp = BUILD / "host" / "probe_build.h"
+    n.rule(
+        name="android_build_stamp",
+        command=f"{python} tools/android_build_stamp.py $out",
+        description="ANDROID BUILD STAMP $out",
+        restat=True,
+    )
+    n.build(outputs="android_always", rule="phony")
+    n.build(outputs=build_stamp, rule="android_build_stamp", implicit=["android_always"])
+    host_sources = sorted((PORT_DIR / "host").glob("*.c")) + [
+        LINUX_DIR / "src" / "posix_files.c", LINUX_DIR / "src" / "posix_net.c",
+        LINUX_DIR / "src" / "posix_mcc_preview.c",
+        LINUX_DIR / "src" / "posix_mcc_share.c",
+        # the map lists' IMPORT's JSON reader (host_mcc_import.c)
+        LINUX_DIR / "src" / "server_json.c",
+        # the app reads debug.sample_seconds from config.toml (host_main.c)
+        TOML_DIR / "tomlc17.c",
+        # the file connection's X25519 and ChaCha20-Poly1305 (host_file_share_crypto.c)
+        MONOCYPHER_DIR / "monocypher.c",
+    ]
+    for source in host_sources:
+        obj = host_obj_dir / (source.name + ".o")
+        # (the Steam client's chunk unpacker: the LZMA SDK's and Zstandard's
+        # decoders, whose warnings are not ours)
+        # (an MCC map's conversion: the guest's codecs, whose bcdec shifts
+        # signed values as the guest's -fwrapv defines, host_mcc_convert.c)
+        n.build(outputs=obj, rule="android_host_cc", inputs=source,
+                variables={"cflags": host_cflags + (" -w" if source.name == "steam_unpack.c" else "") +
+                           (" -fwrapv" if source.name == "host_mcc_convert.c" else "") +
+                           (f" -I{MONOCYPHER_DIR}" if source.name in ("host_file_share_crypto.c", "monocypher.c")
+                            else "")},
+                implicit=[build_stamp] if source.name == "host_vk_probe.c" else None)
+        host_objects.append(obj)
+    # internet play's UPnP (posix_upnp.c, with port/third_party/miniupnpc),
+    # as the other posix_*.c in the host
+    miniupnpc_cflags = " ".join([host_cflags, f"-I{MINIUPNPC_DIR / 'include'}", f"-I{MINIUPNPC_DIR / 'src'}",
+                                 *MINIUPNPC_DEFINES])
+    for source in [LINUX_DIR / "src" / "posix_upnp.c", *miniupnpc_sources()]:
+        obj = host_obj_dir / ("miniupnpc_" + source.name + ".o" if source.parent.parent == MINIUPNPC_DIR
+                              else source.name + ".o")
+        n.build(outputs=obj, rule="android_host_cc", inputs=source,
+                variables={"cflags": miniupnpc_cflags + (" -w" if source.name != "posix_upnp.c" else "")})
+        host_objects.append(obj)
+    # internet play's DTLS with browsers (posix_dtls.c), the community
+    # server's HTTPS requests and the server browser's to the master servers
+    # (posix_update.c's update_request and update_https_request, which
+    # host_https.c answers the guest's with), with port/third_party/mbedtls,
+    # as the other posix_*.c in the host (with its locks: internet play's
+    # thread and the server browser's master servers' both use it, as on Linux)
+    mbedtls_cflags = " ".join([host_cflags, f"-I{MBEDTLS_DIR / 'include'}", f"-I{MBEDTLS_DIR / 'library'}",
+                               "-DMBEDTLS_THREADING_C", "-DMBEDTLS_THREADING_PTHREAD"])
+    own_tls_sources = ("posix_dtls.c", "posix_update.c")
+    for source in [*(LINUX_DIR / "src" / name for name in own_tls_sources),
+                   *sorted((MBEDTLS_DIR / "library").glob("*.c"))]:
+        obj = host_obj_dir / ("mbedtls_" + source.name + ".o" if source.parent.parent == MBEDTLS_DIR
+                              else source.name + ".o")
+        n.build(outputs=obj, rule="android_host_cc", inputs=source,
+                variables={"cflags": mbedtls_cflags + (" -w" if source.name not in own_tls_sources else "")})
+        host_objects.append(obj)
+    # the port's zlib, its names z_ (zlib_prefixed.h), for the Vulkan renderer's high-res HUD sheets the host decodes
+    # (host_vk_hud.c), as the guest has its own
+    for name in ZLIB_SOURCES:
+        obj = host_obj_dir / ("zlib_" + name + ".o")
+        n.build(outputs=obj, rule="android_host_cc", inputs=ZLIB_DIR / name,
+                variables={"cflags": " ".join([host_cflags, *ZLIB_DEFINES, "-w"])})
+        host_objects.append(obj)
+    table_obj = host_obj_dir / "host_import_table.c.o"
+    n.build(outputs=table_obj, rule="android_host_cc", inputs=host_table_c, variables={"cflags": host_cflags})
+    host_objects.append(table_obj)
+    n.rule(
+        name="android_host_link",
+        command=(f"$android_host_cc -shared -o $out $in -L{sdl_build} "
+                 + " ".join(f"-l{lib}" for lib in HOST_LIBRARIES)
+                 + " -Wl,-z,max-page-size=16384 -Wl,--no-undefined"),
+        description="ANDROID HOST LINK $out",
+    )
+    n.build(outputs=libmain, rule="android_host_link", inputs=host_objects, implicit=[libsdl])
+
+    # ---------- staging for Gradle
+
+    staged_sdl = jni_dir / "libSDL3.so"
+    staged_image = assets_dir / "halo_guest.elf"
+    staged_vk_image = assets_dir / "halo_guest_vk.elf"
+    n.rule(name="android_copy", command="cp $in $out", description="ANDROID STAGE $out")
+    n.rule(name="android_copy_into", command="mkdir -p $$(dirname $out) && cp $in $out",
+           description="ANDROID STAGE $out")
+    n.build(outputs=staged_sdl, rule="android_copy", inputs=libsdl)
+    n.build(outputs=staged_image, rule="android_copy", inputs=image, implicit=[guest["checked"]])
+    staged_relocations = assets_dir / "halo_guest.relocs"
+    n.build(outputs=staged_relocations, rule="android_copy", inputs=relocations)
+    n.build(outputs=staged_vk_image, rule="android_copy", inputs=vk_image, implicit=[guest["vk_checked"]])
+    staged_vk_relocations = assets_dir / "halo_guest_vk.relocs"
+    n.build(outputs=staged_vk_relocations, rule="android_copy", inputs=vk_relocations)
+    # internet play's MQTT brokers, in the APK: the app writes them beside
+    # config.toml (port/android/host/host_main.c)
+    staged_brokers = assets_dir / "brokers.txt"
+    n.build(outputs=staged_brokers, rule="android_copy", inputs=Path("port/assets/network/brokers.txt"))
+    # (and the game's data files, which it writes there too: GAME_DATA_FILES)
+    staged_data = [assets_dir / source.name for source in GAME_DATA_FILES]
+    for source, target in zip(GAME_DATA_FILES, staged_data):
+        n.build(outputs=target, rule="android_copy", inputs=source)
+    # the Vulkan probe's shader compiler, its shaders and, only when asked
+    # for, the validation layer (a debuggable app's loader finds a layer in
+    # the app's own native library folder)
+    staged_glslang = jni_dir / "libhalo_glslang.so"
+    # (it was libglslang_probe.so until phase 5: an old copy would ride along in the APK)
+    if (jni_dir / "libglslang_probe.so").exists():
+        (jni_dir / "libglslang_probe.so").unlink()
+    n.build(outputs=staged_glslang, rule="android_copy", inputs=libglslang)
+    probe_staged = [staged_glslang]
+    for built in adrenotools_built:
+        staged = jni_dir / built.name
+        n.build(outputs=staged, rule="android_copy", inputs=built)
+        probe_staged.append(staged)
+    for source in sorted(PROBE_DIR.glob("*.vert")) + sorted(PROBE_DIR.glob("*.frag")):
+        staged = assets_dir / "vk_probe" / source.name
+        n.build(outputs=staged, rule="android_copy_into", inputs=source)
+        probe_staged.append(staged)
+    staged_layer = jni_dir / "libVkLayer_khronos_validation.so"
+    if validation:
+        layer = (VALIDATION_DIR / f"android-binaries-{VALIDATION_VERSION}" / "arm64-v8a"
+                     / "libVkLayer_khronos_validation.so")
+        n.build(outputs=staged_layer, rule="android_copy", inputs=layer)
+        probe_staged.append(staged_layer)
+    elif staged_layer.exists():
+        staged_layer.unlink()
+    # the APK is made again when --android-vulkan-validation is given or dropped: the flag's stamp is an
+    # input, rewritten only when its value changes
+    stamp = BUILD / "vulkan_validation.stamp"
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    wanted = "validation\n" if validation else "no validation\n"
+    if not stamp.exists() or stamp.read_text() != wanted:
+        stamp.write_text(wanted)
+    # Include MCC's decoder notice in the APK as well as the release archive.
+    staged_bcdec_license = assets_dir / "bcdec-LICENSE.txt"
+    n.build(outputs=staged_bcdec_license, rule="android_copy", inputs=Path("port/third_party/bcdec/LICENSE"))
+    staged_all = [libmain, staged_sdl, staged_image, staged_relocations, staged_vk_image, staged_vk_relocations,
+                  staged_brokers, staged_bcdec_license, *staged_data, *probe_staged]
+    n.build(outputs="android", rule="phony", inputs=staged_all)
+
+    apk = PORT_DIR / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
+    sdl_android_mouse_listener = SDL_DIR / SDL_ANDROID_MOUSE_LISTENER
+    # (the JDK and SDK found now, so that Gradle needs neither in the shell
+    # that runs ninja: tools/macos_toolchain.py)
+    gradle_environment = "".join(f"{name}={_quote(path)} " for name, path in
+                                 (("JAVA_HOME", java_home()), ("ANDROID_HOME", android_sdk())) if path)
+    # the build number configure.py was given (as the native updaters have
+    # it: updater_defines), not the one of the shell that runs ninja, which
+    # usually has none; a new number changes the command, so Gradle runs again
+    build_number = os.environ.get("HALO_BUILD_NUMBER", "0")
+    gradle_environment += f"HALO_BUILD_NUMBER={build_number if build_number.isdigit() else '0'} "
+    n.rule(
+        name="android_gradle",
+        # Gradle leaves the APK alone when its contents would not change
+        command=(f"cd {PORT_DIR} && {gradle_environment}./gradlew --console=plain -q :app:assembleDebug && "
+                 "touch app/build/outputs/apk/debug/app-debug.apk"),
+        description="ANDROID GRADLE $out",
+        pool="console",
+    )
+    n.build(outputs=apk, rule="android_gradle", inputs=staged_all, implicit=[stamp, sdl_android_mouse_listener])
+    n.build(outputs="android_apk", rule="phony", inputs=apk)
+    n.newline()
+
+    # the bridge (port/android/bridge/build.gradle): the old app's (com.halo.decomp's) last update, which moves its
+    # players to the game's new id; a release carries it under the old app's zip names (tools/release.py). Java
+    # only: none of the native build is in it
+    bridge_dir = PORT_DIR / "bridge"
+    bridge_apk = bridge_dir / "build" / "outputs" / "apk" / "debug" / "bridge-debug.apk"
+    bridge_sources = sorted(path for path in bridge_dir.rglob("*")
+                            if path.is_file() and "build" not in path.relative_to(bridge_dir).parts)
+    n.rule(
+        name="android_gradle_bridge",
+        command=(f"cd {PORT_DIR} && {gradle_environment}./gradlew --console=plain -q :bridge:assembleDebug && "
+                 "touch bridge/build/outputs/apk/debug/bridge-debug.apk"),
+        description="ANDROID GRADLE $out",
+        pool="console",
+    )
+    n.build(outputs=bridge_apk, rule="android_gradle_bridge", inputs=bridge_sources,
+            implicit=[PORT_DIR / "settings.gradle"])
+    n.build(outputs="android_bridge_apk", rule="phony", inputs=bridge_apk)
+    n.newline()

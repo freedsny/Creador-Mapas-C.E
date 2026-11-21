@@ -1,0 +1,1027 @@
+/*
+HOST_SDL.C
+
+SDL3 on behalf of the guest (guest/runtime/guest_sdl.c). SDL objects are
+64-bit pointers, which the guest cannot hold; it gets small handles into the
+table here instead.
+
+The guest calls these on its own threads, whose stacks (in guest memory) are
+also the ones ART knows, so SDL may call into Java from them
+(host_thread.c). SDL's audio thread is the exception: it has no guest stack,
+so the audio callback is handed to a thread that has one.
+*/
+
+#include "host.h"
+
+#include <SDL3/SDL.h>
+#ifdef __ANDROID__
+#include <jni.h>
+#endif
+#include <pthread.h>
+#include <string.h>
+#include <sys/mman.h>
+
+#define HANDLE_COUNT 256
+
+struct handle
+{
+	int type;
+	void *object;
+	/* an audio stream with a callback: its binding (below) */
+	void *binding;
+};
+
+static struct handle handles[HANDLE_COUNT];
+static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
+
+uint32_t host_sdl_handle_new(int type, void *object)
+{
+	uint32_t index;
+
+	if (!object)
+		return 0;
+	pthread_mutex_lock(&handle_lock);
+	/* an object that already has a handle keeps it */
+	for (index = 1; index < HANDLE_COUNT; index++)
+	{
+		if (handles[index].type == type && handles[index].object == object)
+		{
+			pthread_mutex_unlock(&handle_lock);
+			return index;
+		}
+	}
+	for (index = 1; index < HANDLE_COUNT; index++)
+	{
+		if (handles[index].type == _handle_free)
+		{
+			handles[index].type = type;
+			handles[index].object = object;
+			handles[index].binding = NULL;
+			pthread_mutex_unlock(&handle_lock);
+			return index;
+		}
+	}
+	pthread_mutex_unlock(&handle_lock);
+	host_logf(HOST_LOG_ERROR, "out of SDL handles");
+	return 0;
+}
+
+void *host_sdl_handle_get(uint32_t handle, int type)
+{
+	void *object = NULL;
+
+	if (handle == 0 || handle >= HANDLE_COUNT)
+		return NULL;
+	pthread_mutex_lock(&handle_lock);
+	if (handles[handle].type == type)
+		object = handles[handle].object;
+	pthread_mutex_unlock(&handle_lock);
+	return object;
+}
+
+void host_sdl_handle_free(uint32_t handle)
+{
+	if (handle == 0 || handle >= HANDLE_COUNT)
+		return;
+	pthread_mutex_lock(&handle_lock);
+	handles[handle].type = _handle_free;
+	handles[handle].object = NULL;
+	handles[handle].binding = NULL;
+	pthread_mutex_unlock(&handle_lock);
+}
+
+/* the object of a handle, which the handle no longer refers to; NULL when
+there is none. *binding gets what host_sdl_handle_new's caller stored (audio) */
+static void *handle_release(uint32_t handle, int type, void **binding)
+{
+	void *object = NULL;
+
+	if (binding)
+		*binding = NULL;
+	if (handle == 0 || handle >= HANDLE_COUNT)
+		return NULL;
+	pthread_mutex_lock(&handle_lock);
+	if (handles[handle].type == type)
+	{
+		object = handles[handle].object;
+		if (binding)
+			*binding = handles[handle].binding;
+		handles[handle].type = _handle_free;
+		handles[handle].object = NULL;
+		handles[handle].binding = NULL;
+	}
+	pthread_mutex_unlock(&handle_lock);
+	return object;
+}
+
+/* ---------- general */
+
+int host_sdl_init(uint32_t flags)
+{
+	return SDL_Init((SDL_InitFlags)flags);
+}
+
+int host_sdl_set_hint(const char *name, const char *value)
+{
+	return SDL_SetHint(name, value);
+}
+
+void host_sdl_get_error(char *buffer, uint32_t size)
+{
+	SDL_strlcpy(buffer, SDL_GetError(), size);
+}
+
+void host_sdl_scancode_name(int32_t scancode, char *buffer, uint32_t size)
+{
+	SDL_strlcpy(buffer, SDL_GetScancodeName((SDL_Scancode)scancode), size);
+}
+
+int32_t host_sdl_scancode_from_name(const char *name)
+{
+	return (int32_t)SDL_GetScancodeFromName(name);
+}
+
+int64_t host_sdl_ticks(void)
+{
+	return (int64_t)SDL_GetTicks();
+}
+
+int64_t host_sdl_thread_id(void)
+{
+	return (int64_t)SDL_GetCurrentThreadID();
+}
+
+/* ---------- video */
+
+/* Under Vulkan the guest's window is real, but made without SDL_WINDOW_OPENGL so
+that SDL makes no EGL surface on it (Android lets one API own a window: the
+Vulkan renderer's surface is made on this one, phase 2), and its GL context is a
+stand-in: a handle to nothing, which the functions below accept. The platform
+layer opens a context and swaps at each present as it does under GL ES, and its
+event loop runs only while it has a window and a context. */
+static char standin_context;
+
+#ifdef HALO_MACOS
+/* (host_vk_driver_macos.c) */
+extern void *host_vk_metal_layer;
+#endif
+
+uint32_t host_sdl_create_window(const char *title, int width, int height, int64_t flags)
+{
+	if (host_renderer_vulkan)
+	{
+		flags &= ~(int64_t)SDL_WINDOW_OPENGL;
+#ifdef HALO_MACOS
+		/* (MoltenVK's surface is made on the window's CAMetalLayer:
+		port/macos/host/host_vk_driver_macos.c) */
+		flags |= (int64_t)SDL_WINDOW_METAL;
+#endif
+		host_logf(HOST_LOG_INFO, "window: real, without an OpenGL context (a stand-in), the display being Vulkan's");
+	}
+	{
+		SDL_Window *window = SDL_CreateWindow(title, width, height, (SDL_WindowFlags)flags);
+
+		/* the Vulkan backend makes its surface on the game's window: the last made (host_vk.h) */
+		if (host_renderer_vulkan && window)
+			host_vk_window = window;
+#ifdef HALO_MACOS
+		/* (and on macOS on its Metal view's layer, which only the main thread,
+		the game's, can make: host_vk_present.c) */
+		if (host_renderer_vulkan && window)
+		{
+			SDL_MetalView view = SDL_Metal_CreateView(window);
+
+			host_vk_metal_layer = view ? SDL_Metal_GetLayer(view) : NULL;
+			if (!host_vk_metal_layer)
+				host_logf(HOST_LOG_ERROR, "window: no Metal view (%s)", SDL_GetError());
+		}
+#endif
+		return host_sdl_handle_new(_handle_window, window);
+	}
+}
+
+void host_sdl_window_size_in_pixels(uint32_t window, int *width, int *height)
+{
+	SDL_Window *object = host_sdl_handle_get(window, _handle_window);
+
+	*width = 0;
+	*height = 0;
+	if (object)
+		SDL_GetWindowSizeInPixels(object, width, height);
+}
+
+int host_sdl_set_relative_mouse(uint32_t window, int enabled)
+{
+	SDL_Window *object = host_sdl_handle_get(window, _handle_window);
+
+	return object ? SDL_SetWindowRelativeMouseMode(object, enabled != 0) : 0;
+}
+
+int host_sdl_gl_set_attribute(int attribute, int value)
+{
+	if (host_renderer_vulkan)
+		return 1;
+	return SDL_GL_SetAttribute((SDL_GLAttr)attribute, value);
+}
+
+uint32_t host_sdl_gl_create_context(uint32_t window)
+{
+	SDL_Window *object = host_sdl_handle_get(window, _handle_window);
+
+	if (host_renderer_vulkan)
+		return object ? host_sdl_handle_new(_handle_context, &standin_context) : 0;
+	return object ? host_sdl_handle_new(_handle_context, SDL_GL_CreateContext(object)) : 0;
+}
+
+int host_sdl_gl_make_current(uint32_t window, uint32_t context)
+{
+	if (host_renderer_vulkan)
+		return host_sdl_handle_get(window, _handle_window) != NULL && host_sdl_handle_get(context, _handle_context) == &standin_context;
+	return SDL_GL_MakeCurrent(host_sdl_handle_get(window, _handle_window), host_sdl_handle_get(context, _handle_context));
+}
+
+static int swap_interval = 1;
+
+int host_sdl_gl_set_swap_interval(int interval)
+{
+	swap_interval = interval;
+	if (host_renderer_vulkan)
+		return 1;
+	return SDL_GL_SetSwapInterval(interval);
+}
+
+/* The stand-in swap: until the Vulkan backend presents (host_vk_presenting) and
+its swapchain waits for the display, frames are held to the display's refresh
+rate here, as the swap's vsync holds them under GL ES, and every ten seconds
+the log says how many were swapped. */
+static int standin_swap(SDL_Window *window)
+{
+	static Uint64 next, reported;
+	static unsigned frames;
+	Uint64 now = SDL_GetTicksNS();
+
+	if (swap_interval > 0 && !host_vk_presenting)
+	{
+		SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+		const SDL_DisplayMode *mode = display ? SDL_GetCurrentDisplayMode(display) : NULL;
+		Uint64 interval = (Uint64)(1e9f / (mode && mode->refresh_rate > 1.0f ? mode->refresh_rate : 60.0f));
+
+		if (next > now)
+		{
+			SDL_DelayPrecise(next - now);
+			now = next;
+		}
+		/* a frame more than an interval late starts the count again */
+		next = now - next > interval ? now + interval : next + interval;
+	}
+	frames++;
+	host_gl_frame();
+	if (!reported)
+		reported = now;
+	if (now - reported >= 10000000000ull)
+	{
+		SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+		const SDL_DisplayMode *mode = display ? SDL_GetCurrentDisplayMode(display) : NULL;
+
+		host_logf(HOST_LOG_INFO, "vk: %u frames swapped in %.1f s%s (the display mode says %.1f Hz)", frames,
+			(double)(now - reported) / 1e9,
+			host_vk_presenting ? ", paced by the swapchain" : ", paced by the stand-in swap",
+			mode ? mode->refresh_rate : 0.0f);
+		frames = 0;
+		reported = now;
+	}
+	return 1;
+}
+
+int host_sdl_gl_swap_window(uint32_t window)
+{
+	SDL_Window *object = host_sdl_handle_get(window, _handle_window);
+
+	if (host_renderer_vulkan)
+		return object ? standin_swap(object) : 0;
+	/* (the GL calls' counts, every ten seconds: debug.gpu_stats) */
+	host_gl_frame();
+	return object ? SDL_GL_SwapWindow(object) : 0;
+}
+
+/* ---------- events
+
+The guest's SDL_Event is the host's but where a member is a pointer: the
+guest's are 4 bytes, so the members from the first pointer on lie elsewhere
+(SDL_TextInputEvent's text at 20, not 24). Text input, text editing and
+drops carry strings, which the guest reads (a name typed into the game, a
+file dropped on its window): those events are written in the guest's layout,
+their strings copied into guest memory, a ring of slots each event takes the
+next of (the guest has read an event's strings long before the ring comes
+round to it again). The other events have no pointer, and are copied. */
+
+#define EVENT_STRING_SLOTS 32
+#define EVENT_STRING_SIZE 1024
+
+struct guest_text_event
+{
+	uint32_t type, reserved;
+	uint64_t timestamp;
+	uint32_t window;
+	uint32_t text;
+	int32_t start, length;
+};
+
+struct guest_drop_event
+{
+	uint32_t type, reserved;
+	uint64_t timestamp;
+	uint32_t window;
+	float x, y;
+	uint32_t source, data;
+};
+
+typedef char guest_text_event_check[sizeof(struct guest_text_event) == 32 ? 1 : -1];
+typedef char guest_drop_event_check[sizeof(struct guest_drop_event) == 40 ? 1 : -1];
+
+/* a string in guest memory, its guest address (0 for none) */
+static uint32_t event_string(const char *text)
+{
+	static char *slots;
+	static unsigned next;
+	char *slot;
+
+	if (!text)
+		return 0;
+	if (!slots && !(slots = host_low_map(EVENT_STRING_SLOTS * EVENT_STRING_SIZE, PROT_READ | PROT_WRITE)))
+		return 0;
+	slot = slots + (next++ % EVENT_STRING_SLOTS) * EVENT_STRING_SIZE;
+	SDL_strlcpy(slot, text, EVENT_STRING_SIZE);
+	return (uint32_t)(uintptr_t)slot;
+}
+
+int host_sdl_poll_event(void *event)
+{
+	SDL_Event host_event;
+
+	if (!SDL_PollEvent(&host_event))
+		return 0;
+	memcpy(event, &host_event, sizeof(host_event));
+	switch (host_event.type)
+	{
+	case SDL_EVENT_TEXT_INPUT:
+	case SDL_EVENT_TEXT_EDITING:
+	{
+		struct guest_text_event *text = event;
+
+		text->window = host_event.text.windowID;
+		text->text = event_string(host_event.type == SDL_EVENT_TEXT_INPUT ? host_event.text.text :
+			host_event.edit.text);
+		text->start = host_event.type == SDL_EVENT_TEXT_EDITING ? host_event.edit.start : 0;
+		text->length = host_event.type == SDL_EVENT_TEXT_EDITING ? host_event.edit.length : 0;
+		break;
+	}
+	case SDL_EVENT_DROP_BEGIN:
+	case SDL_EVENT_DROP_FILE:
+	case SDL_EVENT_DROP_TEXT:
+	case SDL_EVENT_DROP_COMPLETE:
+	case SDL_EVENT_DROP_POSITION:
+	{
+		struct guest_drop_event *drop = event;
+
+		drop->window = host_event.drop.windowID;
+		drop->x = host_event.drop.x;
+		drop->y = host_event.drop.y;
+		drop->source = event_string(host_event.drop.source);
+		drop->data = event_string(host_event.drop.data);
+		break;
+	}
+	}
+	return 1;
+}
+
+/* ---------- text input (Android's keyboard while a name is typed:
+sdl_platform.c)
+
+The game's text bar (HaloActivity.showTextBar, TextBar.java) takes the place
+of SDL's hidden field: a real text field above Android's keyboard, which shows
+what is typed and lets the keyboard suggest and correct. What it types still
+arrives as key events, which the guest reads, as SDL's own field's did. SDL's
+text input is not started meanwhile (its hidden field would take the
+keyboard's focus from the bar); with no bar, it is, as before. */
+
+/* the activity's method name (signature) called with the int given, or
+none when the signature takes none; whether it returned true (a void
+method's call counts) */
+#ifdef __ANDROID__
+static int text_bar_call(const char *name, const char *signature, int argument, int takes_argument)
+{
+	JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+	jobject activity = (jobject)SDL_GetAndroidActivity();
+	jclass activity_class;
+	jmethodID method;
+	int result = 0;
+
+	if (!env || !activity)
+		return 0;
+	activity_class = (*env)->GetObjectClass(env, activity);
+	method = activity_class ? (*env)->GetMethodID(env, activity_class, name, signature) : NULL;
+	if (method && takes_argument)
+		result = (*env)->CallBooleanMethod(env, activity, method, (jint)argument) ? 1 : 0;
+	else if (method)
+	{
+		(*env)->CallVoidMethod(env, activity, method);
+		result = 1;
+	}
+	if ((*env)->ExceptionCheck(env))
+	{
+		(*env)->ExceptionClear(env);
+		result = 0;
+	}
+	if (activity_class)
+		(*env)->DeleteLocalRef(env, activity_class);
+	(*env)->DeleteLocalRef(env, activity);
+	if (!method)
+		host_logf(HOST_LOG_WARN, "HaloActivity.%s could not be called", name);
+	return result;
+}
+#else
+/* (the desktop hosts, Linux's and macOS's, have no text bar: SDL's own text
+input, which a desktop's keyboard types into) */
+static int text_bar_call(const char *name, const char *signature, int argument, int takes_argument)
+{
+	(void)name;
+	(void)signature;
+	(void)argument;
+	(void)takes_argument;
+	return 0;
+}
+#endif
+
+int host_sdl_text_input(uint32_t window, int type)
+{
+	SDL_Window *object = host_sdl_handle_get(window, _handle_window);
+	SDL_PropertiesID properties;
+
+	if (!object)
+		return 0;
+	if (type < 0)
+	{
+		text_bar_call("hideTextBar", "()V", 0, 0);
+		if (SDL_TextInputActive(object))
+			SDL_StopTextInput(object);
+		return 0;
+	}
+	if (text_bar_call("showTextBar", "(I)Z", type, 1))
+	{
+		host_logf(HOST_LOG_INFO, "text input: the text bar (type %d)", type);
+		return 1;
+	}
+#ifdef __ANDROID__
+	host_logf(HOST_LOG_WARN, "text input: no text bar, SDL's hidden field (type %d)", type);
+#endif
+	properties = SDL_CreateProperties();
+	SDL_SetNumberProperty(properties, SDL_PROP_TEXTINPUT_TYPE_NUMBER, type);
+	SDL_SetBooleanProperty(properties, SDL_PROP_TEXTINPUT_MULTILINE_BOOLEAN, false);
+	SDL_SetBooleanProperty(properties, SDL_PROP_TEXTINPUT_AUTOCORRECT_BOOLEAN, false);
+	SDL_StartTextInputWithProperties(object, properties);
+	SDL_DestroyProperties(properties);
+	return SDL_TextInputActive(object) ? 1 : 0;
+}
+
+/* ---------- gamepads */
+
+int host_sdl_get_gamepads(uint32_t *ids, int capacity)
+{
+	int count = 0, index;
+	SDL_JoystickID *list = SDL_GetGamepads(&count);
+
+	if (!list)
+		return 0;
+	if (count > capacity)
+		count = capacity;
+	for (index = 0; index < count; index++)
+		ids[index] = list[index];
+	SDL_free(list);
+	return count;
+}
+
+uint32_t host_sdl_open_gamepad(uint32_t id)
+{
+	SDL_Gamepad *gamepad = SDL_OpenGamepad((SDL_JoystickID)id);
+
+	if (gamepad)
+	{
+		char guid[64];
+		char const *serial = SDL_GetGamepadSerial(gamepad);
+		char const *path = SDL_GetGamepadPath(gamepad);
+
+		/* (the serial, path and GUID tell two pads of the same model apart,
+		which share a name) */
+		SDL_GUIDToString(SDL_GetGamepadGUIDForID((SDL_JoystickID)id), guid, sizeof(guid));
+		host_logf(HOST_LOG_INFO, "gamepad %u: %s (type %d, %04x:%04x, serial %s, path %s, guid %s)", (unsigned)id,
+			SDL_GetGamepadName(gamepad), (int)SDL_GetGamepadType(gamepad), SDL_GetGamepadVendor(gamepad),
+			SDL_GetGamepadProduct(gamepad), serial ? serial : "none", path ? path : "none", guid);
+	}
+	return host_sdl_handle_new(_handle_gamepad, gamepad);
+}
+
+uint32_t host_sdl_gamepad_from_id(uint32_t id)
+{
+	return host_sdl_handle_new(_handle_gamepad, SDL_GetGamepadFromID((SDL_JoystickID)id));
+}
+
+/* (the event thread, when the controller goes: sdl_platform.c) */
+void host_sdl_close_gamepad(uint32_t gamepad)
+{
+	SDL_Gamepad *object = handle_release(gamepad, _handle_gamepad, NULL);
+
+	if (object)
+		SDL_CloseGamepad(object);
+}
+
+int host_sdl_gamepad_axis(uint32_t gamepad, int axis)
+{
+	SDL_Gamepad *object = host_sdl_handle_get(gamepad, _handle_gamepad);
+
+	return object ? SDL_GetGamepadAxis(object, (SDL_GamepadAxis)axis) : 0;
+}
+
+int host_sdl_gamepad_button(uint32_t gamepad, int button)
+{
+	SDL_Gamepad *object = host_sdl_handle_get(gamepad, _handle_gamepad);
+
+	return object ? SDL_GetGamepadButton(object, (SDL_GamepadButton)button) : 0;
+}
+
+int host_sdl_gamepad_type(uint32_t gamepad)
+{
+	SDL_Gamepad *object = host_sdl_handle_get(gamepad, _handle_gamepad);
+
+	return object ? SDL_GetGamepadType(object) : SDL_GAMEPAD_TYPE_UNKNOWN;
+}
+
+/* ---------- gyroscope aiming (SDL's gamepad sensors)
+A controller with a gyroscope SDL reads (a DualSense, a DualShock 4, a
+Switch Pro Controller, a Joy-Con), whatever the platform: the turn since the
+last ask, in radians, yaw to the player's right and pitch up, from the
+sensor's rate times the time since then. SDL's axes are the Switch's (+x to
+the controller's right, +y up, +z toward the player), so the turn is as the
+Switch host's: yaw -y, pitch -x. A rate quieter than the sensor's noise at
+rest is dropped, and so is a gap long enough that one reading would spin
+the view (the sensor was not being asked) */
+#define SDL_GYRO_NOISE 0.01f
+#define SDL_GYRO_LONGEST_GAP_NS 100000000ULL
+#define SDL_GYRO_PADS 8
+
+static struct
+{
+	SDL_Gamepad *pad;
+	Uint64 asked_at;
+} sdl_gyro_pads[SDL_GYRO_PADS];
+
+static void sdl_gamepad_gyro_turn(SDL_Gamepad *pad, float *yaw, float *pitch)
+{
+	float rate[3];
+	Uint64 now = SDL_GetTicksNS();
+	int slot;
+	int found = -1;
+	int empty = -1;
+
+	*yaw = 0.0f;
+	*pitch = 0.0f;
+	if (!pad || !SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO))
+		return;
+	for (slot = 0; slot < SDL_GYRO_PADS; slot++)
+	{
+		if (sdl_gyro_pads[slot].pad == pad)
+			found = slot;
+		else if (!sdl_gyro_pads[slot].pad && empty < 0)
+			empty = slot;
+	}
+	if (found < 0)
+	{
+		found = empty >= 0 ? empty : 0;
+		sdl_gyro_pads[found].pad = pad;
+		sdl_gyro_pads[found].asked_at = 0;
+	}
+	if (!SDL_GamepadSensorEnabled(pad, SDL_SENSOR_GYRO))
+	{
+		SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+		sdl_gyro_pads[found].asked_at = 0;
+		return;
+	}
+	if (!SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, rate, 3))
+	{
+		sdl_gyro_pads[found].asked_at = 0;
+		return;
+	}
+	if (sdl_gyro_pads[found].asked_at && now > sdl_gyro_pads[found].asked_at &&
+		now - sdl_gyro_pads[found].asked_at <= SDL_GYRO_LONGEST_GAP_NS)
+	{
+		float seconds = (float)(now - sdl_gyro_pads[found].asked_at) * 1.0e-9f;
+		float x = rate[0] < SDL_GYRO_NOISE && rate[0] > -SDL_GYRO_NOISE ? 0.0f : rate[0];
+		float y = rate[1] < SDL_GYRO_NOISE && rate[1] > -SDL_GYRO_NOISE ? 0.0f : rate[1];
+
+		*yaw = -y * seconds;
+		*pitch = -x * seconds;
+	}
+	sdl_gyro_pads[found].asked_at = now;
+}
+
+void host_sdl_gamepad_gyro(uint32_t gamepad, float *yaw, float *pitch)
+{
+	float turn_yaw;
+	float turn_pitch;
+
+	sdl_gamepad_gyro_turn(host_sdl_handle_get(gamepad, _handle_gamepad), &turn_yaw, &turn_pitch);
+	if (yaw)
+		*yaw = turn_yaw;
+	if (pitch)
+		*pitch = turn_pitch;
+}
+
+int host_sdl_rumble_gamepad(uint32_t gamepad, uint32_t low, uint32_t high, uint32_t milliseconds)
+{
+	SDL_Gamepad *object = host_sdl_handle_get(gamepad, _handle_gamepad);
+
+	return object ? SDL_RumbleGamepad(object, (Uint16)low, (Uint16)high, milliseconds) : 0;
+}
+
+/* ---------- audio */
+
+/* SDL calls audio_callback on its own audio thread, which cannot run guest
+code; it passes each request to the stream's thread (audio_thread), which
+can, and waits for it to be done. SDL holds the stream's lock throughout, so
+the audio the guest puts into the stream meanwhile (from audio_thread) is
+kept in the binding's buffer instead, and put in by audio_callback once the
+guest is done: audio_thread putting it in itself would wait for the lock
+forever */
+struct audio_binding
+{
+	uint32_t handle;
+	uint32_t callback;
+	uint32_t userdata;
+	pthread_mutex_t lock;
+	pthread_cond_t requested;
+	pthread_cond_t done;
+	int pending;
+	/* the stream is destroyed: the thread frees the binding and ends */
+	int quit;
+	int additional;
+	int total;
+	unsigned char *buffer;
+	int buffer_length;
+	int buffer_size;
+};
+
+/* the binding whose callback this thread is running, if any */
+static __thread struct audio_binding *calling_back;
+
+static void *audio_thread(void *context)
+{
+	struct audio_binding *binding = context;
+
+	pthread_mutex_lock(&binding->lock);
+	for (;;)
+	{
+		int additional, total;
+
+		while (!binding->pending && !binding->quit)
+			pthread_cond_wait(&binding->requested, &binding->lock);
+		if (binding->quit)
+			break;
+		additional = binding->additional;
+		total = binding->total;
+		pthread_mutex_unlock(&binding->lock);
+		calling_back = binding;
+		host_call_guest(binding->callback, binding->userdata, binding->handle, (uint32_t)additional, (uint32_t)total);
+		calling_back = NULL;
+		pthread_mutex_lock(&binding->lock);
+		binding->pending = 0;
+		pthread_cond_signal(&binding->done);
+	}
+	pthread_mutex_unlock(&binding->lock);
+	pthread_cond_destroy(&binding->done);
+	pthread_cond_destroy(&binding->requested);
+	pthread_mutex_destroy(&binding->lock);
+	SDL_free(binding->buffer);
+	SDL_free(binding);
+	return NULL;
+}
+
+static void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream, int additional, int total)
+{
+	struct audio_binding *binding = userdata;
+
+	pthread_mutex_lock(&binding->lock);
+	binding->additional = additional;
+	binding->total = total;
+	binding->pending = 1;
+	pthread_cond_signal(&binding->requested);
+	while (binding->pending)
+		pthread_cond_wait(&binding->done, &binding->lock);
+	pthread_mutex_unlock(&binding->lock);
+	if (binding->buffer_length)
+	{
+		SDL_PutAudioStreamData(stream, binding->buffer, binding->buffer_length);
+		binding->buffer_length = 0;
+	}
+}
+
+/* audio the guest puts into its stream during the stream's callback, for
+audio_callback to put in; 1 on success */
+static int audio_keep(struct audio_binding *binding, const void *data, int length)
+{
+	if (length < 0)
+		return 0;
+	if (binding->buffer_length + length > binding->buffer_size)
+	{
+		int size = (binding->buffer_length + length) * 2;
+		unsigned char *buffer = SDL_realloc(binding->buffer, (size_t)size);
+
+		if (!buffer)
+			return 0;
+		binding->buffer = buffer;
+		binding->buffer_size = size;
+	}
+	memcpy(binding->buffer + binding->buffer_length, data, (size_t)length);
+	binding->buffer_length += length;
+	return 1;
+}
+
+uint32_t host_sdl_open_audio_stream(uint32_t device, const void *spec, uint32_t callback, uint32_t userdata)
+{
+	struct audio_binding *binding;
+	SDL_AudioStream *stream;
+
+	/* (one without a callback, the microphone's, which the guest reads:
+	nothing to bind) */
+	if (!callback)
+	{
+		stream = SDL_OpenAudioDeviceStream((SDL_AudioDeviceID)device, spec, NULL, NULL);
+		return stream ? host_sdl_handle_new(_handle_audio, stream) : 0;
+	}
+	binding = SDL_calloc(1, sizeof(*binding));
+	if (!binding)
+		return 0;
+	binding->callback = callback;
+	binding->userdata = userdata;
+	pthread_mutex_init(&binding->lock, NULL);
+	pthread_cond_init(&binding->requested, NULL);
+	pthread_cond_init(&binding->done, NULL);
+	stream = SDL_OpenAudioDeviceStream((SDL_AudioDeviceID)device, spec,
+		callback ? audio_callback : NULL, binding);
+	if (!stream)
+	{
+		SDL_free(binding);
+		return 0;
+	}
+	/* the device starts paused, so no callback can run before this */
+	binding->handle = host_sdl_handle_new(_handle_audio, stream);
+	if (!binding->handle)
+	{
+		SDL_DestroyAudioStream(stream);
+		pthread_cond_destroy(&binding->done);
+		pthread_cond_destroy(&binding->requested);
+		pthread_mutex_destroy(&binding->lock);
+		SDL_free(binding);
+		return 0;
+	}
+	pthread_mutex_lock(&handle_lock);
+	handles[binding->handle].binding = binding;
+	pthread_mutex_unlock(&handle_lock);
+	if (host_native_thread_create(audio_thread, binding, 256 * 1024) != 0)
+		host_fatal("cannot start the audio thread");
+	return binding->handle;
+}
+
+int host_sdl_put_audio_stream_data(uint32_t stream, const void *data, int length)
+{
+	SDL_AudioStream *object = host_sdl_handle_get(stream, _handle_audio);
+
+	if (!object)
+		return 0;
+	if (calling_back && calling_back->handle == stream)
+		return audio_keep(calling_back, data, length);
+	return SDL_PutAudioStreamData(object, data, length);
+}
+
+int host_sdl_resume_audio_stream_device(uint32_t stream)
+{
+	SDL_AudioStream *object = host_sdl_handle_get(stream, _handle_audio);
+
+	return object ? SDL_ResumeAudioStreamDevice(object) : 0;
+}
+
+/* (voice chat's microphone: port/linux/src/voice_audio.c) */
+int host_sdl_get_audio_stream_data(uint32_t stream, void *data, int length)
+{
+	SDL_AudioStream *object = host_sdl_handle_get(stream, _handle_audio);
+
+	return object ? SDL_GetAudioStreamData(object, data, length) : -1;
+}
+
+int host_sdl_get_audio_stream_available(uint32_t stream)
+{
+	SDL_AudioStream *object = host_sdl_handle_get(stream, _handle_audio);
+
+	return object ? SDL_GetAudioStreamAvailable(object) : -1;
+}
+
+/* (a stream with a callback has a thread the guest's callbacks run on:
+once no callback can run any more, it is told to end, and frees the
+binding and its stack as it goes) */
+void host_sdl_destroy_audio_stream(uint32_t stream)
+{
+	void *context;
+	SDL_AudioStream *object = handle_release(stream, _handle_audio, &context);
+	struct audio_binding *binding = context;
+
+	if (!object)
+		return;
+	/* (returns once a callback that is running has finished) */
+	SDL_DestroyAudioStream(object);
+	if (binding)
+	{
+		pthread_mutex_lock(&binding->lock);
+		binding->quit = 1;
+		pthread_cond_signal(&binding->requested);
+		pthread_mutex_unlock(&binding->lock);
+	}
+}
+
+/* ---------- the clipboard (internet play's invite links) */
+
+int host_sdl_set_clipboard_text(const char *text)
+{
+	return SDL_SetClipboardText(text) ? 1 : 0;
+}
+
+void host_sdl_get_clipboard_text(char *buffer, uint32_t size)
+{
+	char *text = SDL_GetClipboardText();
+
+	SDL_strlcpy(buffer, text ? text : "", size);
+	SDL_free(text);
+}
+
+int host_sdl_open_url(const char *url)
+{
+	return SDL_OpenURL(url) ? 1 : 0;
+}
+
+int host_sdl_show_toast(const char *message, int duration, int gravity, int x, int y)
+{
+#ifdef __ANDROID__
+	return SDL_ShowAndroidToast(message, duration, gravity, x, y) ? 1 : 0;
+#else
+	/* (the desktop guest shows none: Linux arm64, port/linux/host) */
+	(void)message;
+	(void)duration;
+	(void)gravity;
+	(void)x;
+	(void)y;
+	return 0;
+#endif
+}
+
+/* ---------- a dialog over the game's window */
+
+#ifdef HALO_MACOS
+/* the game's windows as a dialog shows and after: a window kept in relative
+mouse mode takes the mouse back to its middle as it becomes key again during
+the dialog's modal loop (leaving fullscreen is an animation, which ends with
+the window made key), and the keys then go to it, which reads no events
+until the dialog is answered: the mouse is stuck, Escape does nothing and the
+app cannot be quit. So the windows give up the mouse and fullscreen, the
+change of Space done before the dialog, which is a sheet on the window */
+#define DIALOG_WINDOWS 4
+
+struct dialog_windows
+{
+	int count;
+	SDL_Window *windows[DIALOG_WINDOWS];
+	bool relative[DIALOG_WINDOWS];
+	bool grabbed[DIALOG_WINDOWS];
+	bool fullscreen[DIALOG_WINDOWS];
+};
+
+static SDL_Window *dialog_windows_release(struct dialog_windows *saved)
+{
+	SDL_Window *parent = NULL;
+	SDL_Window **windows;
+	int count = 0;
+	int index;
+
+	memset(saved, 0, sizeof(*saved));
+	windows = SDL_GetWindows(&count);
+	if (!windows)
+		return NULL;
+	for (index = 0; index < count && saved->count < DIALOG_WINDOWS; index++)
+	{
+		SDL_Window *window = windows[index];
+		SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+		int slot = saved->count++;
+
+		saved->windows[slot] = window;
+		saved->relative[slot] = SDL_GetWindowRelativeMouseMode(window);
+		saved->grabbed[slot] = SDL_GetWindowMouseGrab(window);
+		saved->fullscreen[slot] = (flags & SDL_WINDOW_FULLSCREEN) != 0;
+		SDL_SetWindowRelativeMouseMode(window, false);
+		SDL_SetWindowMouseGrab(window, false);
+		if (saved->fullscreen[slot])
+			SDL_SetWindowFullscreen(window, false);
+		/* (the guest may have just left fullscreen itself: updater.c) */
+		SDL_SyncWindow(window);
+		if (!parent && !(flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)))
+			parent = window;
+	}
+	SDL_free(windows);
+	SDL_ShowCursor();
+	if (parent)
+		SDL_RaiseWindow(parent);
+	return parent;
+}
+
+static void dialog_windows_restore(const struct dialog_windows *saved)
+{
+	int index;
+
+	for (index = 0; index < saved->count; index++)
+	{
+		SDL_Window *window = saved->windows[index];
+
+		if (saved->fullscreen[index])
+			SDL_SetWindowFullscreen(window, true);
+		if (saved->grabbed[index])
+			SDL_SetWindowMouseGrab(window, true);
+		if (saved->relative[index])
+			SDL_SetWindowRelativeMouseMode(window, true);
+	}
+}
+#endif
+
+static bool dialog_show(const SDL_MessageBoxData *data, int *answer)
+{
+#ifdef HALO_MACOS
+	struct dialog_windows saved;
+	SDL_MessageBoxData question = *data;
+	bool shown;
+
+	question.window = dialog_windows_release(&saved);
+	shown = SDL_ShowMessageBox(&question, answer);
+	dialog_windows_restore(&saved);
+	return shown;
+#else
+	return SDL_ShowMessageBox(data, answer);
+#endif
+}
+
+/* ---------- a message for the player (a host of another network version) */
+
+int host_sdl_show_simple_message_box(uint32_t flags, const char *title, const char *message)
+{
+	static const SDL_MessageBoxButtonData ok = { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "OK" };
+	SDL_MessageBoxData data;
+
+	memset(&data, 0, sizeof(data));
+	data.flags = (SDL_MessageBoxFlags)flags;
+	data.title = title;
+	data.message = message;
+	data.numbuttons = 1;
+	data.buttons = &ok;
+	return dialog_show(&data, NULL) ? 1 : 0;
+}
+
+/* ---------- a question for the player (the mods at startup: port_mods.c) */
+
+/* 1 and the button chosen in box->chosen, else 0 (the structure: host.h) */
+int host_sdl_show_message_box(struct host_message_box *box)
+{
+	SDL_MessageBoxButtonData buttons[HOST_MESSAGE_BOX_BUTTONS];
+	SDL_MessageBoxData question;
+	const char *texts = (const char *)host_pointer(box->button_texts);
+	uint32_t used = 0;
+	int answer = -1;
+	int index;
+
+	if (box->button_count < 0 || box->button_count > HOST_MESSAGE_BOX_BUTTONS)
+		return 0;
+	for (index = 0; index < box->button_count; index++)
+	{
+		const char *end = used < box->button_texts_size ? memchr(texts + used, 0, box->button_texts_size - used) : NULL;
+
+		if (!end)
+			return 0;
+		buttons[index].flags = (SDL_MessageBoxButtonFlags)box->button_flags[index];
+		buttons[index].buttonID = box->button_ids[index];
+		buttons[index].text = texts + used;
+		used = (uint32_t)(end - texts) + 1;
+	}
+	memset(&question, 0, sizeof(question));
+	question.flags = (SDL_MessageBoxFlags)box->flags;
+	question.title = (const char *)host_pointer(box->title);
+	question.message = (const char *)host_pointer(box->message);
+	question.numbuttons = box->button_count;
+	question.buttons = buttons;
+	if (!dialog_show(&question, &answer))
+		return 0;
+	box->chosen = answer;
+	return 1;
+}

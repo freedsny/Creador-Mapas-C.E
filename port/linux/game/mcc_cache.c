@@ -1,0 +1,813 @@
+/* Independent MCC cache lifetime and I/O. Source files are opened read-only.
+ * Conversion uses exclusively MCC-owned memory and a separate tag window. */
+#include "cseries.h"
+#include "errors.h"
+#include "cache/cache_files.h"
+#include "bitmaps/bitmap_group.h"
+#include "scenario/scenario_definitions.h"
+#include "interface/ui_widget.h"
+#include "mcc_cache.h"
+#include "mcc_identity.h"
+#include "mcc_maps.h"
+#include "mcc_runtime.h"
+#include "mcc_resources.h"
+#include "mcc_package.h"
+#include "mcc_tag_validate.h"
+#include "mcc_checkpoint.h"
+#include "mcc_script_threads.h"
+#include "mcc_object_names.h"
+#include "mcc_grenades.h"
+#include "mcc_script_parameters.h"
+#include "mcc_campaign.h"
+#include "mcc_texture_cache.h"
+#include "mcc_ui_teams.h"
+#include "mcc_hud_draw.h"
+#include "mcc_loading.h"
+#include "mcc_precache.h"
+#include "mcc_validation.h"
+#include "mcc_errors.h"
+#include "mcc_tag_bundle.h"
+#include "halo_port_window.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+
+int config_boolean(char const *name);
+void *mcc_memory_reserve(uint32_t address, uint32_t size);
+void *mcc_memory_reserve_elsewhere(uint32_t linked, uint32_t size);
+void mcc_memory_release(void *allocation, uint32_t size);
+/* (port/linux/src/mcc_memory.c: how far the tags are from their base, while
+they are elsewhere; halo_port_window.h) */
+extern unsigned long platform_mcc_shift;
+extern unsigned long platform_mcc_linked_base;
+int config_boolean(char const *name);
+int mcc_tags_prepare(struct mcc_runtime *runtime);
+int mcc_scripts_prepare(struct mcc_runtime *runtime);
+short mcc_geometry_part_palette(struct mcc_runtime *runtime, void const *buffer, byte const **nodes);
+
+static struct mcc_runtime mcc_loaded_cache;
+static FILE *mcc_stream;
+static boolean mcc_loaded;
+
+/* How long each stage of an MCC map's load took, said once the load ends
+(or fails, as far as it got): which stage is worth making faster, and
+whether a change did. */
+unsigned long system_milliseconds(void);
+enum {
+    MCC_TIMING_READ, MCC_TIMING_RESOURCES, MCC_TIMING_TAG_COPY, MCC_TIMING_TAGS, MCC_TIMING_SCRIPTS,
+    MCC_TIMING_GEOMETRY, MCC_TIMING_AUDIO, MCC_TIMING_BITMAPS, MCC_TIMING_VALIDATION, MCC_TIMING_FINISH,
+    MCC_TIMING_COUNT
+};
+static struct { unsigned long start, last, elapsed[MCC_TIMING_COUNT]; int reached; } mcc_timing;
+
+static void mcc_timing_begin(void)
+{
+    memset(&mcc_timing, 0, sizeof(mcc_timing));
+    mcc_timing.start = mcc_timing.last = system_milliseconds();
+}
+
+static void mcc_timing_mark(int stage)
+{
+    unsigned long now = system_milliseconds();
+    mcc_timing.elapsed[stage] = now - mcc_timing.last;
+    mcc_timing.last = now;
+    mcc_timing.reached = stage + 1;
+}
+
+static void mcc_timing_report(char const *name)
+{
+    static char const *const names[MCC_TIMING_COUNT] = {
+        "read", "resources", "tag copy", "tags", "scripts", "geometry", "audio", "bitmaps", "validation", "finish"
+    };
+    char line[384];
+    int stage, used;
+    used = snprintf(line, sizeof(line), "mcc timing: %s: %lu ms in all", name ? name : "(unnamed)",
+        system_milliseconds() - mcc_timing.start);
+    for (stage = 0; stage < mcc_timing.reached && used > 0 && used < (int)sizeof(line); stage++)
+        used += snprintf(line + used, sizeof(line) - (size_t)used, "%s %s %lu", stage ? "," : ";",
+            names[stage], mcc_timing.elapsed[stage]);
+    error(_error_silent, "%s", line);
+}
+
+/* Menu selection, local admission and readiness ask about the same package.
+ * Retain only its small validation result, never an open file or converted tags. */
+static struct {
+    char name[64];
+    struct mcc_precache_snapshot files;
+    uint32_t checksum;
+} mcc_validation;
+
+void mcc_cache_validation_clear(void)
+{
+    memset(&mcc_validation, 0, sizeof(mcc_validation));
+}
+
+static int mcc_cache_probe(char const *name, struct mcc_cache_source const *source, uint32_t *checksum,
+    char *reason, size_t reason_size)
+{
+    struct mcc_precache_snapshot before, after;
+    int stamped = mcc_precache_snapshot(name, &before);
+    if (reason && reason_size) reason[0]=0;
+    if (mcc_validation_lookup(name, checksum, NULL)) return 1;
+    if (stamped && mcc_validation.checksum && !strcmp(name, mcc_validation.name) &&
+        !memcmp(&before, &mcc_validation.files, sizeof(before))) {
+        *checksum = mcc_validation.checksum;
+        return 1;
+    }
+    mcc_cache_validation_clear();
+    if (!mcc_resources_probe_explain(name, source, checksum, reason, reason_size)) return 0;
+    if (stamped) {
+        /* All candidates matter, including absent package/root overrides and
+         * both shared sets. Never publish a result from an in-flight install. */
+        if (!mcc_precache_snapshot(name, &after) || memcmp(&before, &after, sizeof(before))) {
+            if (reason && reason_size) snprintf(reason,reason_size,
+                "Its map or resources changed during validation. Finish installing and try again.");
+            return 0;
+        }
+        if (strlen(name) < sizeof(mcc_validation.name)) {
+            strcpy(mcc_validation.name, name);
+            mcc_validation.files = after;
+            mcc_validation.checksum = *checksum;
+        }
+    }
+    return 1;
+}
+
+static int mcc_prefix(char const *name)
+{
+    static char const prefix[] = "mcc_maps";
+    size_t i;
+    if (!name)
+        return FALSE;
+    for (i = 0; i < sizeof(prefix) - 1; ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != (unsigned char)prefix[i]) return FALSE;
+    }
+    return name[i] == '\\' || name[i] == '/';
+}
+
+boolean mcc_level_name(char const *name)
+{
+    return mcc_prefix(name);
+}
+
+static int mcc_path(char const *name, char path[128])
+{
+    return mcc_package_map_path(name, path);
+}
+
+/* Checkpoints store the scenario tag's name, not the menu's level name.
+ * Give this MCC instance its canonical namespace so Continue/reload resolves
+ * the same file even when its internal scenario path names a stock level. */
+static int mcc_scenario_identity(struct mcc_runtime *runtime, char const *name)
+{
+    char checked_path[128], canonical[64];
+    char *identity;
+    uint32_t address, index;
+    size_t length;
+    if (!runtime || !runtime->tag_index || !mcc_path(name, checked_path) ||
+        !mcc_package_name(name, canonical)) return FALSE;
+    index = runtime->report.scenario_handle & 0xFFFFu;
+    if (index >= runtime->report.tag_count) return FALSE;
+    name = canonical;
+    length = strlen(name + sizeof(MCC_MAPS_LEVEL_PREFIX) - 1);
+    identity = mcc_runtime_allocate(runtime, (uint32_t)(sizeof(MCC_MAPS_LEVEL_PREFIX) + length));
+    if (!identity) return FALSE;
+    memcpy(identity, MCC_MAPS_LEVEL_PREFIX, sizeof(MCC_MAPS_LEVEL_PREFIX) - 1);
+    memcpy(identity + sizeof(MCC_MAPS_LEVEL_PREFIX) - 1,
+        name + sizeof(MCC_MAPS_LEVEL_PREFIX) - 1, length + 1);
+    address = (uint32_t)(uintptr_t)identity;
+    mcc_diagnostic_tag(runtime,runtime->report.scenario_handle);
+    snprintf(runtime->original_scenario_tag,sizeof(runtime->original_scenario_tag),"%s",runtime->diagnostic.tag);
+    memcpy(runtime->tag_index + index * 32 + 16, &address, sizeof(address));
+    return TRUE;
+}
+
+static int mcc_file_read(void *context, uint32_t offset, uint32_t bytes, void *out)
+{
+    FILE *stream = context;
+    return stream && offset <= 0x7FFFFFFFu &&
+        !fseek(stream, (long)offset, SEEK_SET) && fread(out, 1, bytes, stream) == bytes;
+}
+
+static FILE *mcc_open_explain(char const *name, struct mcc_cache_source *source,
+    struct mcc_cache_identity *identity, char *reason, size_t reason_size)
+{
+    char path[128];
+    unsigned char header[MCC_CACHE_HEADER_BYTES];
+    FILE *stream;
+    long size;
+    enum mcc_cache_status status=MCC_CACHE_READ_FAILED;
+    if (reason && reason_size) snprintf(reason,reason_size,"The MCC package or level name is invalid.");
+    if (!mcc_path(name, path)) return NULL;
+    stream = fopen(path, "rb");
+    if (!stream) {
+        if (reason && reason_size) snprintf(reason,reason_size, "%s", errno==ENOENT ?
+            "Its .map file is missing. Install the complete level in its mcc_maps package folder." :
+            "Its .map file could not be opened. Check that the file is accessible.");
+        return NULL;
+    }
+    if (fseek(stream, 0, SEEK_END) || (size = ftell(stream)) < 0 ||
+        !mcc_file_read(stream, 0, sizeof(header), header) ||
+        (status=mcc_cache_identify(header, sizeof(header), (uint64_t)size, identity)) != MCC_CACHE_OK) {
+        if (reason && reason_size) snprintf(reason,reason_size,"%s",mcc_status_explanation(status));
+        fclose(stream);
+        return NULL;
+    }
+    if (reason && reason_size) reason[0]=0;
+    source->context = stream;
+    source->read = mcc_file_read;
+    source->size = (uint64_t)size;
+    return stream;
+}
+
+static FILE *mcc_open(char const *name, struct mcc_cache_source *source,
+    struct mcc_cache_identity *identity)
+{
+    return mcc_open_explain(name,source,identity,NULL,0);
+}
+
+/* (port) the Tag Injector's (mcc_tag_bundle.c): a map's file opened read-only
+ * as a level's is, its local name as the loader takes it */
+void *mcc_cache_file_open(char const *name, struct mcc_cache_source *source, struct mcc_cache_identity *identity)
+{
+    return mcc_open(mcc_identity_local_name(name), source, identity);
+}
+
+void mcc_cache_file_close(void *file)
+{
+    if (file) fclose((FILE *)file);
+}
+
+#include "mcc_validation.inl"
+
+boolean mcc_cache_available(char const *name)
+{
+    struct mcc_cache_identity identity;
+    struct mcc_cache_source source;
+    FILE *stream = mcc_open(mcc_identity_local_name(name), &source, &identity);
+    if (!stream) return FALSE;
+    fclose(stream);
+    return TRUE;
+}
+
+unsigned long mcc_cache_checksum(char const *name)
+{
+    uint32_t checksum=0;
+    name=mcc_identity_local_name(name);
+    if (mcc_validation_request(name,&checksum,NULL)!=1) return 0;
+    /* Initial host setup asks for the version before opening the lobby.
+     * Prepare the identity with it, before the first settings send. Early
+     * lobby map changes are deferred by mcc_ui_network until local admission.
+     * Keep the existing checksum value. */
+    if (checksum && !mcc_identity_prepare_host(name)) checksum=0;
+    return checksum;
+}
+
+boolean mcc_cache_present(char const *name, unsigned long checksum, char *message, long size)
+{
+    struct mcc_cache_identity identity;
+    struct mcc_cache_source source;
+    FILE *stream;
+    uint32_t actual;
+    char reason[320];
+    if (!mcc_identity_check(name)) {
+        snprintf(message,(size_t)size,"The resolved MCC map or resources changed since admission. Rejoin with the host's matching package.");
+        return FALSE;
+    }
+    name=mcc_identity_local_name(name);
+    stream=mcc_open_explain(name,&source,&identity,reason,sizeof(reason));
+    if (!stream) {
+        mcc_error_message(name,reason,message,size>0 ? (size_t)size : 0);
+        return FALSE;
+    }
+    if (!mcc_cache_probe(name,&source,&actual,reason,sizeof(reason))) {
+        fclose(stream);
+        mcc_error_message(name,reason,message,size>0 ? (size_t)size : 0);
+        return FALSE;
+    }
+    fclose(stream);
+    if (checksum && actual != checksum) {
+        snprintf(message, (size_t)size, "The MCC map %.63s or its package resources differ from the host. Install the same complete package.", name);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+boolean mcc_cache_require(char const *name, unsigned long checksum)
+{
+    char message[512];
+    wchar_t text[512];
+    size_t i;
+    if (mcc_cache_present(name, checksum, message, sizeof(message))) return TRUE;
+    error(_error_silent, "mcc: %s", message);
+    for (i = 0; message[i] && i < NUMBEROF(text) - 1; ++i) text[i] = (unsigned char)message[i];
+    text[i] = 0;
+    display_error_text_when_main_menu_loaded(text);
+    return FALSE;
+}
+
+/* An address in the tags, as the map was written for (at its base) or as it
+is where the tags are (the same where they are at their base; elsewhere once
+moved, or made by the loader: mcc_runtime_allocate). The offset into them, or
+NONE where it is neither. */
+static uint32_t mcc_runtime_offset(struct mcc_runtime const *runtime, uint32_t address)
+{
+    uint32_t actual = (uint32_t)(uintptr_t)runtime->tags;
+    if (runtime->tags && address - actual < runtime->capacity) return address - actual;
+    if (address - runtime->report.tag_base < runtime->capacity) return address - runtime->report.tag_base;
+    return 0xFFFFFFFFu;
+}
+
+void *mcc_runtime_pointer(struct mcc_runtime *runtime, uint32_t address, uint32_t bytes)
+{
+    uint32_t offset = mcc_runtime_offset(runtime, address);
+    if (offset > runtime->used || bytes > runtime->used - offset)
+        return NULL;
+    return runtime->tags + offset;
+}
+
+uint32_t mcc_runtime_linked(struct mcc_runtime const *runtime, uint32_t address)
+{
+    uint32_t offset = mcc_runtime_offset(runtime, address);
+    return offset == 0xFFFFFFFFu ? address : runtime->report.tag_base + offset;
+}
+
+void *mcc_runtime_actual(struct mcc_runtime const *runtime, uint32_t address)
+{
+    uint32_t offset = mcc_runtime_offset(runtime, address);
+    return offset == 0xFFFFFFFFu ? NULL : runtime->tags + offset;
+}
+
+int mcc_runtime_read(struct mcc_runtime *runtime, uint32_t offset, uint32_t bytes, void *out)
+{
+    return (uint64_t)offset <= runtime->source.size &&
+        bytes <= runtime->source.size - offset &&
+        runtime->source.read(runtime->source.context, offset, bytes, out);
+}
+
+void *mcc_runtime_allocate(struct mcc_runtime *runtime, uint32_t bytes)
+{
+    uint32_t limit = runtime->capacity, index;
+    uint32_t start = (runtime->used + 15u) & ~15u;
+    void *result;
+    for (index = 0; index < runtime->report.bsp_count; ++index) {
+        uint32_t bsp_offset = runtime->report.bsps[index].address - runtime->report.tag_base;
+        if (bsp_offset < limit) limit = bsp_offset;
+    }
+    if (start < runtime->used || start > limit || bytes > limit - start) return NULL;
+    result = runtime->tags + start;
+    memset(result, 0, bytes);
+    runtime->used = start + bytes;
+    return result;
+}
+
+boolean mcc_cache_tags_loaded(void) { return mcc_loaded; }
+
+char const *mcc_cache_level_name(void)
+{
+    return mcc_loaded && mcc_loaded_cache.level_name[0] ? mcc_loaded_cache.level_name : NULL;
+}
+
+short mcc_cache_scenario_type(void)
+{
+    return mcc_loaded ? (short)mcc_loaded_cache.report.identity.scenario_type : NONE;
+}
+
+boolean mcc_cache_contains(void const *address, long bytes)
+{
+    uintptr_t offset = (uintptr_t)address - (uintptr_t)mcc_loaded_cache.tags;
+    return mcc_loaded && bytes > 0 && offset <= mcc_loaded_cache.capacity &&
+        (uint32_t)bytes <= mcc_loaded_cache.capacity - offset;
+}
+
+void mcc_cache_tags_unload(void)
+{
+    mcc_validation_cancel();
+    mcc_cache_validation_clear();
+    mcc_cache_precache_clear();
+    mcc_hud_glyphs_dispose();
+    mcc_campaign_dispose();
+    mcc_ui_teams_reset();
+    mcc_script_threads_dispose();
+    mcc_checkpoint_dispose();
+    mcc_grenades_reset();
+    mcc_object_names_clear();
+    mcc_parameters_dispose();
+    mcc_loaded = FALSE;
+    mcc_texture_cache_dispose();
+    mcc_geometry_dispose(&mcc_loaded_cache);
+    mcc_audio_dispose(&mcc_loaded_cache);
+    mcc_bitmaps_dispose(&mcc_loaded_cache);
+    mcc_resources_dispose(&mcc_loaded_cache);
+    mcc_validation_dispose(&mcc_loaded_cache);
+    mcc_memory_release(mcc_loaded_cache.tags, mcc_loaded_cache.capacity);
+    platform_mcc_shift = 0;
+    platform_mcc_linked_base = 0;
+    if (mcc_stream) fclose(mcc_stream);
+    mcc_stream = NULL;
+    memset(&mcc_loaded_cache, 0, sizeof(mcc_loaded_cache));
+}
+
+struct cache_file_tag_header *mcc_cache_tags_load(char const *name, void *header)
+{
+    struct mcc_runtime *runtime = &mcc_loaded_cache;
+    struct mcc_cache_identity identity;
+    unsigned char *raw = NULL;
+    enum mcc_cache_status status;
+    uint32_t package_checksum;
+    unsigned char proven_digest[32];
+    int proven;
+    char memory_problem[192],resource_paths[2][128];
+    char const *problem = "the map could not be opened";
+    mcc_cache_tags_unload();
+    /* (the Tag Injector's map, opened at the menus in this same tag window,
+     * let go first: mcc_tag_bundle.c) */
+    mcc_tag_bundle_close();
+    mcc_timing_begin();
+    mcc_stream = mcc_open_explain(mcc_identity_local_name(name), &runtime->source, &identity,
+        runtime->failure,sizeof(runtime->failure));
+    if (!mcc_stream) goto failed;
+    if (!mcc_package_name(mcc_identity_local_name(name), runtime->level_name)) goto failed;
+    /* The virtual streams are disjoint from the on-disk file. */
+    problem = "Its file is larger than the MCC loader supports.";
+    if (identity.file_length >= 0x50000000u) goto failed;
+    raw = malloc(identity.tag_data_size);
+    problem = "Not enough memory to inspect its map data. Close other applications and try again.";
+    if (!raw) goto failed;
+    status = mcc_cache_load(&runtime->source, raw, identity.tag_data_size, &runtime->report);
+    problem = mcc_status_explanation(status);
+    if (status != MCC_CACHE_OK) {
+        error(_error_silent,"mcc: '%s', %s: %s; map refused (tag index %lu, reader location 0x%08lx)",
+            name ? name : "(map)",runtime->report.problem_path[0] ? runtime->report.problem_path : "map header",
+            runtime->report.problem_detail,(unsigned long)runtime->report.problem_tag,
+            (unsigned long)runtime->report.problem_location);
+        goto failed;
+    }
+    mcc_timing_mark(MCC_TIMING_READ);
+    problem = "Its MCC resources could not be selected. See debug.txt for the failing check.";
+    if (!mcc_resources_select_paths(runtime,raw,
+        mcc_validation_resources(runtime->level_name,resource_paths) ? resource_paths : NULL)) goto failed;
+    mcc_loading_update(MCC_LOADING_RESOURCES, 1, 3);
+    /* port: the lobby's validation read these very files (map and selected
+     * resources, every stamp unchanged since: mcc_validation_find) for the
+     * same CRC and SHA-256. Reading them again (a shared bitmaps.map is
+     * hundreds of MB) held the loading screen half a minute on a console. */
+    {
+        char validated[2][128], selected[2][128];
+        proven = mcc_validation_lookup(mcc_identity_local_name(name), &package_checksum, proven_digest) &&
+            mcc_validation_resources(mcc_identity_local_name(name), validated) &&
+            mcc_resources_selected_paths(runtime, selected) && !memcmp(validated, selected, sizeof(selected));
+    }
+    problem = "Its map resources could not be read completely. Check that the files are accessible.";
+    if (!proven && !mcc_resources_checksum(runtime,
+        (runtime->report.external_bitmap_count ? 1u : 0u)|(runtime->report.external_sound_count ? 2u : 0u),
+        &package_checksum)) goto failed;
+    mcc_loading_update(MCC_LOADING_RESOURCES, 2, 3);
+    problem = "Its map or resources changed after joining. Rejoin with the host's matching complete package.";
+    if (!mcc_identity_loaded(name,runtime,proven ? proven_digest : NULL)) goto failed;
+    mcc_timing_mark(MCC_TIMING_RESOURCES);
+    runtime->capacity = MCC_CACHE_TAG_CAPACITY;
+    /* At the base the map was written for, or where that is taken (on the
+    Switch, by the program's main stack or its own code, which the launcher
+    placed before it ran), elsewhere, its addresses then moved there
+    (halo_port_window.h). debug.mcc_elsewhere moves them where the base is
+    free, for testing. */
+    if (!config_boolean("debug.mcc_elsewhere"))
+        runtime->tags = mcc_memory_reserve(runtime->report.tag_base, runtime->capacity);
+    if (!runtime->tags) {
+        int reserve_error = errno;
+        runtime->tags = mcc_memory_reserve_elsewhere(runtime->report.tag_base, runtime->capacity);
+        if (runtime->tags) {
+            platform_mcc_linked_base = runtime->report.tag_base;
+            platform_mcc_shift = (unsigned long)(uintptr_t)runtime->tags - runtime->report.tag_base;
+            error(_error_silent, "mcc: the tags' base %08lx is %s; they are at %08lx, and their addresses are moved there",
+                (unsigned long)runtime->report.tag_base,
+                config_boolean("debug.mcc_elsewhere") ? "passed over (debug.mcc_elsewhere)" : strerror(reserve_error),
+                (unsigned long)(uintptr_t)runtime->tags);
+        } else errno = reserve_error;
+    }
+    /* (its base, wherever the tags are: saved games move their addresses by
+    the tags' distance from it, game_state.c) */
+    if (runtime->tags) platform_mcc_linked_base = runtime->report.tag_base;
+    if (!runtime->tags) {
+        snprintf(memory_problem, sizeof(memory_problem),
+            "the MCC tag address window at %08lx (%lu MiB) is unavailable: %s",
+            (unsigned long)runtime->report.tag_base,
+            (unsigned long)(runtime->capacity >> 20), strerror(errno));
+        problem = memory_problem;
+        snprintf(runtime->failure,sizeof(runtime->failure),
+            "The memory address range needed by this MCC map is unavailable. Restart OpenCE and try again.");
+        goto failed;
+    }
+    memcpy(runtime->tags, raw, identity.tag_data_size);
+    runtime->used = identity.tag_data_size;
+    runtime->tag_index = runtime->tags + 40;
+    free(raw);
+    raw = NULL;
+    problem = "Its saved-game identity could not be prepared. See debug.txt for details.";
+    if (!mcc_scenario_identity(runtime, name)) goto failed;
+    mcc_timing_mark(MCC_TIMING_TAG_COPY);
+    problem = "Its map data could not be converted. Check for an updated map; debug.txt has the failing check.";
+    mcc_loading_stage(MCC_LOADING_TAGS);
+    mcc_diagnostic_tag(runtime,UINT32_MAX);
+    if (!mcc_hud_bitmaps_prepare(runtime) || !mcc_tags_prepare(runtime)) goto failed;
+    mcc_timing_mark(MCC_TIMING_TAGS);
+    mcc_loading_stage(MCC_LOADING_SCRIPTS);
+    problem = "Its scripts could not be prepared. Check for an updated map; debug.txt names the failing script check.";
+    if (!mcc_scripts_prepare(runtime)) goto failed;
+    mcc_timing_mark(MCC_TIMING_SCRIPTS);
+    mcc_loading_stage(MCC_LOADING_GEOMETRY);
+    problem = "Its level geometry could not be prepared. See debug.txt for the failing geometry check.";
+    if (!mcc_geometry_prepare(runtime)) goto failed;
+    mcc_timing_mark(MCC_TIMING_GEOMETRY);
+    mcc_loading_stage(MCC_LOADING_AUDIO);
+    problem = "Its sounds could not be converted. See debug.txt for the failing sound check.";
+    if (!mcc_audio_prepare(runtime)) goto failed;
+    mcc_timing_mark(MCC_TIMING_AUDIO);
+    mcc_loading_stage(MCC_LOADING_BITMAPS);
+    problem = "Its textures could not be converted. See debug.txt for the failing texture check.";
+    if (!mcc_bitmaps_prepare(runtime)) goto failed;
+    mcc_timing_mark(MCC_TIMING_BITMAPS);
+    /* The runtime tag table is stock-shaped. The independent wire reader's
+     * report retains model offsets; no other loader sees an MCC header. */
+    memset(runtime->tags + 16, 0, 20);
+    memcpy(runtime->tags, &runtime->tag_index, 4);
+    memcpy(runtime->tags + 12, &runtime->report.tag_count, 4);
+    memcpy(runtime->tags + 32, "sgat", 4);
+    problem = "Its converted map data failed validation. Check for an updated map; debug.txt has the failing check.";
+    mcc_loading_stage(MCC_LOADING_VALIDATION);
+    if (!mcc_tags_validate(runtime)) goto failed;
+    mcc_timing_mark(MCC_TIMING_VALIDATION);
+    if (!mcc_runtime_read(runtime, 0, MCC_CACHE_HEADER_BYTES, header)) {
+        problem = "Its map header could not be read. Check that the complete file is accessible.";
+        goto failed;
+    }
+    /* The cache header checksum feeds native save validation as well as the lobby. */
+    memcpy((unsigned char *)header + 0x64, &package_checksum, 4);
+    problem = "Not enough memory to prepare its scripts. Close other applications and try again.";
+    if (!mcc_script_threads_prepare()) {
+        mcc_diagnostic_tag(runtime,runtime->report.scenario_handle);
+        mcc_diagnostic_at(runtime,"script thread storage");
+        mcc_diagnostic_fail(runtime,"not enough memory to allocate script thread state");
+        goto failed;
+    }
+    mcc_loaded = TRUE;
+    mcc_loading_stage(MCC_LOADING_SCENARIO);
+    mcc_bitmaps_prepare_gpu(runtime);
+    mcc_campaign_begin();
+    mcc_timing_mark(MCC_TIMING_FINISH);
+    error(_error_silent, "mcc: loaded %s (%lu tags, %lu bytes of runtime tags)", name,
+        (unsigned long)runtime->report.tag_count, (unsigned long)runtime->used);
+    mcc_timing_report(name);
+    return (struct cache_file_tag_header *)runtime->tags;
+failed:
+    mcc_timing_report(name);
+    error(_error_silent, "mcc: refused %s: %s", name ? name : "(unnamed)", problem);
+    if (runtime->failure[0]) error(_error_silent,"mcc: %s",runtime->failure);
+    {
+        wchar_t text[512];
+        mcc_error_text(mcc_identity_local_name(name),runtime->failure[0] ? runtime->failure : problem,text,NUMBEROF(text));
+        display_error_text_when_main_menu_loaded(text);
+    }
+    if (raw) free(raw);
+    mcc_cache_tags_unload();
+    return NULL;
+}
+
+boolean mcc_cache_read(long tag, long offset, long bytes, void *out)
+{
+    int result;
+    if (!mcc_loaded || offset < 0 || bytes < 0 || !out) return FALSE;
+    result = mcc_bitmaps_read(&mcc_loaded_cache, tag, (uint32_t)offset, (uint32_t)bytes, out);
+    if (result < 0) result = mcc_audio_read(&mcc_loaded_cache, tag, (uint32_t)offset, (uint32_t)bytes, out);
+    if (result < 0) result = mcc_runtime_read(&mcc_loaded_cache, (uint32_t)offset, (uint32_t)bytes, out);
+    if (!result) {
+        memset(out, 0, (size_t)bytes);
+        error(_error_silent, "mcc: I/O failed at %08lx (%ld bytes)", (unsigned long)offset, bytes);
+    }
+    return result ? TRUE : FALSE;
+}
+
+boolean mcc_cache_bsp_load(struct scenario_structure_bsp_reference const *reference,
+    void **header, void **structure)
+{
+    uint32_t i;
+    for (i = 0; mcc_loaded && i < mcc_loaded_cache.report.bsp_count; ++i) {
+        struct mcc_cache_bsp const *bsp = &mcc_loaded_cache.report.bsps[i];
+        void *address;
+        if (bsp->tag_handle != (uint32_t)reference->structure_bsp.index) continue;
+        /* (the reference's address as the map was written for, or moved
+        with the tags: halo_port_window.h) */
+        if (bsp->address != mcc_runtime_linked(&mcc_loaded_cache, (uint32_t)(uintptr_t)reference->base_address) ||
+            bsp->file_offset != (uint32_t)reference->file_offset || bsp->size != (uint32_t)reference->file_size)
+            return FALSE;
+        address = mcc_runtime_actual(&mcc_loaded_cache, bsp->address);
+        if (!address || !mcc_geometry_bsp_load(&mcc_loaded_cache, bsp->tag_handle, bsp->file_offset,
+            bsp->size, address, structure)) return FALSE;
+        *header = address;
+        if (!mcc_bsp_validate(&mcc_loaded_cache, (long)bsp->tag_handle, *header, (long)bsp->size)) {
+            mcc_geometry_bsp_unload(&mcc_loaded_cache);
+            return FALSE;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void mcc_cache_bsp_unload(void) { mcc_geometry_bsp_unload(&mcc_loaded_cache); }
+
+short mcc_cache_part_palette(void const *buffer, byte const **nodes)
+{
+    return mcc_loaded ? mcc_geometry_part_palette(&mcc_loaded_cache, buffer, nodes) : 0;
+}
+
+boolean mcc_cache_bitmap_valid(struct bitmap_data *bitmap)
+{
+    extern int mcc_bitmaps_valid(struct mcc_runtime *runtime, struct bitmap_data *bitmap);
+    return mcc_loaded && mcc_bitmaps_valid(&mcc_loaded_cache, bitmap);
+}
+
+void const *mcc_cache_bitmap_pixels(struct bitmap_data const *bitmap,unsigned long *bytes,int *coverage)
+{
+    uint32_t size=0;
+    void const *pixels;
+    if (coverage) *coverage=0;
+    pixels=mcc_loaded ? mcc_bitmaps_pixels(&mcc_loaded_cache,bitmap,&size,coverage) : NULL;
+    if (bytes) *bytes=size;
+    return pixels;
+}
+
+/* ---------- a map's tags read without loading it (the menus')
+
+mcc_cache_tag_names_walk: each tag's group and name from the map's tag index
+and its names alone (Firefight's MAP CONTENT lists, firefight_spawner.c).
+mcc_cache_raw_open: the map's tags as the file has them (no conversion, at
+no linked address: mcc_cache_pointer finds what an address names), and its
+file kept open for its models' vertices and strips (Firefight's MAP CONTENT
+preview, mcc_tag_preview.c). */
+
+#define MCC_NAMES_MAXIMUM_BYTES (8u * 1024u * 1024u)
+
+static uint32_t mcc_wire_u32(unsigned char const *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+boolean mcc_cache_tag_names_walk(char const *name,
+    int (*visit)(void *context, unsigned long group_tag, char const *tag_name), void *context)
+{
+    struct mcc_cache_identity identity;
+    struct mcc_cache_source source;
+    unsigned char header[0x28];
+    unsigned char *index = NULL, *names = NULL;
+    uint32_t base, count, i, low = UINT32_MAX, high = 0, names_bytes;
+    FILE *stream;
+    boolean walked = FALSE;
+
+    if (!name || !visit) return FALSE;
+    stream = mcc_open(mcc_identity_local_name(name), &source, &identity);
+    if (!stream) return FALSE;
+    if (identity.tag_data_size < sizeof(header) ||
+        !mcc_file_read(stream, identity.tag_data_offset, sizeof(header), header) ||
+        mcc_wire_u32(header) < 0x28 || mcc_wire_u32(header + 0x24) != (uint32_t)'tags')
+        goto done;
+    base = mcc_wire_u32(header) - 0x28;
+    count = mcc_wire_u32(header + 0xC);
+    if (!count || count > 65535 || 0x28 + (uint64_t)count * 0x20 > identity.tag_data_size) goto done;
+    index = malloc(count * 0x20);
+    if (!index || !mcc_file_read(stream, identity.tag_data_offset + 0x28, count * 0x20, index)) goto done;
+    /* (the names lie together after the index: read them at once) */
+    for (i = 0; i < count; i++) {
+        uint32_t address = mcc_wire_u32(index + i * 0x20 + 0x10);
+        if (address < base || address - base >= identity.tag_data_size) continue;
+        if (address - base < low) low = address - base;
+        if (address - base > high) high = address - base;
+    }
+    if (low > high) goto done;
+    names_bytes = high - low + 256;
+    if (names_bytes > identity.tag_data_size - low) names_bytes = identity.tag_data_size - low;
+    if (names_bytes > MCC_NAMES_MAXIMUM_BYTES) {
+        error(_error_silent, "mcc: %s's tag names span %lu bytes; not read", name, (unsigned long)names_bytes);
+        goto done;
+    }
+    names = malloc(names_bytes + 1);
+    if (!names || !mcc_file_read(stream, identity.tag_data_offset + low, names_bytes, names)) goto done;
+    names[names_bytes] = 0;
+    walked = TRUE;
+    for (i = 0; i < count; i++) {
+        unsigned char const *entry = index + i * 0x20;
+        uint32_t address = mcc_wire_u32(entry + 0x10);
+        if (address < base + low || address - base - low >= names_bytes) continue;
+        if (!visit(context, (unsigned long)mcc_wire_u32(entry), (char const *)names + (address - base - low))) break;
+    }
+done:
+    if (index) free(index);
+    if (names) free(names);
+    fclose(stream);
+    return walked;
+}
+
+struct mcc_raw_map {
+    FILE *stream;
+    struct mcc_cache_source source;
+    struct mcc_cache_identity identity;
+    struct mcc_cache_report report;
+    unsigned char *tags;
+    /* (its level's name and MCC resources alone: mcc_resources.c reads
+    bitmaps.map's pixels through a runtime) */
+    struct mcc_runtime runtime;
+};
+
+struct mcc_raw_map *mcc_cache_raw_open(char const *name)
+{
+    /* (malloc, not calloc: the game's free takes only what its malloc made) */
+    struct mcc_raw_map *map = malloc(sizeof(*map));
+    enum mcc_cache_status status;
+
+    if (!map) return NULL;
+    memset(map, 0, sizeof(*map));
+    map->stream = mcc_open(mcc_identity_local_name(name), &map->source, &map->identity);
+    if (!map->stream) {
+        free(map);
+        return NULL;
+    }
+    map->tags = malloc(map->identity.tag_data_size ? map->identity.tag_data_size : 1);
+    status = map->tags ? mcc_cache_load(&map->source, map->tags, map->identity.tag_data_size, &map->report) :
+        MCC_CACHE_NO_MEMORY;
+    if (status != MCC_CACHE_OK) {
+        error(_error_silent, "mcc: %s's tags not read for a preview: %s", name, mcc_cache_status_string(status));
+        mcc_cache_raw_close(map);
+        return NULL;
+    }
+    map->runtime.source = map->source;
+    map->runtime.report = map->report;
+    if (!mcc_package_name(mcc_identity_local_name(name), map->runtime.level_name))
+        map->runtime.level_name[0] = 0;
+    return map;
+}
+
+void mcc_cache_raw_close(struct mcc_raw_map *map)
+{
+    if (!map) return;
+    mcc_resources_dispose(&map->runtime);
+    if (map->tags) free(map->tags);
+    if (map->stream) fclose(map->stream);
+    free(map);
+}
+
+void *mcc_cache_raw_pointer(struct mcc_raw_map *map, unsigned long address, unsigned long bytes)
+{
+    return map ? mcc_cache_pointer(map->tags, &map->report, (uint32_t)address, (uint32_t)bytes) : NULL;
+}
+
+unsigned long mcc_cache_raw_tag_count(struct mcc_raw_map const *map)
+{
+    return map ? map->report.tag_count : 0;
+}
+
+/* the index entry of a tag (32 bytes: group, ..., handle +12, name +16, data +20) */
+unsigned char *mcc_cache_raw_entry(struct mcc_raw_map *map, unsigned long index)
+{
+    return map && index < map->report.tag_count ? map->tags + 0x28 + index * 0x20 : NULL;
+}
+
+/* `bytes` of a model's vertices (strip FALSE) or strips at an offset of them */
+boolean mcc_cache_raw_model_read(struct mcc_raw_map *map, boolean strip, unsigned long offset,
+    unsigned long bytes, void *out)
+{
+    uint32_t start, end;
+
+    if (!map) return FALSE;
+    start = strip ? map->report.model_vertex_bytes : 0;
+    end = strip ? map->report.model_bytes : map->report.model_vertex_bytes;
+    if (start > end || offset > end - start || bytes > end - start - offset) return FALSE;
+    return mcc_file_read(map->stream, map->report.model_file_offset + start + (uint32_t)offset, (uint32_t)bytes, out);
+}
+
+boolean mcc_cache_raw_bitmap_read(struct mcc_raw_map *map, unsigned long bitmap_handle, short bitmap_index,
+    struct bitmap_data const *bitmap, unsigned long bytes, void *out)
+{
+    if (!map || !bitmap || !out || !bytes || bitmap->pixels_size <= 0 || bytes > (unsigned long)bitmap->pixels_size)
+        return FALSE;
+    /* (bit 8: its pixels in bitmaps.map, as "<tag name>_<index>", or in its
+    tag's "<tag name>__pixels": mcc_bitmaps.c's mcc_texture_prepare) */
+    if (bitmap->flags & 0x100) {
+        unsigned char *entry = mcc_cache_raw_entry(map, bitmap_handle & 0xFFFF);
+        char const *tag_name;
+        char resource_name[272], group_name[272];
+        if (!entry || mcc_wire_u32(entry + 12) != (uint32_t)bitmap_handle || !map->runtime.level_name[0]) return FALSE;
+        tag_name = mcc_cache_raw_pointer(map, mcc_wire_u32(entry + 16), 1);
+        if (!tag_name || !memchr(tag_name, 0, MIN(256u, (unsigned)(map->tags + map->identity.tag_data_size -
+            (unsigned char const *)tag_name)))) return FALSE;
+        snprintf(resource_name, sizeof(resource_name), "%s_%u", tag_name, (unsigned)bitmap_index);
+        snprintf(group_name, sizeof(group_name), "%s__pixels", tag_name);
+        return mcc_resources_read(&map->runtime, 1, resource_name, (uint32_t)bitmap->pixels_offset, (uint32_t)bytes,
+            out, group_name) ? TRUE : FALSE;
+    }
+    return (uint64_t)(uint32_t)bitmap->pixels_offset + bytes <= map->source.size &&
+        map->source.read(map->source.context, (uint32_t)bitmap->pixels_offset, (uint32_t)bytes, out) ? TRUE : FALSE;
+}

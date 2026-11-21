@@ -1,0 +1,1007 @@
+# The Tag Injector
+
+The Tag Injector takes weapons, AI and equipment out of Halo Custom Edition
+maps and Halo 1 MCC maps (`mcc_maps`) and puts them in profiles, which the campaign randomizer adds to a level: a
+Custom Edition map's carbine lying where a plasma rifle was, its brutes in
+the level's encounters. A tag is taken out with every tag it names (its
+model, animations, collision, HUD, projectiles, effects, sounds and bitmaps;
+an actor variant's actor, unit, weapons and equipment), as a tag bundle
+(`docs/custom_edition_caches.md`, "Tag bundles").
+
+The game's code is `port/linux/game/tag_injector.c` (the menu's maps and
+tags, taking tags out, adding them to a level), `port/linux/src/port_tag_profiles.c`
+(the profiles' folder), `port/linux/game/menu_functions.c`'s "port tags"
+functions (the menu) and "randomizer tag profile" ones (the screen before
+the randomizer's), and `port/linux/game/randomizer.c` (the pools).
+
+It needs Custom Edition maps to run (`game.custom_edition`, on by default)
+and the maps in `custom_maps`, with Custom Edition's `bitmaps.map` and
+`sounds.map` (`README.md`, "Custom Edition maps"), or MCC maps in `mcc_maps`
+with MCC's shared resource maps (`docs/mcc_maps.md`; below, "MCC maps").
+
+## The menu
+
+**Forge > Tag Injector** (PLAY > FORGE) is laid out as the Mods screen is: a
+list on the left, and in the frame on the right what the row chosen is and
+what A does with it. B, or **BACK**, goes back up a list, and from the
+first leaves. Its first list has:
+
+- **TAG INJECTION**: ON lets the randomizer add a profile's tags
+  (`game.tag_injection`). A, left or right turns it on or off.
+- **TAG PROFILES**: the profiles, each with the size of its folder (what
+  its tags share counted once; EMPTY without any).
+- **CAMPAIGN PROFILES**: how a campaign level plays a profile's weapons
+  and AI without the randomizer (below, "Campaign profiles").
+- **MULTIPLAYER PROFILES**: how a multiplayer game plays a profile's
+  weapons (below, "In multiplayer").
+- **MAPS**: the Custom Edition maps and the MCC maps.
+
+**TAG PROFILES**: A on a profile lists its tags' kinds, as a map's are
+(**WEAPONS**, **AI**, **EQUIPMENT**, **VEHICLES**, **BIPEDS**,
+**SCENERY**, **DOORS & DEVICES**, **SKIES** and **FIRST PERSON HANDS**, each
+with how many of them it has), and A on one lists them,
+each with where it came from (the frame) and its size, ON or OFF, or
+MISSING when its bundle is not there. Left or right turns a tag on or off: one off stays in the profile and
+is left out where the profile is played, to try the profile without it. A on
+a tag opens its settings:
+
+A weapon or an AI has these; equipment, which joins no pool, has NAME,
+ENABLED, REPLACE ORIGINAL and REMOVE TAG alone.
+
+- **NAME**: the name the menus show it by (its list, its frame, the
+  profile's tags), which A types; nothing typed is the last part of its
+  path. Its path stays its map's, which its bundle has and a level knows it
+  by. Its custom type is its name, unless it has one of its own, and AUTO
+  reads its name's words too: a protected map's `weapon 2` named
+  `Sniper Rifle` is a precision weapon.
+- **ENABLED**: on or off, as left and right on the tag.
+- **FACTION**: the pools of the randomizer it joins. An actor variant's:
+  COVENANT, FLOOD, HUMAN, or ANY POOL ONLY; a weapon's: COVENANT or HUMAN.
+- **COUNTS AS** (an actor variant's): the campaign's type it is among for
+  ONE TYPE (as ELITE, it is one of the elites a pool of elites plays), or
+  NONE.
+- **CLASS** (a weapon's): PRECISION, AUTOMATIC, POWER or NONE, the weapon
+  pools of those names.
+- **CUSTOM TYPE**: the name the randomizer's ONE TYPE's TAG INJECTOR chooses
+  it by. A types it; nothing typed is its name. Tags of
+  the same custom type (BRUTE for a brute minor, a brute major and a brute
+  captain) are played together.
+- **HUD** (a weapon's): the HUD it is drawn with, whoever carries it: an AI
+  of the profile that carries it adds it as its own tag (MAPS, below), whose
+  HUD this is. OWN, the default, is its map's. STOCK: AUTO
+  and the campaign's weapons (ASSAULT RIFLE, PISTOL, SNIPER RIFLE, ROCKET
+  LAUNCHER, SHOTGUN, FLAMETHROWER, PLASMA RIFLE, PLASMA PISTOL, NEEDLER)
+  draw it with that weapon's HUD: its crosshairs, ammo meters and zoom
+  overlay. The weapon zooms, fires and reloads as it did: a stock HUD only
+  changes what is drawn. AUTO chooses by its path's words (sniper or beam:
+  the sniper rifle's; needle: the needler's; rocket, launcher or fuel rod:
+  the rocket launcher's; shotgun or mauler: the shotgun's; flame: the
+  flamethrower's; plasma pistol, plasma rifle, pistol or magnum), else by
+  the weapon: one that zooms 4x or more the sniper rifle's, one that zooms
+  less the pistol's, one without a magazine (a battery or heat) the plasma
+  rifle's, and the rest the assault rifle's.
+- **REPLACE ORIGINAL** (a tag of a path a campaign map has: an energy
+  sword, an elite major): ON, it takes the place of the campaign's tag
+  wherever the level has it, with the tags it names as its map has them
+  ("In a level", below); OFF, the default, the level's stays. The campaign
+  maps are read for their paths the first time a tag's settings open.
+- **REMOVE TAG**: A, twice, takes it out of the profile and deletes its
+  bundle.
+
+AUTO, each setting's first, finds it by the tag's name as the randomizer
+finds the campaign's: an actor variant's faction and type by its unit's
+(a grunt, elite, jackal, hunter or engineer is the Covenant's, a flood form
+the Flood's, a marine human; a brute is none of them, and is played by ANY
+and TAG INJECTOR alone until its faction is set), a weapon's by the
+campaign's weapon of its path, else by its name's words (plasma, needle,
+carbine: the Covenant's; sniper, pistol: precision; rocket, shotgun,
+sword: power; rifle: automatic).
+
+**MAPS** has **ADD TO**, the profile a map's tags are added to (the one
+opened last in TAG PROFILES, or made; left and right choose another), and
+**CUSTOM SINGLEPLAYER** and **CUSTOM MULTIPLAYER**, as the map lists have
+them: A on one lists its folders of `custom_maps` (each with how many maps
+it has) and the maps beside them, and A on a folder lists its maps.
+**MCC SINGLEPLAYER** and **MCC MULTIPLAYER** list the MCC maps of
+`mcc_maps` as the MCC map lists do: their Workshop collections and packages
+first, then the maps beside them (below, "MCC maps"). A on a
+map loads its tags, as the game would play them, and lists its
+**WEAPONS**, **AI**, **EQUIPMENT**, **VEHICLES**, **BIPEDS** and
+**SCENERY**, each with how many there are. A on one lists them, by the last
+part of their paths (the frame has how many tags it requires: itself and
+what it names). A on a weapon, an actor variant or equipment adds it to the
+profile (ADDED), or takes it out again. An actor variant added adds the
+weapons and equipment it carries too, each a tag of the profile of its own
+(one the profile has of that path is left as it is), so that their HUD and
+replacing are set there; taking the actor variant out leaves them. The
+randomizer plays weapons and AI; equipment joins no pool, and is played as
+an AI's, or replacing the original. Vehicles, bipeds and scenery are listed,
+and cannot be added yet.
+
+The button bar beside BACK goes by the list shown: nothing in the first
+list; **NEW PROFILE** in TAG PROFILES, which asks for a name (letters,
+digits, spaces, `-` and `_` make its folder's name) and chooses it; in a
+profile's lists **DUPLICATE PROFILE**, which asks for a name and makes a
+copy of the profile (its tags, their settings and its pack), and **DELETE
+PROFILE**, which, pressed twice, deletes it and its tags; and in MAPS'
+lists NEW PROFILE and **VIEW <name> PROFILE**, which shows the profile MAPS
+adds to as A on it in TAG PROFILES does, B from there going back to the list
+it was pressed in (a map's weapons, still open).
+
+**MULTIPLAYER PROFILES** lists the multiplayer profiles, each with the
+profile whose weapons it plays; **NEW PROFILE** asks for a name and makes
+one playing the profile shown last in TAG PROFILES. A on one opens its
+settings:
+
+- **NAME**: the name the menus and Server Setup show it by, which A types.
+- **TAG PROFILE**: the profile whose weapons on it plays (its AI and
+  equipment are not played). A, left and right choose another.
+- **ROTATION**: **ADD TO MAP'S**, the profile's weapons join the map's, so
+  that a weapon of the map may stay the map's; **PROFILE'S ONLY**, the
+  map's weapons are all swapped for the profile's.
+- **REPLACEMENT**: how the map's weapons are swapped. **FULLY RANDOM**: a
+  weapon at random each time one spawns. **ONCE PER POSITION**: each place
+  a weapon spawns rolls one the first time, and spawns it all game.
+  **ONCE PER WEAPON**: each of the map's weapons rolls one the first time
+  it spawns, and every one of it is that (every shotgun the same).
+  **MANUAL**: below it, a row for each of the map's weapons (ASSAULT
+  RIFLE, PISTOL, SNIPER RIFLE, ROCKET LAUNCHER, SHOTGUN, FLAMETHROWER,
+  PLASMA RIFLE, PLASMA PISTOL, NEEDLER), with how many weapons are chosen
+  for it (AS IT IS: none, and it stays the map's); A on one lists
+  **ORIGINAL** (the map's own) and the profile's weapons on, each turned on
+  or off by A, left or right. One of those on spawns at random each time.
+  With ADD TO MAP'S, the original is among them whether or not it is on.
+- **LOADOUT**: the weapons each player spawns with. **GAMETYPE'S**: as the
+  gametype gives them. **RANDOM**: two different weapons of those the map's
+  are swapped for, each spawn. **SET**: **PRIMARY** and **SECONDARY**
+  below it, each NONE, one of the map's weapons (MAP'S PISTOL: when the map
+  has it) or one of the profile's.
+
+In a multiplayer profile's lists the button bar has **DELETE PROFILE**,
+which, pressed twice, deletes the multiplayer profile (not its profile).
+
+**CAMPAIGN PROFILES** lists the campaign profiles, each with the profile
+whose tags it plays; **NEW PROFILE** asks for a name and makes one playing
+the profile shown last in TAG PROFILES. A on one opens it:
+
+- **NAME**: the name the menus show it by, which A types.
+- **TAG PROFILE**: the profile whose weapons and AI on it plays. A, left
+  and right choose another.
+- **WEAPONS** (its row says its ROTATION and REPLACEMENT): A opens
+  - **ROTATION**: **ADD TO LEVEL'S**, the profile's weapons join the
+    level's, so a weapon lying in the level may stay as it is; **PROFILE'S
+    ONLY**, every one is the profile's.
+  - **REPLACEMENT**: **RANDOM**, each weapon lying in the level, or given
+    to an actor, is one of the profile's at random; **MANUAL**: below it a
+    row for each of the campaign's weapons (ASSAULT RIFLE, PISTOL, SNIPER
+    RIFLE, ROCKET LAUNCHER, SHOTGUN, FLAMETHROWER, PLASMA RIFLE, PLASMA
+    PISTOL, NEEDLER, and the AI's own, FUEL ROD and ENERGY SWORD), with how
+    many weapons are chosen for it (AS IT IS: none, and it stays the
+    level's); A on one lists **ORIGINAL** and the profile's weapons on, each
+    turned on or off by A, left or right. With ADD TO LEVEL'S, the original
+    is among them whether or not it is on. An actor keeps its own weapon
+    when its unit has no animations to hold the one chosen.
+- **ENEMIES**: A opens ROTATION and REPLACEMENT for the level's actors
+  (**RANDOM**: any of the profile's AI, the player's allies left as they
+  are; **MANUAL**: the AI chosen for each enemy below), then a row for each
+  of the campaign's enemies, GRUNT, ELITE, JACKAL, HUNTER, COMBAT FORM,
+  CARRIER FORM, MARINE, INFECTION FORM, ENGINEER, SENTINEL (each with how
+  many AI and weapons are chosen for it, or AS IT IS). An enemy with ranks
+  (GRUNT: MINOR, MAJOR, SPEC OPS; ELITE: those, ZEALOT and STEALTH; JACKAL
+  and HUNTER: MINOR and MAJOR; COMBAT FORM: HUMAN and ELITE) lists its
+  ranks, each a slot of its own; one without opens its slot at once. A
+  slot has:
+  - **REPLACEMENT**: A lists ORIGINAL and the profile's AI, each turned on
+    or off (with RANDOM, it says so and does not open).
+  - **LOADOUT**: the weapons an actor placed in the slot holds, the
+    level's own or the AI that took its place: A lists **ORIGINAL** (its
+    own), the profile's weapons on and the campaign's, each turned on or
+    off. An enemy that holds no weapons a loadout can choose (HUNTER,
+    CARRIER FORM, INFECTION FORM, ENGINEER, SENTINEL) says NO WEAPONS, and
+    it does not open.
+
+In a campaign profile's lists the button bar has **DELETE PROFILE**, which,
+pressed twice, deletes the campaign profile (not its profile).
+
+Under the details of a map's tag (a kind's list in MAPS) and of a
+profile's (a kind's list in TAG PROFILES), the frame shows the tag's model,
+turning (`port/linux/game/tag_preview.c`): a weapon's, equipment's, a
+vehicle's, a biped's or scenery's own, an actor variant's its unit's, in
+its default pose: the most detailed geometry of each region's first
+permutation, its opaque parts alone (all of them when it has none, as an
+energy sword), each part with its shader's base map (a model's or an
+environment's shader's; grey without one), tinted by the change color a
+model's shader names where its multipurpose map's color change mask says:
+an actor variant's change colors, else its unit's (the first of each's
+permutations), as the game draws an object of it (the grunt major, minor
+and spec ops of one model, red, orange and black). The game draws it on the
+processor, lit from above with blue edges, into a picture the frame's
+`tag_preview` widget shows, once the row has been chosen for a moment (a
+profile's tag is read from its bundle). Under it, `tag_needs` says what of
+what the tag needs to work is MISSING, else "No data missing": a weapon
+needs its model, its collision
+(lying on the ground), its first-person model and animations, its
+projectile (none: a melee weapon's) and its HUD; an actor variant its
+behaviour (its actor), its unit, the unit's model, animations and
+collision, and its weapon (none: unarmed); equipment its model and
+collision; a vehicle or a biped its model, animations and collision;
+scenery its model (and its collision, which it may have none of). The
+details above them leave out their blank lines and stop at six; a profile's
+tag's say the map it came from, not its path. A tag whose model cannot be read shows nothing
+there.
+
+A profile's tag a level could not play (its bundle missing or unreadable,
+not one this build plays, past the room a level has, or adding a weapon
+without a first-person model, a bitmap this build cannot draw or a model it
+cannot make) is turned off, and its `failed` setting says why: its row says
+FAILED, and its details (and its ENABLED's) say it failed to load last time
+and why. Its row, its kind of tags', its profile's and TAG PROFILES' are
+yellow, and its kind's list has the tags that failed first. Turning it on
+again clears it, to try it again; it keeps its place in the list until the
+list is opened again. Tags past the 64 a
+level adds are left out but not turned off. Two seconds into the level
+played (past its opening cutscene, its players in their bodies), each local
+player's HUD says how many failed and which, by name, without stopping the
+game.
+
+A weapon without a first-person model or animations cannot be added: its
+map never let a player hold it, and the game reads them as the player holds
+it (a debug build stops). An AI whose bundle carries one is played without
+it: the weapon is left out (what names it names none), and the AI is added
+unarmed of it, for a campaign profile's LOADOUT (below) to arm; the
+randomizer and a level without a loadout for it leave it unarmed.
+
+A protected map's tags have no paths of their own (they are all
+`<protected>`, nothing, or one path many share), which the menu lists them,
+keeps them in a profile and adds them to a level by. As the map opens, each
+is given a name made from what it is (`docs/custom_edition_caches.md`, "Tag
+bundles"): a weapon its pickup text (`battle rifle`), a biped the stock
+folder of its tags (`elite`), an actor variant its unit's and its weapon's
+(`elite battle rifle`), numbered where two are the same (`battle rifle 2`).
+The frame says so, and NAME renames it once it is in a profile.
+
+Adding a tag loads its map again, with the sounds of the tags it takes
+decoded: a second or two, and longer for an actor variant of many voices
+(the brute major carbine of `firefight-fissurefall` takes 515 tags, 43 MB).
+
+### MCC maps
+
+A Halo 1 MCC map's tags are taken out as a Custom Edition map's are, into
+the same tag bundles, so a profile plays them wherever it plays any (the
+randomizer, campaign and multiplayer profiles, Forge, Firefight, the firing
+range) and on every kind of level the Tag Injector adds tags to, MCC
+levels among them (below, "On MCC levels").
+`port/linux/game/mcc_tag_bundle.c` opens the map as the MCC loader opens a
+level, in the MCC tag window (so not while an MCC map is played), and
+makes its tags a Custom Edition map's as they are taken out:
+
+- its metadata as an MCC level's is converted (shader types, chicago
+  extended shaders, weapon functions, HUD placements from MCC's 960-line
+  canvas, HUD meters), Gearbox HUD meters' opacity none as MCC draws them;
+- its models stay gbxmodels, as a Custom Edition map's bundles' are;
+- its bitmaps' pixels are read from the map or MCC's `bitmaps.map` as Halo
+  PC lays them out: BC7 as DXT5 (block for block), a 2D bitmap whose sides
+  are not powers of two (or BC7 that cannot be DXT5) decoded to linear
+  A8R8G8B8, its first level;
+- its sounds' samples (from the map or MCC's `sounds.map`: PCM, ADPCM or
+  Ogg Vorbis) are encoded as the Xbox ADPCM this build plays;
+- the MCC validator checks it all before anything is taken out.
+
+The scenario's scripts, recorded animations and cutscene cameras are left
+out of the opened map (a bundle never holds a scenario). An MCC map's model
+shaders of MCC's flag 6 and HUD meters of its flag 5 keep their Xbox channel
+orders where a level adds them (the bundle says it is an MCC map's). What an
+MCC level alone does as it draws (a weapon HUD's child anchors, its wider
+safe frame, MCC meters' coverage sampling) is not done for its tags on
+another level.
+
+**MCC's own content stays on this machine.** A tag of a map that is not a
+Steam Workshop item's (its package a Workshop id), or whose pixels or
+samples come from MCC's shared resource maps, holds MCC's own content,
+which its EULA lets no one redistribute (as MCC map sharing has it,
+`docs/mcc_maps.md`, "MCC sharing eligibility"). Its bundle says so, and it is
+left out of every network game's share and every Forge map's bake (logged:
+`... is MCC's own content, which stays on this machine`): played alone, on
+the firing range or in a campaign level, it plays; in a network game, every
+machine plays the profile without it. The menu says so on the MCC rows.
+
+### On MCC levels
+
+An MCC map's level plays Tag Injector profiles too (any profile's tags,
+Custom Edition's or MCC's; `randomizer.c`'s `randomizer_mcc_tags_loaded`
+takes it through the same level loading as any other's):
+
+- **an MCC campaign level** played alone: a campaign profile, chosen on the
+  TAG PROFILE screen after its difficulty (its campaign profiles alone:
+  the randomizer plays this build's campaign only), then the skulls' screen.
+  Its weapons and AI are swapped as a campaign level's are (by the
+  campaign's weapon and enemy paths, which a custom campaign may not use);
+- **an MCC multiplayer game**: the host's multiplayer profile, its share on
+  every machine, as on any multiplayer map;
+- **Firefight on an MCC map**: its variant's profile, as on any map.
+
+What is this build's maps' alone stays off on an MCC level: the
+randomizer's swaps, Forge's bakes and actors, the game modes' packs
+(Floodfection), and a co-op game's share (an MCC co-op game plays as it is).
+
+## Profiles
+
+The profiles are in the `tag_injector` folder of the data root (the folder
+with `maps/`; on Android the app's data folder, on the web the browser's
+storage for the site). Each profile is a folder, with a `profile.toml`, a
+tag file for each of its tags, and its pack:
+
+```
+tag_injector/
+  Brutes/
+    profile.toml
+    carbine.weap.tagref
+    brute major carbine.actv.tagref
+    tags.pack
+    tags.index
+```
+
+A tag's bundle (`docs/custom_edition_caches.md`, "Tag bundles") is kept in
+two parts (`port/linux/src/port_tag_store.c`): its tags in its tag file,
+and its file data, the pixels, samples and vertices they name, in the
+profile's pack, a region at a time (a bitmap's pixels, a sound's samples, a
+model part's vertices), each region once however many of the profile's tags
+have it. The tags of one map share much (their effects, sounds and shaders:
+a weapon's impacts on every material), which a bundle each held a copy of;
+the tags and each region are compressed too (zlib) where that makes them an
+eighth smaller. Five tags of `bleakness-firefight` (a battle rifle, a
+carbine and three brutes), 136 MB of bundles, are 21 MB so. A region no tag
+has any more is let go when a tag is taken out (the pack is written again
+when they are a quarter of it). `tags.index` is where the pack's regions
+are: one lost, or not the pack's, is made again from the pack.
+
+A bundle as it was taken out (`carbine.weap.tagbundle`, as an earlier build
+kept them, or `ce_tags extract` writes) is played as it is. The Tag
+Injector's menu stores such bundles while it is open, one a frame, saying
+how many are left and how much smaller the profiles are; one that cannot be
+is kept as it is (the log says why).
+
+```toml
+name = "Brutes"
+format = 2
+
+[[tags]]
+map = "firefight-fissurefall"
+group = "weap"
+tag = "cmt\\weapons\\covenant\\carbine\\carbine"
+file = "carbine.weap.tagref"
+enabled = true
+faction = "covenant"
+class = "automatic"
+custom_type = "Carbine"
+hud = "auto"
+replace = true
+name = "Brute Carbine"
+```
+
+A tag's `enabled`, `faction`, `type` (an actor variant's), `class` (a
+weapon's), `custom_type`, `hud` (a weapon's), `replace` and `name` are its
+settings in the menu, and `failed` why the level last loaded could not play
+it (`"missing"`, `"unreadable"`, `"too large"`, `"unplayable"`,
+`"no memory"`, `"not holdable"`, `"bitmaps"` or `"models"`); one left out is its default (on, AUTO, its name, OWN,
+off, the last part of its path, and not failed). An actor variant's `hud`, which an earlier build gave
+its weapons, is no longer read: its weapons' own tags have theirs. The values are the
+randomizer's names: `faction` `"covenant"`, `"flood"`, `"human"` or
+`"none"`; `type` one of `game.randomizer_type`'s (`"elite"`) or `"none"`;
+`class` `"precision"`, `"automatic"`, `"power"` or `"none"`; `hud` `"auto"`,
+`"assault_rifle"`, `"pistol"`, `"sniper_rifle"`, `"rocket_launcher"`,
+`"shotgun"`, `"flamethrower"`, `"plasma_rifle"`, `"plasma_pistol"` or
+`"needler"`.
+
+A profile holds its bundles, not the maps they came from: it is played
+without them, and can be copied to another machine whole (in a browser, the
+page's **Tag profiles** exports and imports profiles as zips:
+`port/web/README.md`). A folder without
+`profile.toml` is not a profile, nor is one made for a later `format` (a
+profile with tag files is of format 2, which an earlier build does not
+list; one of bundles alone stays 1). A
+tag whose bundle is missing, or is not one this build reads, is left out
+where the profile is played, and the game's log says why.
+
+Limits: 64 profiles, 256 tags a profile.
+
+The multiplayer profiles are files of `tag_injector/multiplayer` (64 at
+most), each its name, the folder of its profile and its settings. No
+profile is made in a folder named `multiplayer` or `campaign` (whatever its
+case), nor is one listed. An earlier build kept these files in
+`.multiplayer` and `.campaign`, which hid them from a player copying the
+folder: the game moves such a folder's files to the new one as it reads
+them, unless that one is there already.
+
+```toml
+name = "Shotgun Madness"
+profile = "Brutes"
+rotation = "add"
+replace = "manual"
+loadout = "set"
+primary = "cmt\\weapons\\covenant\\carbine\\carbine"
+secondary = "stock:pistol"
+
+[manual]
+shotgun = ["original", "cmt\\weapons\\covenant\\carbine\\carbine"]
+```
+
+The campaign profiles are files of `tag_injector/campaign` (64 at most),
+kept the same way:
+
+```toml
+name = "Brute Invasion"
+profile = "Brutes"
+weapon_rotation = "add"
+weapon_replace = "manual"
+enemy_rotation = "only"
+enemy_replace = "random"
+
+[weapons]
+plasma_rifle = ["original", "cmt\\weapons\\covenant\\carbine\\carbine"]
+
+[enemies]
+elite_major = ["cmt\\characters\\brute\\brute major"]
+flood_infection = ["original", "cmt\\characters\\flood\\infection"]
+
+[loadout]
+elite_major = ["original", "stock:needler"]
+```
+
+`weapon_rotation` and `enemy_rotation` are `"add"` or `"only"`;
+`weapon_replace` and `enemy_replace` `"random"` or `"manual"`; `[weapons]`
+the weapons chosen for each of the campaign's by its key (`assault_rifle`,
+`pistol`, `sniper_rifle`, `rocket_launcher`, `shotgun`, `flamethrower`,
+`plasma_rifle`, `plasma_pistol`, `needler`, `fuel_rod`, `energy_sword`),
+`[enemies]` the AI chosen for each enemy slot and `[loadout]` the weapons
+its actors may hold: `"original"` its own, a weapon of the profile by its
+path, or one of the campaign's as `"stock:"` and its key. A slot's key is
+its enemy's (`grunt`, `elite`, `jackal`, `hunter`, `flood_combat`,
+`flood_carrier`, `marine`, `flood_infection`, `engineer`, `sentinel`), and
+of one with ranks `_` and its rank's (`minor`, `major`, `specops`,
+`zealot`, `stealth`; a combat form's `human` or `elite`): `grunt_specops`,
+`flood_combat_human`. A setting left out is the first of its values.
+
+`rotation` is `"add"` or `"only"`; `replace` `"random"`, `"position"`,
+`"weapon"` or `"manual"`; `loadout` `"map"`, `"random"` or `"set"`;
+`primary` and `secondary` a weapon of the profile by its path, one of the
+map's as `"stock:"` and its key, or `""` for none; `[manual]` the weapons
+chosen for each of the map's by its key (`assault_rifle`, `pistol`,
+`sniper_rifle`, `rocket_launcher`, `shotgun`, `flamethrower`,
+`plasma_rifle`, `plasma_pistol`, `needler`), `"original"` the map's own. A
+setting left out is the first of its values.
+
+## In a level
+
+With **TAG INJECTION** on, the difficulty of a campaign level the randomizer
+plays opens, before the randomizer's screen, **TAG INJECTOR PROFILE**: NONE,
+the campaign profiles (below, "Campaign profiles") and each profile, marked
+(RANDOMIZER), A one to play it (`game.randomizer_tag_profile`), then the
+randomizer's screen, whose CANCEL comes back to it. It is shown with any
+profile, one alone too, so a level can be played without its tags; with
+none, none is played. A campaign profile chosen there plays the level
+instead of the randomizer, whose screen is passed over.
+The randomizer's screen has the profile's choices only while it has tags on
+of their kind:
+
+- **ENEMY POOL**'s **TAG INJECTOR**: the profile's AI alone.
+- **ENEMY TYPE**'s **TAG INJECTOR** (with ONE TYPE), and below it **CUSTOM
+  TYPE**, which left and right choose among the custom types of the
+  profile's AI: that one alone (`game.randomizer_custom_type`).
+- **PICKUP POOL**'s and **WEAPON POOL**'s **TAG INJECTOR**: the profile's
+  weapons alone; **PICKUP TYPE**'s and **WEAPON TYPE**'s **TAG INJECTOR**,
+  with their CUSTOM TYPE: one custom type of them
+  (`game.randomizer_pickup_custom`, `game.randomizer_weapon_custom`).
+
+The profile's tags on join the other pools too, as their settings say: ANY
+all of them, COVENANT, FLOOD and HUMAN those of their faction, PRECISION,
+AUTOMATIC and POWER the weapons of their class, and ONE TYPE's campaign
+types the AI that count as them (and are of the rank chosen, by their
+names). A setup saved (SAVE) keeps the custom types.
+
+A flag, an oddball or another map's thing of their kind (a weapon with the
+bit the game's `weapon_is_flag` reads) can sit in a profile, but no pool,
+swap or loadout gives one, here or in multiplayer and campaign profiles, and
+the menus do not offer it. The game type places them.
+
+The randomizer's **PLAYER LOADOUT** page sets the weapons a player starts with
+(`game.randomizer_loadout`): **DEFAULT**, the level's weapons; **RANDOM**, two
+for each player, rolled as the level loads, from the pickups' pool with
+WEAPON PICKUPS on, else any campaign hand weapon and the profile's; or **SET**,
+**PRIMARY** and **SECONDARY** as chosen, among the campaign's hand weapons and
+the profile's. They stand in for the starting profile's weapons at the spawn
+and each time a script gives one; its grenades, health and shields stay. Played
+alone a weapon the level lacks is copied in; a co-op host, whose clients add
+only the tags it advertises, gives only weapons the level has. A campaign
+profile, played in the randomizer's place, and a daily challenge use the
+level's. A setup saved keeps it.
+
+A campaign level the randomizer swaps is given the profile's tags on as it
+loads, after those the randomizer copies from the other campaign maps (none
+for a pool of the profile's alone):
+
+- each tag of a bundle that the level has not got (a tag of its group and
+  path) is added to the level's tags, in the profile's order; one the level
+  has is the level's own, and so is one an earlier bundle added;
+- each reference and tag index of a tag added names the level's tag;
+- a tag with REPLACE ORIGINAL on whose path the level has (its own, or a
+  tag the randomizer copied) is given to the level where that tag is, in its
+  place: the scenario's palettes, the actor variants that carry it and the
+  randomizer's pools have it now. Its other tags are its own, added though
+  the level has tags of their paths (its projectile, its model, its sounds
+  as its map has them), but for one a bundle before it has replaced, which
+  it shares. Of two tags replacing the same one, the first does; one whose
+  path the level has not got is added as the others are;
+- a weapon added whose HUD setting (its own tag's in the profile, whichever
+  bundle adds it) is a stock one names that HUD instead of its own (which is added, and not drawn). A level without that HUD gets it
+  from the first campaign map that has it (the sniper rifle's from a30, the
+  rocket launcher's from b30, the shotgun's from c10, the flamethrower's
+  from c20, the needler's from a30, the others' from a10), from
+  `tag_pack/watanoge_stock_huds.pack`, which the game writes at start-up
+  (`port/linux/TAG_INJECTION.md`); a HUD pixel the pack has not got is read
+  from that map as the level loads (16 MB of them at most). The profile's bundles are read before the randomizer copies its
+  tags, so that it knows the HUDs to copy. Without the HUD (its map is not
+  there), the weapon keeps its own, and the log says so;
+- a gbxmodel is made this build's model, as a Custom Edition map's are
+  (compressed vertices, in buffers of its own);
+- a bitmap's pixels and a sound's samples are read from the bundle's file as
+  the game wants them, the pixels laid out for the texture cache as a Custom
+  Edition map's are, with their channels where Halo PC keeps them (HUD
+  meters, multipurpose maps). A bundle's tags alone are kept in memory, 64
+  MB of them at most, from 64 bundles at most;
+- with `game.tag_injection_textures` `"small"`, or `"auto"` (its default)
+  where the texture cache is the Xbox's 22 MB (the web build's), a bitmap
+  with mipmaps is drawn from those of 256 pixels at most: Custom Edition
+  weapons' bitmaps are often uncompressed 512s (a battle rifle's 16 MB of
+  them), which filled the cache, and what did not fit was drawn as the
+  default texture, bands of green, yellow and red (`YOU GOT STABBED` in the
+  log). `"full"` draws them as they are. A bitmap without mipmaps (a HUD's)
+  is drawn as it is.
+
+A bundle whose model cannot be made, or whose bitmap cannot be drawn, is
+left out; when the tags would not fit in the level's table, none are added.
+
+Only a level played alone adds them: a network game's machines must have
+the same tags, and the profile is this machine's (Server Setup's randomizer
+has none of the TAG INJECTOR choices, and a setting of one is taken as ANY;
+a multiplayer game shares its host's weapons instead: "In multiplayer",
+below).
+A daily challenge, or a random run, never adds them: they are the same for
+everyone. A saved game is loaded with the tags the setup gives the level
+then, as the randomizer's are: one saved with a profile's tags expects the
+same profile.
+
+A multiplayer game plays a profile's weapons another way (below).
+
+## Campaign profiles
+
+A campaign profile plays a profile's weapons and AI in one of the ten
+campaign levels without the randomizer (`port/linux/game/tag_campaign.c`).
+With TAG INJECTION on and a campaign profile made, the difficulty of a
+campaign level opens the TAG INJECTOR PROFILE screen (above) whether the
+randomizer is on or not: NONE, then the campaign profiles (by their names),
+then, with the randomizer on, the profiles it plays, marked (RANDOMIZER).
+A campaign profile chosen (`game.campaign_tag_profile`) goes on to the
+skulls' screen, or the level; NONE goes on to the randomizer's screen with
+the randomizer on, else to the skulls' screen or the level. A level played
+so:
+
+- is given the profile's tags on as the randomizer's profile's are ("In a
+  level", above: their HUDs, REPLACE ORIGINAL, their failures), and no tags
+  of the other campaign maps (the skulls' aside);
+- swaps each weapon lying in it (not one a script names), and each given
+  to an actor (the fuel rod and the energy sword are only so), as WEAPONS
+  says: RANDOM among the profile's weapons (and the level's own, with ADD
+  TO LEVEL'S), MANUAL among those chosen for the campaign's weapon it is;
+  an actor's among those its unit has the animations to hold, else its
+  own;
+- swaps each actor it places (not one a script commands, nor a squad a
+  conversation names) as ENEMIES says: RANDOM among the profile's AI (and
+  the level's own, with ADD), the player's allies left as they are; MANUAL
+  among those chosen for its slot: the campaign's enemy it is, by its
+  unit's name as the randomizer finds it, and its rank, by its own name
+  (`major`, `specops`, `commander` the zealot, `stealth`; a combat form's
+  `human` or not; else minor) (MARINE swaps the allies too). As the
+  randomizer's, a squad's infection forms swapped for other AI are placed
+  one in three, an AI a script seats in a vehicle without the animations
+  for it rides as the level's own and is swapped back once out;
+- gives each actor it places in a slot (the level's own, or the AI that
+  took its place, an AI added without its weapon too) one of the weapons
+  its LOADOUT chose, at random, of those
+  its unit has the animations to hold (a campaign's weapon only when the
+  level has it), in place of WEAPONS' swap; with none chosen, or none it
+  can hold, its own, swapped as WEAPONS says. An AI whose actor variant
+  gives it no weapon holds none.
+
+Each roll is the placement's, so starting the level again rolls again,
+and a checkpoint keeps what was placed. A campaign profile is played in a
+level played alone, or in a co-op game ("In co-op", below); never in a
+daily challenge or a random run, and a saved game expects the same one.
+A campaign profile whose profile is gone, or has no tags on, plays the level
+as it is (the log says so).
+
+**PLAYER BIPED**, **PLAYER HANDS** and **PLAYER MOVEMENT** (`player_biped`,
+`player_hands`, `player_movement`) set what the player spawns as, as Forge's
+map settings do: a biped of the profile (or the map's own), its first-person
+hands (a biped chosen chooses the hands taken out of its map, the one whose
+path is most its own; hands are kept as `path#map`), and BIPED'S OWN or
+SPARTAN movement. A co-op game plays the host's for every player, read from
+its share's `campaign.toml` on every machine.
+
+
+## In multiplayer
+
+A multiplayer game hosted on one of the game's own multiplayer maps (not a
+campaign level, nor a Custom Edition map) can play the weapons of a
+profile, as a multiplayer profile says (`port/linux/game/tag_multiplayer.c`).
+With TAG INJECTION on and a multiplayer profile made, the gametype chosen
+for such a game opens a **TAG PROFILE** screen before Server Setup: NONE
+first, then the multiplayer profiles (the list starts on the one chosen
+last, `game.multiplayer_tag_profile`). What is chosen there is the game's
+until it ends, and decides who sees it:
+
+- **NONE**: the map's own weapons. The game is a plain one, listed for and
+  joined by every build, upstream's too.
+- **A multiplayer profile**: a modded game (below), which only builds with
+  the mod see and join. It needs Custom Edition maps on
+  (`game.custom_edition`) on every machine; without them its row is
+  refused.
+
+Server Setup's **TAG PROFILE** row shows the choice, and A on it (or B)
+goes back to the screen to choose again; nothing else changes it while the
+game is hosted (config.toml's setting is only the next game's starting
+point), so players who joined a plain game are never put into a modded one,
+nor the other way. With TAG INJECTION off, no multiplayer profile, or
+another map, the screen is skipped and the game plays none. A dedicated
+server takes `game.multiplayer_tag_profile` (with `game.tag_injection` on)
+as its game is hosted.
+
+- **The share.** As the game is hosted (and a moment after the profile
+  chosen, or its files, change, outside a level), the host writes the profile's weapons on as
+  one file, its archive (`tag_injector/.shared/<id>.tagshare`, named for
+  its hash's first 16 hexadecimal digits): their tag files and the
+  profile's pack and index as they are, nothing compressed again (the pack
+  has its AI's pixels and samples too), and a `profile.toml` of the weapons
+  alone, with their settings (their HUD, REPLACE ORIGINAL, their names),
+  and the multiplayer profile played (`multiplayer.toml`).
+  It plays the archive unpacked into `.shared/host`, as each player plays
+  its own copy. A share of the same weapons is not made again for the next
+  game; a level loading before the share was made (a lobby a moment long)
+  makes it then. The host tells each
+  of its players the hash (`_distributed_message_tag_share`), in the lobby
+  too, and a player without that share downloads its archive as a Custom
+  Edition map is downloaded (`port/linux/NETCODE.md`, "Map sharing": from
+  the host and the other players), and makes it the share's folder again.
+  The player's game waits for it as for a map, whose download bar says
+  "Downloading the host's tag profile". One that cannot download it
+  (`network.map_download` or `game.custom_edition` off) leaves the game,
+  saying why.
+- **A copy of one's own.** A share downloaded is copied, once, into the
+  player's TAG PROFILES as the host's profile's name and " (online)" (its
+  weapons, their settings and its pack), and its multiplayer profile into
+  MULTIPLAYER PROFILES, named so too and playing that copy: they are the
+  player's to change, play alone or host with. The game itself plays the
+  share as it came, whatever is done to the copy. A share downloaded before
+  copies were made is copied as the Tag Injector's menu opens (without a
+  multiplayer profile, which those shares did not carry). A marker beside
+  the share (`<id>.imported`) keeps a copy deleted from coming back.
+- **The level.** As the map loads, every machine adds the share's tags to
+  it as a profile's are added to a campaign level ("In a level", above:
+  the stock HUDs its weapons are drawn with copied from the campaign maps
+  when the map has not got them), before its menus' and mods' own tags, so
+  that they are at the same indices on every machine. A share's tag a
+  machine could not play is not turned off in it (it is the host's), but
+  that machine's level then differs from the host's: the host checks each
+  player's tags as it does a modded co-op game's, and the player's HUD says
+  so.
+- **The weapons.** The host alone spawns the map's weapons and gives its
+  players theirs (the players have the host's objects). Each of the map's
+  weapons it spawns (its netgame equipment's; not the flag, the ball,
+  grenades or powerups) is swapped as REPLACEMENT says, among the share's
+  weapons, and the map's with ADD TO MAP'S (those its netgame equipment
+  spawns). Each player spawning is given LOADOUT's weapons, its others
+  taken away, unless it is GAMETYPE'S; grenades are the gametype's. The
+  gametype's NO WEAPONS ON MAP spawns none of them. A gametype that gives
+  its weapons itself (Gun Game, Infection) keeps its own.
+- **Tag Gun Game** (the OPENCE bank's, or OPENCE OPTIONS' MODE) plays
+  Gun Game with the profile's weapons: its list is the map's eight loadout
+  weapons and every weapon the share added, each once (64 at most), in an
+  order the host draws for each game; its score to win is the list's length.
+  Without a profile it is Gun Game drawn in a random order.
+
+A game playing a multiplayer profile is a modded game
+(`port/linux/NETCODE.md`, "Modded games"): only a build with the mod joins
+it. A profile's tag of a later Tag Injector, or a bundle a player's build
+reads otherwise (a texture its renderer cannot draw), makes that player's
+level differ from the host's.
+
+Not built yet: Custom Edition maps; a multiplayer profile's AI or
+equipment. Downloaded shares stay in `tag_injector/.shared`
+until deleted by hand.
+
+Each team's **BIPED**, **HANDS** and **MOVEMENT** (RED, BLUE and FFA rows:
+`biped_red`, `hands_red`, `movement_red` and so on) set what its players
+spawn as, as Forge's map settings do (a team game plays the red and blue
+team's, a free for all game FFA's). The share carries the bipeds and hands
+chosen beside the weapons (`port_tag_profiles_shared_extras_set`), and every
+machine reads the settings from the share's `multiplayer.toml` as the level
+loads (port/forge/src/forge_map_settings.c's players layer, under a saved
+Forge map's own settings).
+
+
+### In co-op
+
+A co-op game hosted on one of the ten campaign levels (not a Custom
+Edition campaign map, nor a daily challenge) can play a campaign profile
+("Campaign profiles", above) the same way. With TAG INJECTION on and a
+campaign profile made, the difficulty chosen for the level opens the same
+**TAG PROFILE** screen before Server Setup: NONE (the levels as they are,
+or the randomizer's, a game every build joins unless it is randomized or
+has skulls), then the campaign profiles (starting on
+`game.campaign_tag_profile`). A campaign profile makes the game a modded
+one, kept for the whole game, every level of it; Server Setup's TAG
+PROFILE row shows it, A goes back to choose again, and its RANDOMIZER row
+is hidden: the profile plays in the randomizer's place, as it does alone,
+and the game is not advertised as randomized. A dedicated server hosting a
+co-op game takes `game.campaign_tag_profile` (with `game.tag_injection` on).
+
+- **The share** is made, told and downloaded as a multiplayer game's
+  (above), of all the profile's tags on (its AI, its weapons and the
+  equipment their bundles added), with the campaign profile played
+  (`campaign.toml`); a player's copy of it is a profile and a campaign
+  profile, both " (online)".
+- **The level.** Each level of the game adds the share's tags on every
+  machine as a campaign profile's level played alone adds the profile's
+  (the stock HUDs, the skulls' tags), so that they are at the same indices
+  on each; the host checks each player's tags.
+- **The swaps.** The host alone plays the campaign profile: it swaps the
+  level's weapons and actors and gives the loadouts, as alone. Its players
+  have the host's objects and actors, so they swap nothing.
+
+With the randomizer on, the screen lists the Tag Injector's profiles after
+the campaign profiles, marked (RANDOMIZER), as the solo screen does. One
+chosen joins the randomizer's pools (its TAG INJECTOR pools and custom
+types too, set on Server Setup's RANDOMIZER screen, which stays shown) for
+every level of the game, and is written to `game.randomizer_tag_profile`.
+It is shared as a campaign profile is (all its tags on, without a profile
+of settings), and the host advertises its TAG INJECTOR pools and whether
+each one type is a custom type with the randomizer's setup, so each player
+copies the same tags of the other campaign maps and adds the share's; the
+host alone swaps. With the randomizer swapping nothing, the game plays no
+share and is a plain one.
+
+## The Tag Editor
+
+The overlay menu's **TAG EDITOR** (L, R and the d-pad's down, or | on the keyboard) changes the
+weapon the first player holds, when it is one of the played profile's. Its
+first list has five:
+
+- **Weapon stats**: the weapon's own values (zoom, heat, autoaim), its
+  triggers, magazines and projectiles (their damage below them), and its
+  melee damage.
+- **HUD**: its HUD and the parent HUDs it draws too (below).
+- **Viewmodel**: its first-person arms and gun moved, turned and scaled as
+  one piece (below).
+- **Pickup settings**: its pickup prompt ("Hold E to pick up ..."):
+  **Prompt** ICON, its HUD's icon (its name when its HUD has none), or
+  TEXT, words, and **Text**, the words (nothing typed: its name as its map
+  has it), typed as a name is.
+- **Tag settings**: **Name**, the name the profile shows it by;
+  **Faction** and **Class**, the randomizer's pools it joins (left and
+  right choose, A puts back AUTO), as the Tag Injector menu has them;
+  **Custom type**, the randomizer's ONE TYPE name it is played by (nothing
+  typed: its name); and **Remove from profile** (A twice: the level loaded
+  keeps it until it loads again).
+
+  A name, a custom type and a pickup text are typed over the game, on the keyboard (Enter
+  keeps it, Escape does not, the arrows, Home and End move the cursor) or
+  on an on-screen keyboard, shown while a controller or the touchscreen was
+  used last: the d-pad picks a key, A presses it, a click or a tap presses
+  the key under it; < and > move the cursor, Aa gives capitals, Back or DEL
+  deletes the character before the cursor, SAVE keeps it, B or a right
+  click does not. Letters, digits, spaces, - and _ alone, as a profile
+  keeps them.
+
+Each change is kept in the weapon's tag of the profile, under
+`[tags.edits]` in `profile.toml`, a number by its key
+(`port/linux/game/tag_editor.c` lists them), and every level that adds the
+weapon gives it its edits; a network game's clients play the host's.
+
+**HUD** lists the weapon's HUD, and below it each **PARENT HUD** the HUD
+draws too (a Custom Edition HUD often keeps its visor, its ammunition
+counter's frame or its grenades in parent HUDs, shared by every weapon of
+the mod): their anchor, and each element with its bitmap's name. A on an
+element moves it over the game (the d-pad; A switches to its scale, Back
+puts it back, B is done); left or right on it hides it, and shows it again.
+A parent HUD's elements are its keys under `hud.parent1.` (its parent),
+`hud.parent2.` (that one's) and so on; a hidden one's `hide` is 1.
+
+**Viewmodel** places the weapon in the first-person view: **Right**, **Up**
+and **Forward** move it (in centimetres; the profile keeps world units),
+**Yaw** turns its muzzle to the left, **Pitch** up and **Roll** its top to
+the right (degrees; the profile keeps radians), and **Scale** sizes it, all
+about the gun's own root node, with its animations played as they are on
+top. Its keys are `viewmodel.x`, `viewmodel.y`, `viewmodel.z`,
+`viewmodel.yaw`, `viewmodel.pitch`, `viewmodel.roll` and `viewmodel.scale`;
+a value stepped back to where it started is taken out of the profile, so a
+weapon left as it is keeps no edits. Like the HUD, it changes at once in any
+game, and a network game's clients see the host's. A build before it keeps
+the keys and draws the weapon as its map has it.
+
+A weapon given edits plays a copy of each tag they change (its HUD, and a
+parent HUD changed: every HUD up to it), named for its edits, so that the
+weapons that share them keep theirs; weapons edited alike share one copy.
+While the level plays, a change is made to the tags it plays at once: a
+parent HUD shared with other weapons (**Edits apply to** names them)
+changes for them too until the level loads again.
+
+## The firing range
+
+A profile's list ends with **FIRING RANGE**: A, from the main menu's
+settings, plays a level alone to try the profile's tags in
+(`port/linux/game/firing_range.c`). Its parts, from the start in the
+middle facing north:
+
+Each side faces its other half: the weapons west and the AI east cover the
+same 12 units north to south, and the arena north and the mirror south are
+as wide as each other (16 units), 11 units from the start either way.
+
+- **West**, the weapons: each of the profile's weapons the level could add,
+  once, laid on benches (twelve to a bench, 12 units long, the first 4.5
+  units west of the start, the next 2.5 further each, 96 weapons at most). A
+  weapon taken is laid there again 3 seconds after its place is empty.
+  Past each bench's north end (its first weapon's) stands a dummy: the
+  multiplayer player's biped, unarmed, with a multiplayer player's health
+  and shield (no difficulty or skull scaling, the shield recharging as in
+  multiplayer, and multiplayer headshots), so a weapon's kill time is
+  multiplayer's. As it dies the HUD says how long it took from the first
+  hit; it is stood again 3 seconds later, healed 5 seconds after it was
+  last hurt, and put back when a blast pushes it. The AI leave it be.
+- **East**, the AI: each of the profile's actor variants the level could
+  add, once (32 at most), stands in columns of four from 4.5 units east of
+  the start (the next 2.5 further each), facing you, unarmed, playing every
+  base animation of its graph in turn (each name once), and nothing hurts
+  it. Walking up to one, the HUD says "Press action to fight" it; action
+  puts a live one of it in the arena, holding one of the profile's weapons
+  by chance (its own when the profile has none). Eight fight at once at
+  most: the ninth takes the oldest's place.
+- **North**, the arena: 16 by 14 units, walled 1 high, a door in its south
+  wall. Its AI walk the floor (its only walkable surface, so they do not
+  path round its walls) and have no encounter or firing positions. The pad
+  east of its door outside clears it: standing on it, the HUD says so, and
+  action takes away the bodies in it (and those of the AI fought, wherever
+  they fell) and the weapons and items lying in it.
+- **South**, the mirror: a frame 11 units south, 16 wide and 1.4 high
+  (drawn alone: it does not stop you). Standing up to 5 units before the
+  pane (within the frame across), a copy of you stands
+  where your reflection is, holding your weapons slot for slot (one picked
+  up or swapped is its too, in hand), and moves as you do: it is given your
+  controls each tick, turned about the pane, so it walks, jumps, crouches,
+  aims, fires, reloads, throws and strikes as you do, seen from the front.
+  Stepping back lets it go. Its shots and grenades hurt no one, and nothing
+  hurts it.
+
+The level is Blood Gulch (`maps/bloodgulch.map`), for its sky, sounds and
+shaders, with its ground never read: the game writes a structure bsp of its
+own where the map's would be, a floor walled round 8 units high, reaching
+6 units past the mirror's reflection south, the arena north, the farthest
+bench west and the farthest AI east (no narrower than the arena) (and solid past the walls, up to a ceiling 100 up), with
+the benches its own (their collision and their faces). It
+has no lightmap: the floor is drawn with the renderer's own directional
+light, and objects are lit by the bsp's default lighting. While it plays,
+Blood Gulch's scenery, vehicles, items, netgame flags and decals are taken
+out, and its players start at the middle facing north; the next time the
+map is loaded it is as it was. The pause menu's QUIT leaves the range.
+
+## The game's log
+
+The game's log says what is taken out and added (`tag injector:`), and why
+a map cannot be read, a tag cannot be taken out (a tag it names is of a
+group this build cannot bundle), or a bundle is left out.
+
+## In Forge
+
+The Tag Injector is Forge's source of custom tags, and its only one: Forge's
+menu opens it (TAG INJECTOR).
+
+- **The palette** is Forge's default tags, the profile chosen, and the tags
+  saved in the map. The default tags are a tag pack, `watanoge_forge` (about
+  565 MB), written at the main menu once Forge's menu has been opened; a tag is
+  read from it the moment it is placed, so a level holds only what it uses.
+  What it can place is kept in `Faber_data/cached_tags/pack_palette.txt`.
+- **Choosing.** After the map, in Single Player, Multiplayer and Edit Maps, a
+  TAG PROFILE screen lists NONE and each profile with a tag on (no such
+  profile, or Custom Edition maps off: it is skipped). The choice lasts the
+  session.
+- **Online.** A Forge game shares the whole profile, not only its weapons, as
+  co-op does: its share kind is `_share_forge`, the host swaps nothing, and
+  a game with a profile is a modded one (flag 0x40) on Forge's own network
+  version. Scenery and doors spawn on each machine, so whether a door is open
+  is not kept the same.
+- **Saved maps.** Saving on a stock map stores the tags of what is placed that
+  are not the game's in the map: an `OCETAGS1` archive after the map's other
+  trailers, found by the state's `BAKED_TAGS|offset|size|id` line. Only the
+  tags objects use are kept, so a tag nothing uses is dropped at the next save.
+  As the map loads, on every machine and in any game, the archive is unpacked
+  once into `tag_injector/.baked/<id>/` and read before any profile: a baked
+  tag stays as it was saved, even over a tag of the same path in the profile.
+  A Custom Edition base has its tags in the file already. An old save's tag
+  no one has any more stays in the map, and the HUD says it cannot be shown.
+- **Snap points** are each tag's own, kept by its path in
+  `Faber_data/cached_tags/snap_points.txt`. A scenery or door tag's page in a
+  profile has **SNAP POINTS**, which lists its points over its turning model
+  (the white one is chosen): LAYOUT sets them by the model's box, and each is
+  moved by its rows. A stock tag has no page: **SNAP POINTS** in Object
+  Properties, on an object of it, chooses none or a layout. That replaces any
+  points the tag had.
+- **Skies, bipeds and hands.** A map's **SKIES** are its sky tags, and its
+  **FIRST PERSON HANDS** every model that can be a player's arms: the one its
+  globals draw them with (`first_person_interface`), and each model no object
+  or first-person weapon is drawn with whose nodes are mostly those (an
+  elite's or an ODST's arms beside the cyborg's). Adding a biped adds its
+  hands too, a tag of its own (unless the profile has one of that path): the
+  arms whose path shares the most folders with the biped's
+  (`characters\elite\fp\fp_arms` for `characters\elite\elite_mp`), else the
+  globals'. Forge's map settings play them; nothing else does. Most maps keep
+  their arms at the stock path (`characters\cyborg\fp\fp`), so a profile
+  names hands by their path and map (`characters\cyborg\fp\fp#bigass`): each
+  map's arms are a tag of their own. A level adds a profile's hands beside its
+  own: the model by that name, and what it names that the level has of the
+  same paths (shaders, bitmaps) as `<path>#<map>`, so their textures stay
+  theirs (a hands tag of an older profile, named by its path alone, is added
+  so too when the level has its path). REPLACE ORIGINAL on hands replaces the
+  level's own instead.
+- **Map settings.** In Forge mode, holding the palette's button (instead of
+  pressing it) opens MAP SETTINGS: **DISPLAY NAME** (typed; the map lists
+  show it), **SKYBOX**, **FOG SETTINGS** and **PLAYER BIPEDS**. FOG SETTINGS
+  has the atmosphere (MAP DEFAULT, CLEAR, LIGHT FOG, HEAVY FOG, FLOOD FOG, or
+  CUSTOM once a value is changed) and the fog's color, density, start,
+  full-fog distance, fog indoors and the sky behind the fog. PLAYER BIPEDS has
+  RED TEAM, BLUE TEAM and FREE FOR ALL (left and right choose the biped, A
+  opens the team's page: BIPED, HANDS, MOVEMENT and TEST SPAWN). MOVEMENT
+  SPARTAN moves the biped as the map's own player biped does: its player
+  physics (strafing, the player's speeds), turning, flying none, slopes,
+  jump and landings are copied onto the biped's tag in memory on every
+  machine (its size, cameras and crouch stay its own; an AI of the same tag
+  moves so too); BIPED'S OWN gives them back (`MAP_MOVEMENT|slot|1`, `!FGM`). A biped chosen chooses
+  its hands: of a profile's biped, the hands taken from its map whose path is
+  most its own; else the map's. Solo Forge, a single player game, plays the
+  FREE FOR ALL biped.
+- **Test spawn.** TEST SPAWN (the host's, or solo) leaves Forge mode and
+  makes the player that team's biped. Solo, where a death reverts the game to
+  its checkpoint, the player's unit is swapped where it stands: the new one has
+  the weapons it had that the biped has animations for (the status bar says
+  how many it cannot hold; its tag's own starting weapons too) and its
+  grenades. A network game's host is killed and spawns again. A copy of the
+  biped stands a few steps ahead, facing the player, moving as in a mirror:
+  walking, aiming, jumping, crouching and firing as the player does, with the
+  player's weapons (its shots hurt no one; it can be shot, and stands again).
+  Forge mode ends the test. A biped picks up only weapons its animations
+  have, so many custom bipeds cannot hold the stock weapons at all.
+- **Saving and online.** The host alone changes the settings, and tells its
+  clients (`!FG` packets: a tag by its index, the tag tables being the
+  host's). A save keeps them in the state (`MAP_SETTINGS|1`, `MAP_NAME|`,
+  `MAP_SKY|`, `MAP_BIPED|slot|path`, `MAP_HANDS|slot|path`,
+  `MAP_ATMOSPHERE|...`), bakes their tags with the placed objects' (MCC's own
+  as `LOCAL_TAG` lines), and writes the name in the header (`FGDN` at 0x1A0).
+  Every machine reads them as the level loads, in any game of the map: the sky
+  replaces the scenario's sky references, a player spawns as the team's biped
+  (not in Firefight), the hands are drawn for the unit's team, and the fog is
+  set over the map's (under Floodfection's). Bipeds take effect at the next
+  spawn.
+- **Spawns, teleporters and objectives** of a stock map are saved in the same
+  state (`PLAYER_SPAWN|`, `NETGAME_FLAG|`, with `PLAYER_SPAWNS_SAVED` and
+  `NETGAME_FLAGS_SAVED` to say they stand in place of the map's) and put in the
+  scenario as the level loads, so they play the same solo, for a client, and
+  in a normal game of the saved map.
+
+## In Firefight
+
+A Firefight variant can play a profile. Open **PLAY > FIREFIGHT > FIREFIGHT VARIANTS**, edit a variant, open **GAME OPTIONS > SKULLS & TRAITS** and press A on **TAG PROFILE**. The variant keeps the profile's folder as a hash (`firefight_tag_profile` in its options), so renaming a profile keeps it and a variant moved to a machine without the profile shows NOT ON THIS MACHINE and plays without it.
+
+In the game:
+
+- The profile's AI join the waves alongside the stock enemies, whatever the variant's faction: about half of each wave's picks are theirs. Each is placed by its type (the tag's `type` setting, else its unit's): grunts and infection forms are fodder, elites and carriers are commanders, hunters are bosses, and the rest are infantry. They always fight the players.
+- The profile's weapons join the ordnance drops, one per player per drop. A heavy drop prefers the ones whose class is power.
+
+The host shares the profile's tags as it does a Forge game's (`_share_firefight`), so its clients download them. A game playing a profile is a modded game: only builds with the same mod version see it. Solo games do the same on this machine alone.

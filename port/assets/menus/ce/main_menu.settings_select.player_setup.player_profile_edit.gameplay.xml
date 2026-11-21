@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The port's settings screen, in the PC version's style (tools/port_settings.py) -->
+<menus>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/gameplay_settings_screen" width="640" height="480" flags="pass_unhandled_to_focused_child pause_game" bitmap="bitmaps/gradient">
+		<on event="b" back="true"/>
+		<on event="back" back="true"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/header_gameplay"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/options_menu"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/header_gameplay" controller="1" left="35" top="11" width="605" height="59" bitmap="main_menu/settings_select/player_setup/player_profile_edit/gameplay/header_gameplay">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/help" type="text" controller="1" left="68" top="350" width="482" height="60" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/help_strings" font="ui\large_ui" color="#FFFFFFFF">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/options_menu" type="column_list" width="640" height="480" flags="pass_unhandled_to_focused_child up_down_tabs_children" description="main_menu/settings_select/player_setup/player_profile_edit/gameplay/help">
+		<data input="port settings help"/>
+		<data input="port custom maps update"/>
+		<on event="created" run="port custom maps init"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_terminal_output" x="54" y="73"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_campaign_progression" x="54" y="100"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_ragdolls" x="54" y="127"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_third_person" x="54" y="154"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_randomizer" x="54" y="181"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_skulls" x="54" y="208"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_scoring" x="54" y="235"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_community" x="54" y="262"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_custom_maps_folder" x="54" y="289" platform="android"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/button_bar" y="414"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/button_bar" type="column_list" width="640" height="28" flags="pass_unhandled_to_focused_child left_right_tabs_items">
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/button_defaults" y="1"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/button_ok" x="380" y="1"/>
+		<child widget="common_button_cancel" x="510" y="1"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_terminal_output" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/terminal_output_label"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/terminal_output_spinner" x="320" y="1"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/terminal_output_label" type="text" controller="1" width="300" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="0" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/terminal_output_spinner" type="spinner" left="3" top="2" width="147" height="20" flags="pass_unhandled_to_focused_child left_right_tabs_items" strings="NONE|MENUS ONLY|ALWAYS" setting="game.terminal_output" values="none|menus|always" font="ui\large_ui" color="#FF2896FF" align="center" text_y="1" header_bitmap="bitmaps/arrow_sm_left" footer_bitmap="bitmaps/arrow_sm_right" header_bounds="7 -6 19 0" footer_bounds="7 150 19 156">
+		<on event="created" run="port setting load"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_campaign_progression" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/campaign_progression_label"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/campaign_progression_spinner" x="320" y="1"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/campaign_progression_label" type="text" controller="1" width="300" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="1" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/campaign_progression_spinner" type="spinner" left="3" top="2" width="147" height="20" flags="pass_unhandled_to_focused_child left_right_tabs_items" strings="DEFAULT|ALL UNLOCKED" setting="game.campaign_progression" values="default|all_unlocked" font="ui\large_ui" color="#FF2896FF" align="center" text_y="1" header_bitmap="bitmaps/arrow_sm_left" footer_bitmap="bitmaps/arrow_sm_right" header_bounds="7 -6 19 0" footer_bounds="7 150 19 156">
+		<on event="created" run="port setting load"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_ragdolls" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<on event="a" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/ragdolls/ragdolls_settings_screen"/>
+		<on event="start" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/ragdolls/ragdolls_settings_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/ragdolls_label"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/ragdolls_label" type="text" controller="1" width="512" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="2" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_third_person" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<on event="a" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/third_person/third_person_settings_screen"/>
+		<on event="start" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/third_person/third_person_settings_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/third_person_label"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/third_person_label" type="text" controller="1" width="512" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="3" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_randomizer" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<on event="a" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/randomizer/randomizer_settings_screen"/>
+		<on event="start" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/randomizer/randomizer_settings_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/randomizer_label"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/randomizer_label" type="text" controller="1" width="512" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="4" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_skulls" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<on event="a" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/skulls/skulls_settings_screen"/>
+		<on event="start" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/skulls/skulls_settings_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/skulls_label"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/skulls_label" type="text" controller="1" width="512" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="5" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_scoring" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<on event="a" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/scoring/scoring_settings_screen"/>
+		<on event="start" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/scoring/scoring_settings_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/scoring_label"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/scoring_label" type="text" controller="1" width="512" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="6" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_community" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF">
+		<on event="a" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/community/community_settings_screen"/>
+		<on event="start" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/community/community_settings_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/community_label"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/community_label" type="text" controller="1" width="512" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="7" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/op_custom_maps_folder" width="512" height="28" flags="pass_unhandled_to_focused_child" bitmap="bitmaps/option_bkds" color="#FF2896FF" platform="android">
+		<on event="a" run="port custom maps pick"/>
+		<on event="start" run="port custom maps pick"/>
+		<on event="b" run="port field back"/>
+		<on event="back" run="port field back"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/custom_maps_folder_label"/>
+		<child widget="main_menu/settings_select/player_setup/player_profile_edit/gameplay/custom_maps_folder_value" x="290" y="1"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/custom_maps_folder_label" type="text" controller="1" width="290" height="22" string_list="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels" string_index="8" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="4">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/custom_maps_folder_value" type="text" controller="1" width="216" height="22" font="ui\small_ui" color="#FF2896FF" align="center" text_y="5" text_flags="no_focus_test">
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/button_defaults" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" string_list="strings/common_button_captions" string_index="3" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port settings defaults"/>
+		<on event="start" run="port settings defaults"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/button_ok" type="text" width="128" height="24" bitmap="bitmaps/text_button_background" string_list="strings/common_button_captions" string_index="1" font="ui\small_ui" color="#FFFFFFFF" align="center" text_y="2">
+		<on event="a" run="port settings save" back="true"/>
+		<on event="start" run="port settings save" back="true"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+	<strings name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/labels">
+		<string text="TERMINAL OUTPUT:"/>
+		<string text="CAMPAIGN PROGRESSION:"/>
+		<string text="RAGDOLLS"/>
+		<string text="THIRD PERSON"/>
+		<string text="RANDOMIZER"/>
+		<string text="SKULLS"/>
+		<string text="SCORING"/>
+		<string text="COMMUNITY"/>
+		<string text="CUSTOM MAPS FOLDER:"/>
+	</strings>
+	<strings name="main_menu/settings_select/player_setup/player_profile_edit/gameplay/help_strings">
+		<string text=""/>
+		<string text="The game's messages at the bottom left: never,\nin the menus only, or in games too."/>
+		<string text="Default: finish a level to unlock the next.\nAll unlocked: every campaign level can be played."/>
+		<string text="How the bodies of players and the AI fall."/>
+		<string text="The view over your shoulder on foot, which\nsides and how far back."/>
+		<string text="The randomizer: a campaign level's enemies\nand weapons swapped."/>
+		<string text="The Master Chief Collection's skulls, and\nhow they are found."/>
+		<string text="The campaign's score, its time and par times,\nand medals, in multiplayer too."/>
+		<string text="Online leaderboards, the daily challenge, and\nthe community server."/>
+		<string text="Where Custom Edition maps are read from and\ndownloaded to. A chooses another folder."/>
+	</strings>
+	<widget name="main_menu/settings_select/player_setup/player_profile_edit/gameplay_profile_item" type="text" left="51" top="339" width="232" height="32" bitmap="bitmaps/list_item_bkd" text="GAMEPLAY" font="ui\large_ui" color="#FF2896FF" text_x="13" text_y="5">
+		<on event="a" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/gameplay_settings_screen"/>
+		<on event="start" open="main_menu/settings_select/player_setup/player_profile_edit/gameplay/gameplay_settings_screen"/>
+		<on event="left_mouse" run="mouse emit accept event"/>
+	</widget>
+</menus>
