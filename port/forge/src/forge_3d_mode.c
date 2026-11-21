@@ -739,6 +739,9 @@ static struct forge_hit const *forge_hit_at(short x, short y)
 	return NULL;
 }
 
+/* Halo Forge Evolved: the menus' pointer on the touchscreen (forge_touch.inl) */
+static int forge_touch_menu_pointer(int wanted, struct halo_ui_pointer *pointer);
+
 static void forge_pointer_poll(void)
 {
 	struct halo_ui_pointer pointer;
@@ -747,7 +750,7 @@ static void forge_pointer_poll(void)
 		!forge_is_main_menu_active() && !ui_widgets_active();
 
 	memset(&s_pointer_input, 0, sizeof(s_pointer_input));
-	if (!halo_forge_pointer_update(wanted, &pointer) || !wanted)
+	if ((!halo_forge_pointer_update(wanted, &pointer) && !forge_touch_menu_pointer(wanted, &pointer)) || !wanted)
 		return;
 	if (pointer.moved && (hit = forge_hit_at(pointer.x, pointer.y)) != NULL)
 	{
@@ -7954,6 +7957,8 @@ static int forge_point_in_sight(float x, float y, float z)
 }
 
 #include "forge_map_settings_menu.inl"
+/* Halo Forge Evolved: the Forge on the touchscreen */
+#include "forge_touch.inl"
 
 /* (the palette's button: pressed and let go, the palette; held, the map's
 settings. When it went down, and whether holding it did something) */
@@ -8011,6 +8016,8 @@ void forge_3d_update(float dt)
 	if (s_gp_b_held_over)
 		s_gp_btn_down[FORGE_GP_B] = 0;
 	s_prev_modal = g_forge.active_modal;
+	/* (Halo Forge Evolved: the fingers, before the menus' pointer reads them) */
+	forge_touch_update();
 	forge_pointer_poll();
 
 	if (forge_is_main_menu_active())
@@ -9501,6 +9508,8 @@ void forge_3d_update(float dt)
 				dyaw += touch_yaw + gyro_yaw;
 				dpitch += touch_pitch + gyro_pitch;
 			}
+			/* (Halo Forge Evolved: a finger dragged on nothing, forge_touch.inl) */
+			forge_touch_look(&dyaw, &dpitch);
 		}
 		if (!rot_holding && ((float)fabs((double)gp_rx) > 0.001f || (float)fabs((double)gp_ry) > 0.001f))
 		{
@@ -9781,6 +9790,10 @@ void forge_3d_update(float dt)
 			}
 		}
 
+		/* (Halo Forge Evolved: what is picked is under the finger while one is
+		on the map, not the reticle's: forge_touch.inl) */
+		forge_touch_pick(&fwd);
+
 		/* Point 4: Perform Physics Beam Raycast + Ray-Cone / Proximity World Object & Marker Scanner (strictly within 20m!) */
 		{
 			real_point3d ray_origin;
@@ -9987,6 +10000,9 @@ void forge_3d_update(float dt)
 					s_volume_pick.point[2] = point[2];
 				}
 			}
+
+			/* (Halo Forge Evolved: what the finger went down on, and what a tap chooses) */
+			forge_touch_after_hover();
 
 			/* Update hovered_object_label for HUD display (including Player Spawns, Teleporters & KOTH/Oddball/CTF/Race markers) */
 			g_forge.hovered_object_label[0] = 0;
@@ -10348,6 +10364,9 @@ void forge_3d_update(float dt)
 			if (GetAsyncKeyState(VK_NEXT) & 0x8000)  g_forge.grab_distance -= 8.0f * dt;
 			if (g_forge.grab_distance < 1.0f) g_forge.grab_distance = 1.0f;
 			if (g_forge.grab_distance > 30.0f) g_forge.grab_distance = 30.0f;
+
+			/* (Halo Forge Evolved: carried by a finger, as far as the surface under it) */
+			forge_touch_hold_distance(&fwd);
 
 			/* Keep the placement cursor and held object locked to the camera crosshair ray
 			 * (and clamped against any closer BSP/surface hit along the beam) */
@@ -11804,6 +11823,9 @@ void forge_3d_draw_hud(
 		}
 	}
 
+	/* (Halo Forge Evolved: the touchscreen's buttons, over everything) */
+	set_forge_hud_ui_scale(1.0f, 0.0f, 0.0f);
+	forge_touch_draw(window_x0, window_y0, window_x1, window_y1, font_index);
 	set_forge_hud_ui_scale(1.0f, 0.0f, 0.0f);
 }
 

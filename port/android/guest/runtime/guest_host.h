@@ -220,6 +220,11 @@ int host_touch_devices(void);
 them, each five ints (x0, y0, x1, y1 in ten-thousandths of the screen, and
 the game's controller button it holds down) */
 void host_touch_targets(const int *targets, int count);
+/* Halo Forge Evolved: the Forge's fingers on the overlay (host_touch.c,
+port/forge/src/forge_touch.inl) since the last read, at most maximum, four
+ints each (what: 0 down, 1 moved, 2 up, 3 cancelled; the finger; x and y in
+ten-thousandths of the screen); returns how many */
+int host_touch_forge_read(int *events, int maximum);
 
 /* ---------- the server browser's master servers (host_https.c) */
 

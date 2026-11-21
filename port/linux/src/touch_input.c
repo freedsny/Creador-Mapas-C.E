@@ -301,7 +301,19 @@ enum
 	and an overlay whose option says so (TouchControls.java's "Show during
 	cutscenes") shows them anyway. The web's overlay hides as before */
 	_touch_scene_cinematic = 1 << 5,
+	/* Halo Forge Evolved: the Forge's Monitor flies (port/forge/src/
+	forge_touch.inl): the overlay shows only its stick, and a finger on no
+	control is the Forge's (host_touch_forge_read), never the view swipe */
+	_touch_scene_forge = 1 << 6,
+	/* ... with one of the Forge's own menus open over it (its palette, an
+	object's settings): the overlay shows nothing and every finger is the
+	Forge's, which taps its rows */
+	_touch_scene_forge_menu = 1 << 7,
 };
+
+/* the Forge's scene, _touch_scene_forge and _touch_scene_forge_menu's bits
+as forge_touch.inl names them (FORGE_TOUCH_SCENE_*), 0 outside it */
+int forge_touch_scene(void);
 
 /* the bit of the menu fingers on the touch controls in their buttons
 (TouchControls.java's MENU_BIT) */
@@ -395,7 +407,8 @@ void touch_input_controls(XINPUT_GAMEPAD *pad, int menus)
 		host_touch_scene(_touch_scene_known | touch_controls_setting() |
 			(hidden || cinematic ? _touch_scene_menus : 0) |
 			(cinematic && !hidden ? _touch_scene_cinematic : 0) |
-			(touch_game_replay_playing() ? _touch_scene_replay : 0));
+			(touch_game_replay_playing() ? _touch_scene_replay : 0) |
+			(!hidden && !cinematic ? forge_touch_scene() & (_touch_scene_forge | _touch_scene_forge_menu) : 0));
 	}
 	/* (the profile's mapping, for the buttons' names; only when it changes) */
 	touch_game_button_controls(bindings);

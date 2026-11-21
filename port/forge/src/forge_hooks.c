@@ -3635,6 +3635,9 @@ int forge_menu_open(void)
 		!forge_is_main_menu_active();
 }
 
+/* Halo Forge Evolved: a key the touchscreen's buttons press (forge_touch.inl) */
+int forge_touch_key_down(int vk);
+
 short forge_key_state(int vk)
 {
 	if (!forge_window_is_focused() || forge_chat_typing())
@@ -3644,6 +3647,9 @@ short forge_key_state(int vk)
 #else
 	{
 		int other, scancode;
+
+		if (forge_touch_key_down(vk))
+			return (short)0x8000;
 
 		/* (VK_LBUTTON, VK_RBUTTON, VK_MBUTTON: SDL's buttons 1, 3, 2) */
 		if (vk == 0x01 || vk == 0x02 || vk == 0x04)

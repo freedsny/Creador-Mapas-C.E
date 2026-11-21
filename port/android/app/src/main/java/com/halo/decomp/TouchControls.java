@@ -53,6 +53,8 @@ import java.util.Locale;
 public final class TouchControls extends View implements SensorEventListener, InputManager.InputDeviceListener {
     /** what a finger holds besides a control: the view swipe */
     private static final int LOOK = -5;
+    /** Halo Forge Evolved: a finger the Forge reads (nativeForge), in the Forge's scenes */
+    private static final int FORGE = -9;
     private static final int NOTHING = Integer.MIN_VALUE;
     /**
      * the toolbar's items: Hide at the top, Options at the top right until
@@ -128,6 +130,21 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static final int SCENE_REPLAY = 16;
     /** beside SCENE_MENUS: a cinematic is all that hides the controls, which the layout's cinematics shows anyway */
     private static final int SCENE_CINEMATIC = 32;
+    /**
+     * Halo Forge Evolved: the Forge's Monitor flies (port/forge/src/forge_touch.inl): only
+     * the stick shows, and a finger on no control is the Forge's (nativeForge), which picks,
+     * drags and turns what is on the map, looks around and presses its own buttons
+     */
+    private static final int SCENE_FORGE = 64;
+    /** ... with one of the Forge's menus open: nothing shows and every finger is the Forge's */
+    private static final int SCENE_FORGE_MENU = 128;
+    /** nativeForge's actions (port/android/host/host_touch.c's HOST_TOUCH_FORGE_*) */
+    private static final int FORGE_DOWN = 0;
+    private static final int FORGE_MOVE = 1;
+    private static final int FORGE_UP = 2;
+    private static final int FORGE_CANCEL = 3;
+    /** KINDS' Start */
+    private static final int FORGE_START_KIND = 10;
 
     /**
      * a replay's buttons, which the game draws and says where they are
@@ -223,6 +240,7 @@ public final class TouchControls extends View implements SensorEventListener, In
     private static native void nativeMenuFingers(int fingers);
     private static native void nativeDevices(boolean touchscreen, boolean controller);
     private static native int nativeTargets(int[] targets);
+    private static native void nativeForge(int action, int id, float x, float y);
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     /**
@@ -324,13 +342,19 @@ public final class TouchControls extends View implements SensorEventListener, In
         public void run() {
             if (!deviceInputActive)
                 return;
+            boolean wasForge = forge();
             scene = nativeScene();
+            // (Halo Forge Evolved: in and out of the Forge, the fingers held let go, and the overlay
+            // draws again for its stick alone, or the game's buttons)
+            if (forge() != wasForge)
+                reset();
             int mode = nativeGyroMode();
             if (mode != gyroMode) {
                 gyroMode = mode;
                 updateSensors();
             }
             updateShowing();
+            invalidateIfChanged();
             readBindings();
             readTargets();
             updateRumble();
@@ -494,6 +518,28 @@ public final class TouchControls extends View implements SensorEventListener, In
         return (scene & SCENE_ON) != 0 || !controllerConnected;
     }
 
+    /** Halo Forge Evolved: whether the Forge reads the fingers (its Monitor flies) */
+    private boolean forge() {
+        return (scene & SCENE_FORGE) != 0 && (scene & SCENE_MENUS) == 0 && !editing;
+    }
+
+    /** ... with one of its menus open, where every finger is the Forge's */
+    private boolean forgeMenu() {
+        return forge() && (scene & SCENE_FORGE_MENU) != 0;
+    }
+
+    /** the Forge keeps the stick and Start (the pause menu: SAVE MAP, the map's settings, leaving) */
+    private static boolean forgeKeeps(int type) {
+        return type == TouchLayout.LEFT || type == FORGE_START_KIND;
+    }
+
+    /** a finger handed to the Forge, at a point in pixels */
+    private void forgeFinger(int action, int id, float px, float py) {
+        float width = Math.max(1, getWidth());
+        float height = Math.max(1, getHeight());
+        nativeForge(action, id, px / width, py / height);
+    }
+
     /** shows the controls once shown() has held for SHOW_DELAY_MS; hides them at once */
     private void updateShowing() {
         boolean show = false;
@@ -568,6 +614,8 @@ public final class TouchControls extends View implements SensorEventListener, In
 
     /** lets go of every finger and sends a released controller */
     public void reset() {
+        if (owners.indexOfValue(FORGE) >= 0)
+            nativeForge(FORGE_CANCEL, -1, 0, 0);
         dragPointer = -1;
         dragControl = -1;
         owners.clear();
@@ -773,6 +821,13 @@ public final class TouchControls extends View implements SensorEventListener, In
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         int action = event.getActionMasked();
+        // (the Forge's fingers, with the controls shown or not: forgeTouch)
+        if (forge() && openDialogs == 0) {
+            forgeTouch(event);
+            publish();
+            invalidateIfChanged();
+            return true;
+        }
         if (!showing && !editing && openDialogs == 0) {
             // the menus and cinematics take the fingers (SDL's surface below)
             if (action == MotionEvent.ACTION_DOWN)
@@ -794,6 +849,52 @@ public final class TouchControls extends View implements SensorEventListener, In
     public boolean performClick() {
         super.performClick();
         return true;
+    }
+
+    /**
+     * a finger in the Forge: with the controls shown (and the Forge's menus
+     * closed) the stick and the toolbar are as in a game, and every other
+     * finger is the Forge's; otherwise every finger is
+     */
+    private void forgeTouch(MotionEvent event) {
+        if (showing && !forgeMenu()) {
+            gameTouch(event);
+            return;
+        }
+        int index = event.getActionIndex();
+        int id = event.getPointerId(index);
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                if (owners.size() > 0 && event.getActionMasked() == MotionEvent.ACTION_DOWN)
+                    reset();
+                owners.put(id, FORGE);
+                forgeFinger(FORGE_DOWN, id, event.getX(index), event.getY(index));
+                break;
+            case MotionEvent.ACTION_MOVE:
+                for (int i = 0; i < event.getPointerCount(); i++) {
+                    int pointer = event.getPointerId(i);
+                    if (owners.get(pointer, NOTHING) == FORGE)
+                        forgeFinger(FORGE_MOVE, pointer, event.getX(i), event.getY(i));
+                    else
+                        fingerMoved(pointer, event.getX(i), event.getY(i));
+                }
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
+                if (owners.get(id, NOTHING) == FORGE) {
+                    owners.delete(id);
+                    forgeFinger(FORGE_UP, id, event.getX(index), event.getY(index));
+                } else {
+                    fingerUp(id, event.getX(index), event.getY(index));
+                }
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                reset();
+                break;
+            default:
+                break;
+        }
     }
 
     private void gameTouch(MotionEvent event) {
@@ -846,6 +947,15 @@ public final class TouchControls extends View implements SensorEventListener, In
         float y = logical(py);
         int target = hit(x, y);
         int stick = TouchLayout.LEFT;
+        // (the Forge: only the stick and the toolbar are the overlay's; the rest is the Forge's)
+        if (forge() && target != NOTHING && target >= 0 && target < layout.size() && !forgeKeeps(layout.type(target)))
+            target = NOTHING;
+        if (forge() && target == NOTHING && !(layout.floatingStick && !hidden && layout.shown(stick) && !held(stick)
+                && inFloatingZone(x, y) && !inGestureZone(px, py))) {
+            owners.put(id, FORGE);
+            forgeFinger(FORGE_DOWN, id, px, py);
+            return;
+        }
         if (target == NOTHING && splitScreen()) {
             // split screen: the left half moves, the right half aims and fires
             if (hidden || inGestureZone(px, py))
@@ -918,6 +1028,10 @@ public final class TouchControls extends View implements SensorEventListener, In
     }
 
     private void fingerMoved(int id, float px, float py) {
+        if (owners.get(id, NOTHING) == FORGE) {
+            forgeFinger(FORGE_MOVE, id, px, py);
+            return;
+        }
         float[] tap = tapTouches.get(id);
         if (tap != null && movedPastSlop(tap, px, py))
             tapTouches.remove(id);
@@ -951,6 +1065,11 @@ public final class TouchControls extends View implements SensorEventListener, In
     }
 
     private void fingerUp(int id, float px, float py) {
+        if (owners.get(id, NOTHING) == FORGE) {
+            owners.delete(id);
+            forgeFinger(FORGE_UP, id, px, py);
+            return;
+        }
         float[] toolbar = toolbarFingers.get(id);
         if (toolbar != null) {
             toolbarFingers.remove(id);
@@ -1702,7 +1821,9 @@ public final class TouchControls extends View implements SensorEventListener, In
         sign(editing ? 1L : 2L);
         sign(hidden ? 1L : 2L);
         sign(scale);
-        if (!showing && !editing)
+        sign(forge() ? 1L : 2L);
+        sign(forgeMenu() ? 1L : 2L);
+        if ((!showing && !editing) || forgeMenu())
             return;
         if (canvas != null) {
             canvas.save();
@@ -1719,7 +1840,7 @@ public final class TouchControls extends View implements SensorEventListener, In
                         held(REPLAY_CONTROL + i), 13, layout.opacity);
             }
             for (int i = 0; i < layout.size() && !(replay() && !editing); i++) {
-                if (!layout.shown(i) || layout.type(i) == TouchLayout.LEFT)
+                if (!layout.shown(i) || layout.type(i) == TouchLayout.LEFT || (forge() && !forgeKeeps(layout.type(i))))
                     continue;
                 float textSize = 11 * Math.max(layout.sizeScale(i), layout.radius(i) / 36f);
                 circle(canvas, layout.x(i), layout.y(i), layout.radius(i), label(layout.type(i)),

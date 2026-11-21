@@ -326,3 +326,72 @@ JNIEXPORT jint JNICALL Java_com_halo_decomp_TouchControls_nativeScene(JNIEnv *en
 	(void)cls;
 	return touch_scene;
 }
+
+/* ---------- Halo Forge Evolved: the Forge's fingers
+
+In the Forge (port/forge/src/forge_touch.inl) a finger on no control of the
+overlay is the Forge's: TouchControls.java hands it over as it goes down,
+moves and goes up, and the Forge reads them once a frame
+(host_touch_forge_read), in order, to pick, drag and turn what is on the
+map, look around and press its own buttons. Each event is four ints: what
+happened (HOST_TOUCH_FORGE_*), the finger's id, and where, x and y in
+ten-thousandths of the screen. A queue the Forge does not read for a while
+(the menus, the app in the background) keeps only its latest events. */
+#define HOST_TOUCH_FORGE_DOWN 0
+#define HOST_TOUCH_FORGE_MOVE 1
+#define HOST_TOUCH_FORGE_UP 2
+#define HOST_TOUCH_FORGE_CANCEL 3
+#define HOST_TOUCH_FORGE_FIELDS 4
+#define HOST_TOUCH_FORGE_QUEUE 128
+
+static int32_t forge_events[HOST_TOUCH_FORGE_QUEUE * HOST_TOUCH_FORGE_FIELDS];
+static int forge_event_count;
+
+JNIEXPORT void JNICALL Java_com_halo_decomp_TouchControls_nativeForge(
+	JNIEnv *env, jclass cls, jint action, jint id, jfloat x, jfloat y)
+{
+	int32_t *event;
+
+	(void)env;
+	(void)cls;
+	if (action < HOST_TOUCH_FORGE_DOWN || action > HOST_TOUCH_FORGE_CANCEL)
+		return;
+	if (x < 0.0f) x = 0.0f;
+	if (x > 1.0f) x = 1.0f;
+	if (y < 0.0f) y = 0.0f;
+	if (y > 1.0f) y = 1.0f;
+	pthread_mutex_lock(&touch_lock);
+	if (forge_event_count == HOST_TOUCH_FORGE_QUEUE)
+	{
+		/* (full: the oldest goes; a move is the one that matters least) */
+		memmove(forge_events, forge_events + HOST_TOUCH_FORGE_FIELDS,
+			sizeof(forge_events) - HOST_TOUCH_FORGE_FIELDS * sizeof(*forge_events));
+		forge_event_count--;
+	}
+	event = forge_events + forge_event_count * HOST_TOUCH_FORGE_FIELDS;
+	event[0] = action;
+	event[1] = id;
+	event[2] = (int32_t)(x * 10000.0f + 0.5f);
+	event[3] = (int32_t)(y * 10000.0f + 0.5f);
+	forge_event_count++;
+	pthread_mutex_unlock(&touch_lock);
+}
+
+/* the guest's: the Forge's finger events since the last read, at most
+maximum of them, into events (HOST_TOUCH_FORGE_FIELDS each); returns how
+many */
+int host_touch_forge_read(int32_t *events, int maximum)
+{
+	int count;
+
+	if (!events || maximum <= 0)
+		return 0;
+	pthread_mutex_lock(&touch_lock);
+	count = forge_event_count < maximum ? forge_event_count : maximum;
+	memcpy(events, forge_events, (size_t)count * HOST_TOUCH_FORGE_FIELDS * sizeof(*events));
+	memmove(forge_events, forge_events + count * HOST_TOUCH_FORGE_FIELDS,
+		(size_t)(forge_event_count - count) * HOST_TOUCH_FORGE_FIELDS * sizeof(*forge_events));
+	forge_event_count -= count;
+	pthread_mutex_unlock(&touch_lock);
+	return count;
+}
