@@ -335,7 +335,9 @@ int forge_touch_scene(void)
 {
 	if (!forge_touch_monitor())
 		return 0;
-	return FORGE_TOUCH_SCENE_FORGE | (g_forge.active_modal != _forge_modal_none ? FORGE_TOUCH_SCENE_MENU : 0);
+	/* (the inventory too: the overlay's stick would cover its tabs) */
+	return FORGE_TOUCH_SCENE_FORGE |
+		(g_forge.active_modal != _forge_modal_none || s_touch.inv_open ? FORGE_TOUCH_SCENE_MENU : 0);
 }
 
 /* a point of the screen (shares) in the Forge's screen units, as it draws.
@@ -690,6 +692,20 @@ static struct
 	{ "spawn point", "punto de aparicion" },
 	{ "player spawn", "aparicion de jugador" },
 	{ "oddball", "calavera" },
+	{ "no glass", "sin vidrio" },
+	{ "cryo chamber", "camara criogenica" },
+	{ "shuttle bay", "hangar de naves" },
+	{ "blast door", "puerta blindada" },
+	{ "small door", "puerta pequena" },
+	{ "door small", "puerta pequena" },
+	{ "large door", "puerta grande" },
+	{ "door large", "puerta grande" },
+	{ "big door", "puerta grande" },
+	{ "door big", "puerta grande" },
+	{ "jeff tube", "tubo jeff" },
+	{ "power up", "potenciador" },
+	{ "powerup", "potenciador" },
+	{ "control room", "sala de control" },
 	/* (words) */
 	{ "pistol", "pistola" }, { "shotgun", "escopeta" }, { "rifle", "rifle" }, { "needler", "lanza agujas" },
 	{ "flamethrower", "lanzallamas" }, { "grenade", "granada" }, { "launcher", "lanzador" }, { "sword", "espada" },
@@ -725,7 +741,11 @@ static struct
 	{ "single", "sencillo" }, { "center", "centro" }, { "left", "izquierda" }, { "right", "derecha" },
 	{ "top", "arriba" }, { "bottom", "abajo" }, { "end", "final" }, { "piece", "pieza" }, { "section", "seccion" },
 	{ "support", "soporte" }, { "beam", "viga" }, { "post", "poste" }, { "sign", "letrero" }, { "skull", "calavera" },
-	{ "ball", "bola" }, { "hog", "warthog" }, { "tank", "tanque" }, { "vehicle", "vehiculo" }, { "weapon", "arma" },
+	{ "ball", "bola" }, { "glass", "vidrio" }, { "doors", "puertas" }, { "closed", "cerrada" }, { "open", "abierta" },
+	{ "airlock", "esclusa" }, { "blast", "blindada" }, { "tube", "tubo" }, { "prison", "prision" },
+	{ "mustering", "de reunion" }, { "bay", "bahia" }, { "chamber", "camara" }, { "hatch", "escotilla" },
+	{ "metal", "metal" }, { "wood", "madera" }, { "wooden", "de madera" }, { "steel", "acero" },
+	{ "hog", "warthog" }, { "tank", "tanque" }, { "vehicle", "vehiculo" }, { "weapon", "arma" },
 	{ "equipment", "equipo" }, { "scenery", "escenario" }, { "decoration", "decoracion" }, { "prop", "objeto" },
 };
 
@@ -2152,6 +2172,49 @@ static short forge_touch_row(
 	return x;
 }
 
+/* a name in a square: on one line if it fits, else in two (cut between
+words), the second with dots if it is still too long */
+static void forge_touch_two_lines(long font, short x0, short y0, short x1, short y1, char const *text, uint32_t color)
+{
+	char first[64], second[64];
+	short width = (short)(x1 - x0 - 8);
+	short middle = (short)(y0 + (y1 - y0) / 2);
+	size_t length = strlen(text), cut, best = 0;
+
+	snprintf(first, sizeof(first), "%s", text);
+	if (measure_ce_menu_str_pixels(0, font, first) <= width)
+	{
+		draw_ce_menu_str_box(0, font, x0, (short)(middle - 7), x1, y1, 2, first, color);
+		return;
+	}
+	/* (the most words that fit on the first line) */
+	for (cut = 1; cut < length && cut < sizeof(first); cut++)
+	{
+		if (text[cut] != ' ')
+			continue;
+		snprintf(first, sizeof(first), "%.*s", (int)cut, text);
+		if (measure_ce_menu_str_pixels(0, font, first) > width)
+			break;
+		best = cut;
+	}
+	if (best == 0)
+	{
+		/* (one long word: cut it) */
+		snprintf(first, sizeof(first), "%s", text);
+		forge_text_fit(0, font, first, width);
+		second[0] = 0;
+	}
+	else
+	{
+		snprintf(first, sizeof(first), "%.*s", (int)best, text);
+		snprintf(second, sizeof(second), "%s", text + best + 1);
+		forge_text_fit(0, font, second, width);
+	}
+	draw_ce_menu_str_box(0, font, x0, (short)(middle - 16), x1, y1, 2, first, color);
+	if (second[0])
+		draw_ce_menu_str_box(0, font, x0, (short)(middle + 2), x1, y1, 2, second, color);
+}
+
 /* the box of the square tapped: the object itself turning (drawn by
 forge_runtime_tags.c's palette preview, through this box, which is left clear),
 its name in Spanish and its own, where it comes from, and TOMAR */
@@ -2198,10 +2261,12 @@ static void forge_touch_inventory_detail(
 	}
 	draw_box_border(x0, y0, x1, view_y1, 1, 0xFF1E5A8Cu);
 	/* (the names: Spanish big, its own small) */
-	forge_touch_spanish(forge_touch_entry_name(entry), text, 40, &changed);
+	forge_touch_spanish(forge_touch_entry_name(entry), text, 64, &changed);
+	forge_text_fit(0, font, text, (short)(x1 - x0 - 12));
 	draw_ce_menu_str_box(0, font, (short)(x0 + 6), (short)(view_y1 + gap), (short)(x1 - 6), (short)(view_y1 + gap + line), 2, text,
 		0xFFFFFFFFu);
-	forge_touch_label(text, 48, forge_touch_entry_name(entry));
+	forge_touch_label(text, 64, forge_touch_entry_name(entry));
+	forge_text_fit(0, font, text, (short)(x1 - x0 - 12));
 	draw_ce_menu_str_box(0, font, (short)(x0 + 6), (short)(view_y1 + gap + line), (short)(x1 - 6),
 		(short)(view_y1 + gap + line * 2), 2, text, 0xFF9FD8FFu);
 	for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
@@ -2241,18 +2306,27 @@ static void forge_touch_inventory_draw(
 	short gy1 = py1;
 	short cell_w, cell_h;
 	int first, i, tab, rows;
-	char label[32];
+	char label[64];
 	rectangle2d r;
 
 	forge_touch_inventory_counts();
 	forge_touch_inventory_list();
 	forge_touch_inventory_scroll_to(s_touch.inv_scroll);
+	/* (dark everywhere but the box where the model turns, which stays clear:
+	the model is drawn with the level, before this) */
 	r.x0 = px0;
 	r.y0 = py0;
-	r.x1 = px1;
+	r.x1 = (short)(dx0 - gap);
 	r.y1 = py1;
 	draw_quad(&r, 0xE6040C1Cu);
-	draw_box_border(r.x0, r.y0, r.x1, r.y1, 1, 0xFF2896FFu);
+	r.x0 = (short)(dx0 - gap);
+	r.y1 = gy0;
+	r.x1 = px1;
+	draw_quad(&r, 0xE6040C1Cu);
+	r.y0 = (short)(gy0 + (gy1 - gy0) * 0.5f);
+	r.y1 = py1;
+	draw_quad(&r, 0xE6040C1Cu);
+	draw_box_border(px0, py0, px1, py1, 1, 0xFF2896FFu);
 	/* (the top: its name, how many, and its two buttons) */
 	snprintf(label, sizeof(label), "INVENTARIO  %d", s_touch.inv_count);
 	draw_ce_menu_str_box(0, font, (short)(px0 + 10), (short)(py0 + bh / 2 - 7), (short)(px0 + w * 0.4f), top1, 0, label,
@@ -2303,9 +2377,11 @@ static void forge_touch_inventory_draw(
 		short x = (short)(gx0 + (i % FORGE_TOUCH_INVENTORY_COLUMNS) * (cell_w + gap));
 		short y = (short)(gy0 + (i / FORGE_TOUCH_INVENTORY_COLUMNS) * (cell_h + gap));
 
-		forge_touch_spanish(forge_touch_entry_name(entry), label, 20, NULL);
-		forge_touch_button_draw(font, x, y, (short)(x + cell_w), (short)(y + cell_h), label, _forge_touch_button_cell + first + i,
-			first + i == s_touch.inv_selected, entry->origin == _forge_origin_map ? 0xFFFFE680u : 0xFFFFFFFFu);
+		forge_touch_spanish(forge_touch_entry_name(entry), label, sizeof(label), NULL);
+		forge_touch_button_draw(font, x, y, (short)(x + cell_w), (short)(y + cell_h), "", _forge_touch_button_cell + first + i,
+			first + i == s_touch.inv_selected, 0xFFFFFFFFu);
+		forge_touch_two_lines(font, x, y, (short)(x + cell_w), (short)(y + cell_h), label,
+			entry->origin == _forge_origin_map ? 0xFFFFE680u : 0xFFFFFFFFu);
 	}
 	/* (where in the list: a bar at the right when there are more rows) */
 	rows = forge_touch_inventory_rows();
