@@ -89,8 +89,10 @@ Minecraft's breaks a block) */
 #define FORGE_TOUCH_MENU_GROWTH 1.47f
 
 /* the inventory (+ OBJETOS): its columns and rows of objects, and the most it lists of a tab */
-#define FORGE_TOUCH_INVENTORY_COLUMNS 3
-#define FORGE_TOUCH_INVENTORY_ROWS 5
+#define FORGE_TOUCH_INVENTORY_COLUMNS 4
+#define FORGE_TOUCH_INVENTORY_ROWS 4
+/* its tabs: in two rows at the top, this many in each */
+#define FORGE_TOUCH_TABS_PER_ROW 8
 #define FORGE_TOUCH_INVENTORY_MAX 512
 
 enum
@@ -572,13 +574,18 @@ hand */
 
 static void forge_touch_hotbar_note(struct forge_catalog_entry const *entry);
 
+/* (the catalog row the Forge's palette is to make this frame, from the
+inventory: see the palette's Enter in forge_3d_update) */
+static int s_forge_touch_palette_spawn = -1;
+
 /* (forge_runtime_tags.c: the model the inventory's box shows, and where) */
 extern int g_forge_touch_preview_catalog;
 extern float g_forge_touch_preview_right;
 extern float g_forge_touch_preview_up;
 
-/* its tabs, in order: the categories a tap can put (the rest, as the AI and
-the volumes, stay in the Forge's full list) */
+/* its tabs, in order: all the Forge's categories (what a tap cannot put
+down as it is, as the AI or a volume, the Forge's own palette puts: see
+forge_touch_inventory_choose) */
 static struct
 {
 	int category;
@@ -594,6 +601,11 @@ static struct
 	{ _forge_cat_teleporters, "TELEPORTES" },
 	{ _forge_cat_lights, "LUCES" },
 	{ _forge_cat_effects, "EFECTOS" },
+	{ _forge_cat_decals, "CALCOMANIAS" },
+	{ _forge_cat_ai_squads, "ENEMIGOS" },
+	{ _forge_cat_firefight, "OLEADAS" },
+	{ _forge_cat_bipeds, "PERSONAJES" },
+	{ _forge_cat_volumes, "VOLUMENES" },
 };
 #define FORGE_TOUCH_TAB_COUNT ((int)(sizeof(s_forge_touch_tabs) / sizeof(s_forge_touch_tabs[0])))
 
@@ -621,6 +633,27 @@ static int forge_touch_entry_placeable(struct forge_catalog_entry const *entry)
 		return 0;
 	if (forge_palette_is_ff_preset(entry))
 		return 0;
+	for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
+	{
+		if (s_forge_touch_tabs[tab].category == entry->category)
+			return forge_catalog_entry_allowed(entry);
+	}
+	return 0;
+}
+
+/* whether a catalog row is an object of the inventory: any but a folder or
+a menu of others (their objects are listed themselves) */
+static int forge_touch_entry_listed(struct forge_catalog_entry const *entry)
+{
+	int tab;
+
+	if (!entry || !entry->tag_path[0])
+		return 0;
+	if (entry->group_tag == FORGE_GROUP_FOLDER || entry->group_tag == FORGE_GROUP_FF_MENU ||
+		entry->group_tag == FORGE_GROUP_AI_MENU)
+	{
+		return 0;
+	}
 	for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
 	{
 		if (s_forge_touch_tabs[tab].category == entry->category)
@@ -832,7 +865,7 @@ static void forge_touch_inventory_counts(void)
 	{
 		struct forge_catalog_entry const *entry = &g_forge.catalog[i];
 
-		if (entry->category < NUMBER_OF_FORGE_PALETTE_CATEGORIES && forge_touch_entry_placeable(entry))
+		if (entry->category < NUMBER_OF_FORGE_PALETTE_CATEGORIES && forge_touch_entry_listed(entry))
 			s_touch.inv_tab_count[entry->category]++;
 	}
 	s_touch.inv_counts_catalog = g_forge.catalog_count;
@@ -851,7 +884,7 @@ static void forge_touch_inventory_list(void)
 		struct forge_catalog_entry const *entry = &g_forge.catalog[i];
 		int j, twice = 0;
 
-		if (entry->category != s_touch.inv_tab || !forge_touch_entry_placeable(entry))
+		if (entry->category != s_touch.inv_tab || !forge_touch_entry_listed(entry))
 			continue;
 		for (j = 0; j < s_touch.inv_count; j++)
 		{
@@ -936,8 +969,19 @@ static void forge_touch_inventory_choose(int place)
 	if (place < 0 || place >= s_touch.inv_count)
 		return;
 	entry = &g_forge.catalog[s_touch.inv_list[place]];
-	if (!forge_touch_entry_placeable(entry))
+	if (!forge_touch_entry_listed(entry))
 		return;
+	if (!forge_touch_entry_placeable(entry))
+	{
+		/* (an AI, a volume, a KOTH hill, a firefight's kind: the Forge's own
+		palette makes it, as if chosen there, held in front to be put down) */
+		s_forge_touch_palette_spawn = s_touch.inv_list[place];
+		g_forge.active_modal = _forge_modal_spawn_palette;
+		g_forge.current_category = (enum forge_palette_category)entry->category;
+		s_touch.inv_open = 0;
+		s_touch.inv_selected = -1;
+		return;
+	}
 	forge_touch_hotbar_note(entry);
 	s_touch.inv_open = 0;
 	s_touch.inv_selected = -1;
@@ -2282,7 +2326,7 @@ static void forge_touch_inventory_detail(
 }
 
 /* the inventory: its tabs at the left, its objects in big squares (the map's
-own, new ones in yellow), CERRAR and LISTA COMPLETA at the top */
+own, new ones in yellow), its tabs and CERRAR at the top */
 static void forge_touch_inventory_draw(
 	long font,
 	short window_x0, short window_y0, short window_x1, short window_y1,
@@ -2297,12 +2341,13 @@ static void forge_touch_inventory_draw(
 	short py0 = (short)(window_y0 + h * 0.02f);
 	short py1 = (short)(window_y0 + h * 0.80f);
 	short top1 = (short)(py0 + bh);
-	short tabs_x1 = (short)(px0 + w * 0.18f);
-	short gx0 = (short)(tabs_x1 + gap * 2);
+	short tab_h = (short)(bh * 0.8f);
+	short tab_w = (short)((px1 - px0 - gap * (FORGE_TOUCH_TABS_PER_ROW + 1)) / FORGE_TOUCH_TABS_PER_ROW);
+	short gx0 = (short)(px0 + gap);
 	/* (the box of the square tapped, at the right) */
 	short dx0 = (short)(window_x0 + w * 0.67f);
 	short dx1 = (short)(px1 - gap);
-	short gy0 = (short)(top1 + gap * 2);
+	short gy0 = (short)(top1 + gap * 3 + tab_h * 2);
 	short gy1 = py1;
 	short cell_w, cell_h;
 	int first, i, tab, rows;
@@ -2327,30 +2372,30 @@ static void forge_touch_inventory_draw(
 	r.y1 = py1;
 	draw_quad(&r, 0xE6040C1Cu);
 	draw_box_border(px0, py0, px1, py1, 1, 0xFF2896FFu);
-	/* (the top: its name, how many, and its two buttons) */
+	/* (the top: its name, how many, and CERRAR) */
 	snprintf(label, sizeof(label), "INVENTARIO  %d", s_touch.inv_count);
 	draw_ce_menu_str_box(0, font, (short)(px0 + 10), (short)(py0 + bh / 2 - 7), (short)(px0 + w * 0.4f), top1, 0, label,
 		0xFFFFFFFFu);
 	forge_touch_button_draw(font, (short)(px1 - w * 0.13f - gap), py0, (short)(px1 - gap), top1, "CERRAR",
 		_forge_touch_button_inventory_close, 0, 0xFFFFFFFFu);
-	forge_touch_button_draw(font, (short)(px1 - w * 0.36f - gap * 2), py0, (short)(px1 - w * 0.13f - gap * 2), top1,
-		"LISTA COMPLETA", _forge_touch_button_inventory_full, 0, 0xFF9FD8FFu);
-	/* (the tabs: those with something) */
+	/* (the tabs, those with something: two rows) */
 	{
-		short y = gy0;
-		short tab_h = (short)((gy1 - gy0) / FORGE_TOUCH_TAB_COUNT - gap);
+		int shown = 0;
 
-		if (tab_h > bh)
-			tab_h = bh;
 		for (tab = 0; tab < FORGE_TOUCH_TAB_COUNT; tab++)
 		{
 			int category = s_forge_touch_tabs[tab].category;
+			short x, y;
 
 			if (!s_touch.inv_tab_count[category])
 				continue;
-			forge_touch_button_draw(font, (short)(px0 + gap), y, tabs_x1, (short)(y + tab_h), s_forge_touch_tabs[tab].name,
+			x = (short)(px0 + gap + (shown % FORGE_TOUCH_TABS_PER_ROW) * (tab_w + gap));
+			y = (short)(top1 + gap + (shown / FORGE_TOUCH_TABS_PER_ROW) * (tab_h + gap));
+			snprintf(label, sizeof(label), "%s", s_forge_touch_tabs[tab].name);
+			forge_text_fit(0, font, label, (short)(tab_w - 6));
+			forge_touch_button_draw(font, x, y, (short)(x + tab_w), (short)(y + tab_h), label,
 				_forge_touch_button_tab + category, category == s_touch.inv_tab, 0xFFFFFFFFu);
-			y = (short)(y + tab_h + gap);
+			shown++;
 		}
 	}
 	/* (the squares) */
@@ -2662,7 +2707,7 @@ static void forge_touch_draw(short window_x0, short window_y0, short window_x1, 
 			"Con un objeto agarrado, gira dos dedos: lo giras",
 			"Toca donde quieras con un objeto agarrado: lo pones ahi",
 			"Palanca: volar.  SUBIR / BAJAR: altura.  START: menu y guardar el mapa",
-			"LISTA COMPLETA (en el inventario): IA, volumenes y lo demas de la Forja",
+			"Enemigos, volumenes, colinas y oleadas: TOMAR los pone delante; toca para soltarlos",
 		};
 		short x0 = (short)(window_x0 + w * 0.18f);
 		short x1 = (short)(window_x1 - w * 0.18f);

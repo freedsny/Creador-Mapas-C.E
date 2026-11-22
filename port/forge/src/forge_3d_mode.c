@@ -8777,9 +8777,14 @@ void forge_3d_update(float dt)
 			if (g_forge.palette_cursor >= g_forge.palette_scroll + visible_rows)
 				g_forge.palette_scroll = g_forge.palette_cursor - (visible_rows - 1);
 		}
-		if (cur_enter && !prev_enter && fcount > 0 && g_forge.palette_cursor < fcount)
+		if ((cur_enter && !prev_enter && fcount > 0 && g_forge.palette_cursor < fcount) ||
+			(s_forge_touch_palette_spawn >= 0 && s_forge_touch_palette_spawn < g_forge.catalog_count))
 		{
-			struct forge_catalog_entry const *ce = &g_forge.catalog[filtered[g_forge.palette_cursor]];
+			/* (Halo Forge Evolved: the row chosen in the touchscreen's inventory) */
+			struct forge_catalog_entry const *ce = s_forge_touch_palette_spawn >= 0 ?
+				&g_forge.catalog[s_forge_touch_palette_spawn] : &g_forge.catalog[filtered[g_forge.palette_cursor]];
+
+			s_forge_touch_palette_spawn = -1;
 			real_vector3d cam_fwd, cam_up;
 			real_point3d ray_orig;
 			real_vector3d ray_vec;
